@@ -181,45 +181,22 @@ async function scanProjects(numQueries = 5) {
     
     console.log(`🎯 ${unique.length} unique tweets after deduplication`);
     
-    // Fetch project details and filter by June 2024
-    const june2024 = new Date('2024-06-01').getTime();
-    const filtered = [];
+    console.log(`✅ Found ${unique.length} unique projects from search`);
     
-    for (const proj of unique) {
-        const details = await fetchProjectDetails(proj.project_handle);
-        
-        if (!details || !details.created_at) {
-            console.log(`⚠️ Could not verify @${proj.project_handle}`);
-            continue;
-        }
-        
-        const accountCreated = new Date(details.created_at).getTime();
-        
-        if (accountCreated < june2024) {
-            console.log(`❌ @${proj.project_handle} created before June 2024`);
-            continue;
-        }
-        
-        // Add project details
-        proj.account_created = details.created_at;
-        proj.followers = details.public_metrics?.followers_count || 0;
-        proj.verified = details.verified || false;
-        proj.bio = details.description || '';
-        
-        console.log(`✅ @${proj.project_handle} created ${details.created_at} - ACCEPTED`);
-        
-        filtered.push(proj);
-        
-        await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    
-    console.log(`✅ Final: ${filtered.length} projects created after June 2024`);
+    // Map projects without verification (save API calls!)
+    const projects = unique.map(proj => ({
+        ...proj,
+        account_created: null, // Unknown
+        followers: 0,
+        verified: false,
+        bio: ''
+    }));
     
     // Save to database
-    if (filtered.length > 0) {
+    if (projects.length > 0) {
         const { error } = await supabase
             .from('projects')
-            .upsert(filtered.map(p => ({
+            .upsert(projects.map(p => ({
                 tweet_id: p.tweet_id,
                 project_handle: p.project_handle,
                 tweet_text: p.tweet_text,
@@ -239,11 +216,11 @@ async function scanProjects(numQueries = 5) {
         if (error) {
             console.error('❌ Database error:', error);
         } else {
-            console.log(`💾 Saved ${filtered.length} projects to database`);
+            console.log(`💾 Saved ${projects.length} projects to database`);
         }
     }
     
-    return filtered;
+    return projects;
 }
 
 // ==========================================
