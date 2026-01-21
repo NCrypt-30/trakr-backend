@@ -347,14 +347,29 @@ app.get('/api/projects', async (req, res) => {
             .from('projects')
             .select('*')
             .order('found_at', { ascending: false })
-            .limit(100);
+            .limit(200); // Get more to ensure we have 100 unique after dedup
         
         if (error) throw error;
         
+        // Deduplicate by project_handle (keep most recent)
+        const uniqueProjects = [];
+        const seenHandles = new Set();
+        
+        for (const project of data) {
+            if (!seenHandles.has(project.project_handle)) {
+                seenHandles.add(project.project_handle);
+                uniqueProjects.push(project);
+                
+                if (uniqueProjects.length >= 100) break; // Stop at 100 unique
+            }
+        }
+        
+        console.log(`📤 Returning ${uniqueProjects.length} unique projects (from ${data.length} total tweets)`);
+        
         res.json({
             success: true,
-            count: data.length,
-            projects: data
+            count: uniqueProjects.length,
+            projects: uniqueProjects
         });
     } catch (error) {
         res.status(500).json({
@@ -472,8 +487,37 @@ app.get('/health', (req, res) => {
 // CRON JOBS
 // ==========================================
 
-// Auto-scan every 5 minutes
+let scanningEnabled = true; // Control flag
+
+// Pause auto-scanning
+app.post('/api/admin/pause', (req, res) => {
+    scanningEnabled = false;
+    console.log('⏸️ Auto-scanning paused');
+    res.json({ success: true, message: 'Auto-scanning paused' });
+});
+
+// Resume auto-scanning
+app.post('/api/admin/resume', (req, res) => {
+    scanningEnabled = true;
+    console.log('▶️ Auto-scanning resumed');
+    res.json({ success: true, message: 'Auto-scanning resumed' });
+});
+
+// Get scanning status
+app.get('/api/admin/status', (req, res) => {
+    res.json({
+        success: true,
+        scanningEnabled: scanningEnabled
+    });
+});
+
+// Auto-scan every 5 minutes (if enabled)
 cron.schedule('*/5 * * * *', async () => {
+    if (!scanningEnabled) {
+        console.log('⏸️ Auto-scan skipped (paused)');
+        return;
+    }
+    
     console.log('⏰ Auto-scan triggered');
     try {
         await scanProjects(5); // 5 queries per auto-scan
