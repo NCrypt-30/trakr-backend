@@ -488,8 +488,8 @@ app.get('/api/admin/status', (req, res) => {
     });
 });
 
-// Auto-scan every 5 minutes (if enabled)
-cron.schedule('*/5 * * * *', async () => {
+// Auto-scan every 15 minutes (if enabled)
+cron.schedule('*/15 * * * *', async () => {
     if (!scanningEnabled) {
         console.log('⏸️ Auto-scan skipped (paused)');
         return;
