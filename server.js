@@ -143,6 +143,11 @@ async function scanProjects(numQueries = 5) {
             
             // Parse tweets
             for (const tweet of data.data) {
+                // Skip retweets (tweets starting with "RT @")
+                if (tweet.text.startsWith('RT @')) {
+                    continue;
+                }
+                
                 const user = users[tweet.author_id] || {};
                 const projectHandle = extractProjectHandle(tweet.text);
                 
@@ -580,12 +585,11 @@ async function checkLiveWhales() {
                     
                     console.log(`   Found ${newFollows.length} new follows`);
                     
-                    // Filter to crypto-related only
-                    const cryptoFollows = newFollows.filter(isCryptoRelated);
-                    console.log(`   ${cryptoFollows.length} are crypto-related`);
+                    // Store ALL new follows (crypto filter removed)
+                    console.log(`   Storing all ${newFollows.length} new follows`);
                     
                     // Store new follows as notifications
-                    for (const follow of cryptoFollows) {
+                    for (const follow of newFollows) {
                         const { error: notifError } = await supabase
                             .from('whale_live_notifications')
                             .insert({
