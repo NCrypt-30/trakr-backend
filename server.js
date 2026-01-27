@@ -31,9 +31,6 @@ const SEARCH_TERMS = [
     'NFT project launching',
     'testnet launching',
     'testnet live',
-    'mainnet launching',
-    'mainnet coming soon',
-    'devnet live',
     'smart contract deployed',
     'no token yet',
     'pre-token',
@@ -110,8 +107,8 @@ async function scanProjects(numQueries = 5) {
             const params = new URLSearchParams({
                 query: query,
                 'max_results': '10',
-                'tweet.fields': 'created_at,public_metrics',
-                'user.fields': 'username,public_metrics,description,verified,created_at,url',
+                'tweet.fields': 'created_at',
+                'user.fields': 'username,description,verified,created_at,url',
                 'expansions': 'author_id'
             });
             
