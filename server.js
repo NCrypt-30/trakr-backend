@@ -497,39 +497,6 @@ app.get('/api/admin/status', (req, res) => {
 // LIVE X TRACKER FUNCTIONS
 // ==========================================
 
-// Helper: Fetch who a user follows from X API
-async function fetchUserFollowing(username, maxResults = 100) {
-    try {
-        // First get user ID
-        const userResponse = await fetch(`${TWITTER_BASE_URL}/users/by/username/${username}`, {
-            headers: { 'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}` }
-        });
-        
-        if (!userResponse.ok) {
-            throw new Error(`Failed to fetch user: ${userResponse.status}`);
-        }
-        
-        const userData = await userResponse.json();
-        const userId = userData.data.id;
-        
-        // Get their following list
-        const followingResponse = await fetch(
-            `${TWITTER_BASE_URL}/users/${userId}/following?max_results=${maxResults}&user.fields=name,description,public_metrics,verified,profile_image_url,url,created_at`,
-            { headers: { 'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}` } }
-        );
-        
-        if (!followingResponse.ok) {
-            throw new Error(`Failed to fetch following: ${followingResponse.status}`);
-        }
-        
-        const followingData = await followingResponse.json();
-        return followingData.data || [];
-    } catch (error) {
-        console.error(`Error fetching following for ${username}:`, error);
-        throw error;
-    }
-}
-
 // Helper: Check if account is crypto-related (basic filter)
 function isCryptoRelated(user) {
     const cryptoKeywords = [
@@ -901,6 +868,132 @@ app.post('/api/whale/live/mark-all-read', async (req, res) => {
     }
 });
 
+// ============================================
+// ADMIN ENDPOINTS - Database Management
+// ============================================
+
+const ADMIN_KEY = process.env.ADMIN_KEY || 'fallback-admin-key-change-me';
+
+// Middleware to verify admin key
+function verifyAdmin(req, res, next) {
+    const adminKey = req.headers['x-admin-key'] || req.query.key;
+    if (adminKey !== ADMIN_KEY) {
+        return res.status(403).json({ 
+            success: false, 
+            error: 'Unauthorized - Invalid admin key' 
+        });
+    }
+    next();
+}
+
+// Get project count
+app.get('/api/admin/projects/count', verifyAdmin, async (req, res) => {
+    try {
+        const { count, error } = await supabase
+            .from('projects')
+            .select('*', { count: 'exact', head: true });
+        
+        if (error) throw error;
+        
+        res.json({ 
+            success: true, 
+            count: count,
+            message: `Currently ${count} projects in database`
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// Delete all projects
+app.delete('/api/admin/projects/clear-all', verifyAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('projects')
+            .delete()
+            .not('tweet_id', 'is', null);
+        
+        if (error) throw error;
+        
+        const deletedCount = data?.length || 0;
+        console.log(`🗑️ ADMIN: Deleted ${deletedCount} projects`);
+        res.json({ 
+            success: true, 
+            deleted: deletedCount,
+            message: `Successfully deleted ${deletedCount} projects`,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error('Error deleting projects:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// Delete old projects (older than X days)
+app.delete('/api/admin/projects/clear-old', verifyAdmin, async (req, res) => {
+    try {
+        const days = parseInt(req.query.days) || 7;
+        const cutoffDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+        
+        const { data, error } = await supabase
+            .from('projects')
+            .delete()
+            .lt('found_at', cutoffDate);
+        
+        if (error) throw error;
+        
+        const deletedCount = data?.length || 0;
+        console.log(`🗑️ ADMIN: Deleted ${deletedCount} projects older than ${days} days`);
+        res.json({ 
+            success: true, 
+            deleted: deletedCount,
+            message: `Deleted ${deletedCount} projects older than ${days} days`
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// Delete by filters (e.g., low followers)
+app.delete('/api/admin/projects/filter', verifyAdmin, async (req, res) => {
+    try {
+        const minFollowers = parseInt(req.query.minFollowers) || 100;
+        
+        const { data, error } = await supabase
+            .from('projects')
+            .delete()
+            .lt('followers', minFollowers);
+        
+        if (error) throw error;
+        
+        const deletedCount = data?.length || 0;
+        console.log(`🗑️ ADMIN: Deleted ${deletedCount} low-quality projects`);
+        res.json({ 
+            success: true, 
+            deleted: deletedCount,
+            message: `Deleted ${deletedCount} projects with < ${minFollowers} followers`
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// ==========================================
+// CRON JOBS
+// ==========================================
+
 // Auto-scan every 15 minutes (if enabled)
 cron.schedule('*/15 * * * *', async () => {
     if (!scanningEnabled) {
@@ -925,107 +1018,6 @@ cron.schedule('*/15 * * * *', async () => {
         console.error('Live X Tracker error:', error);
     }
 });
-// ============================================
-// ADMIN ENDPOINTS - Database Management
-// ============================================
-
-const ADMIN_KEY = process.env.ADMIN_KEY || 'fallback-admin-key-change-me';
-
-// Middleware to verify admin key
-function verifyAdmin(req, res, next) {
-    const adminKey = req.headers['x-admin-key'] || req.query.key;
-    if (adminKey !== ADMIN_KEY) {
-        return res.status(403).json({ 
-            success: false, 
-            error: 'Unauthorized - Invalid admin key' 
-        });
-    }
-    next();
-}
-
-// Get project count
-app.get('/api/admin/projects/count', verifyAdmin, async (req, res) => {
-    try {
-        const result = await pool.query('SELECT COUNT(*) as count FROM projects');
-        const count = parseInt(result.rows[0].count);
-        res.json({ 
-            success: true, 
-            count: count,
-            message: `Currently ${count} projects in database`
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
-});
-
-// Delete all projects
-app.delete('/api/admin/projects/clear-all', verifyAdmin, async (req, res) => {
-    try {
-        const result = await pool.query('DELETE FROM projects');
-        console.log(`🗑️ ADMIN: Deleted ${result.rowCount} projects`);
-        res.json({ 
-            success: true, 
-            deleted: result.rowCount,
-            message: `Successfully deleted ${result.rowCount} projects`,
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        console.error('Error deleting projects:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
-});
-
-// Delete old projects (older than X days)
-app.delete('/api/admin/projects/clear-old', verifyAdmin, async (req, res) => {
-    try {
-        const days = parseInt(req.query.days) || 7;
-        const result = await pool.query(
-            `DELETE FROM projects 
-             WHERE found_at < NOW() - $1 * INTERVAL '1 day' 
-             RETURNING tweet_id`,
-            [days]
-        );
-        console.log(`🗑️ ADMIN: Deleted ${result.rowCount} projects older than ${days} days`);
-        res.json({ 
-            success: true, 
-            deleted: result.rowCount,
-            message: `Deleted ${result.rowCount} projects older than ${days} days`
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
-});
-
-// Delete by filters (e.g., low followers)
-app.delete('/api/admin/projects/filter', verifyAdmin, async (req, res) => {
-    try {
-        const minFollowers = parseInt(req.query.minFollowers) || 100;
-        const result = await pool.query(
-            'DELETE FROM projects WHERE followers < $1 RETURNING tweet_id',
-            [minFollowers]
-        );
-        console.log(`🗑️ ADMIN: Deleted ${result.rowCount} low-quality projects`);
-        res.json({ 
-            success: true, 
-            deleted: result.rowCount,
-            message: `Deleted ${result.rowCount} projects with < ${minFollowers} followers`
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
-});
 
 // ==========================================
 // START SERVER
@@ -1045,4 +1037,8 @@ app.listen(PORT, () => {
     console.log(`   POST /api/whale/live/mark-read`);
     console.log(`   POST /api/whale/live/mark-all-read`);
     console.log(`   GET  /api/stats`);
+    console.log(`   GET  /api/admin/projects/count`);
+    console.log(`   DELETE /api/admin/projects/clear-all`);
+    console.log(`   DELETE /api/admin/projects/clear-old`);
+    console.log(`   DELETE /api/admin/projects/filter`);
 });
