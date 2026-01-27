@@ -150,6 +150,17 @@ async function scanProjects(numQueries = 5) {
                 
                 if (!projectHandle) continue;
                 
+                // Filter: Only accounts created on or after December 1, 2024
+                if (user.created_at) {
+                    const accountCreated = new Date(user.created_at);
+                    const cutoffDate = new Date('2024-12-01T00:00:00Z');
+                    
+                    if (accountCreated < cutoffDate) {
+                        console.log(`⏭️ Skipping @${projectHandle} - account too old (${accountCreated.toISOString().split('T')[0]})`);
+                        continue;
+                    }
+                }
+                
                 allProjects.push({
                     tweet_id: tweet.id,
                     project_handle: projectHandle,
@@ -991,8 +1002,8 @@ app.delete('/api/admin/projects/filter', verifyAdmin, async (req, res) => {
 // CRON JOBS
 // ==========================================
 
-// Auto-scan every 15 minutes (if enabled)
-cron.schedule('*/15 * * * *', async () => {
+// Auto-scan every 1 hour
+cron.schedule('0 * * * *', async () => {
     if (!scanningEnabled) {
         console.log('⏸️ Auto-scan skipped (paused)');
         return;
