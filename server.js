@@ -1028,8 +1028,6 @@ app.delete('/api/admin/projects/filter', verifyAdmin, async (req, res) => {
 // CRON JOBS - Tiered Scanning
 // ==========================================
 
-let scanningEnabled = true; // Control flag
-
 // TIER 1: Every 5 minutes (high-signal)
 cron.schedule('*/5 * * * *', async () => {
     if (!scanningEnabled) return;
