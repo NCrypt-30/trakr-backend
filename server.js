@@ -36,7 +36,7 @@ const SEARCH_TIERS = {
         ageLimit: 365  // days - builders often have older accounts
     },
     tier2: {
-        query: '(stealth OR shipping OR testnet OR "heads down") (DeFi OR rollup OR DEX OR DePIN OR RWA) -is:retweet -thread -opinion -thoughts -market -price -chart',
+        query: '(stealth OR testnet) ("launch" OR "live" OR deploy OR deployed) (DeFi OR rollup OR DePIN OR RWA) -is:retweet',
         frequency: 30,  // minutes (changed from 15 to reduce cost)
         label: 'TIER 2',
         ageLimit: 180  // days
@@ -83,6 +83,18 @@ function extractProjectHandle(text) {
 async function scanProjects(tier = 'tier1') {
     const tierConfig = SEARCH_TIERS[tier];
     console.log(`🔍 Starting ${tierConfig.label} scan...`);
+    
+    // Track last tweet count per tier (for cooldown skip)
+    if (!global.lastTweetCount) {
+        global.lastTweetCount = {};
+    }
+    
+    // Fix #3: Cooldown skip for Tier 1 if last run returned 0 tweets
+    if (tier === 'tier1' && global.lastTweetCount[tier] === 0) {
+        console.log('⏭️ Skipping TIER 1 — last run empty (cooldown)');
+        global.lastTweetCount[tier] = undefined; // Reset so next run executes
+        return [];
+    }
     
     const query = tierConfig.query;
     const allProjects = [];
@@ -140,7 +152,7 @@ async function scanProjects(tier = 'tier1') {
         
         const params = new URLSearchParams({
             query: query,
-            'max_results': tier === 'tier1' ? '10' : '15',  // Dramatically reduced from 100
+            'max_results': '10',  // Both tiers capped at 10 for cost control
             'tweet.fields': 'created_at',
             'user.fields': 'username,description,verified,created_at,public_metrics,url',
             'expansions': 'author_id',
@@ -165,9 +177,13 @@ async function scanProjects(tier = 'tier1') {
         
         const data = await response.json();
         
+        // Track tweet count for cooldown skip logic
+        const tweetCount = data.data?.length || 0;
+        global.lastTweetCount[tier] = tweetCount;
+        
         // DEBUG: Log query and results
         console.log(`${tierConfig.label} query:`, query.substring(0, 100) + '...');
-        console.log(`${tierConfig.label} tweets returned:`, data.data?.length || 0);
+        console.log(`${tierConfig.label} tweets returned:`, tweetCount);
         
         if (!data.data || data.data.length === 0) {
             console.log(`${tierConfig.label}: No tweets found in last ${windowMinutes} minutes`);
