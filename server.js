@@ -99,6 +99,11 @@ async function scanProjects(tier = 'tier1') {
     const query = tierConfig.query;
     const allProjects = [];
     
+    // Track projects found in this scan cycle (across all tiers)
+    if (!global.currentScanProjects) {
+        global.currentScanProjects = new Set();
+    }
+    
     // Hard lookup caps per tier (prevents surprise bills)
     const LOOKUP_CAPS = {
         tier1: 5,
@@ -215,6 +220,12 @@ async function scanProjects(tier = 'tier1') {
             
             if (!projectHandle) continue;
             
+            // CROSS-TIER DEDUPLICATION: Skip if already found by higher tier this scan cycle
+            if (global.currentScanProjects.has(projectHandle)) {
+                console.log(`⏭️ ${tierConfig.label}: Skipping @${projectHandle} - already found by higher tier`);
+                continue;
+            }
+            
             // CHEAP FILTER #2: Handle heuristics (FREE)
             if (!looksLikeProjectHandle(projectHandle)) {
                 console.log(`⏭️ ${tierConfig.label}: Skipping @${projectHandle} - doesn't look like project handle`);
@@ -242,6 +253,9 @@ async function scanProjects(tier = 'tier1') {
             }
             
             console.log(`✅ ${tierConfig.label}: Found @${projectHandle} (created ${accountCreated.toISOString().split('T')[0]})`);
+            
+            // Mark as found in this scan cycle
+            global.currentScanProjects.add(projectHandle);
             
             // Store PROJECT's data
             allProjects.push({
@@ -1081,6 +1095,15 @@ app.delete('/api/admin/projects/filter', verifyAdmin, async (req, res) => {
 
 // CRON JOBS - Tiered Scanning
 // ==========================================
+
+// Reset cross-tier deduplication every hour to prevent memory bloat
+cron.schedule('0 * * * *', () => {
+    if (global.currentScanProjects) {
+        const size = global.currentScanProjects.size;
+        global.currentScanProjects.clear();
+        console.log(`🔄 Reset cross-tier deduplication (was tracking ${size} projects)`);
+    }
+});
 
 // TIER 1: Every 5 minutes (high-signal)
 cron.schedule('*/5 * * * *', async () => {
