@@ -206,8 +206,7 @@ async function scanProjects(tier = 'tier1') {
                 followers: projectUser.public_metrics?.followers_count || 0,  // PROJECT's data
                 verified: projectUser.verified || false,  // PROJECT's data
                 bio: projectUser.description || '',  // PROJECT's data
-                found_by_query: tierConfig.label,  // Store tier label
-                tier: tier  // Store tier ID
+                found_by_query: tierConfig.label  // Store tier label (TIER 1, TIER 2, TIER 3)
             });
         }
         
@@ -246,8 +245,7 @@ async function scanProjects(tier = 'tier1') {
                 followers: p.followers,  // Keep real data
                 verified: p.verified,  // Keep real data
                 bio: p.bio,  // Keep real data
-                found_by_query: p.found_by_query,  // Tier label
-                tier: p.tier,  // Tier ID
+                found_by_query: p.found_by_query,  // Tier label (TIER 1, TIER 2, TIER 3)
                 found_at: new Date().toISOString()
             })), {
                 onConflict: 'tweet_id'
