@@ -27,22 +27,22 @@ const TWITTER_BASE_URL = 'https://api.twitter.com/2';
 // SCANNER FUNCTIONS
 // ==========================================
 
-// 3-Tier Search System
+// 3-Tier Search System - X API v2 compatible (no lang:, no protocol)
 const SEARCH_TIERS = {
     tier1: {
-        query: '(testnet OR deployed OR "mainnet live" OR "devnet live" OR "no token" OR "pre-token") AND (DeFi OR rollup OR DEX OR protocol OR DePIN OR RWA) -is:retweet lang:en',
+        query: '(testnet OR deployed OR "smart contract deployed" OR "mainnet live" OR "devnet live" OR "no token" OR "pre-token") AND (DeFi OR rollup OR DEX OR DePIN OR RWA) -is:retweet',
         frequency: 5,  // minutes
         label: 'TIER 1',
         ageLimit: 365  // days - builders often have older accounts
     },
     tier2: {
-        query: '(stealth OR shipping OR building OR "working on" OR testnet) AND (DeFi OR rollup OR DEX OR DePIN OR RWA OR "AI agent") -is:retweet lang:en',
+        query: '(stealth OR shipping OR building OR "heads down" OR "working on" OR testnet) AND (DeFi OR rollup OR DEX OR DePIN OR RWA OR "AI agent") -is:retweet',
         frequency: 15,  // minutes
         label: 'TIER 2',
         ageLimit: 180  // days
     },
     tier3: {
-        query: '(launching OR "now live" OR announced OR airdrop OR presale OR "TGE coming") AND (DeFi OR DEX OR NFT OR DePIN OR RWA OR "AI agent") -is:retweet lang:en',
+        query: '("launching" OR "now live" OR "going live" OR announced OR airdrop OR presale OR "TGE coming") AND (DeFi OR DEX OR NFT OR DePIN OR RWA OR "AI agent") -is:retweet',
         frequency: 30,  // minutes
         label: 'TIER 3',
         ageLimit: 90  // days
@@ -101,8 +101,8 @@ async function scanProjects(tier = 'tier1') {
             'max_results': '100',
             'tweet.fields': 'created_at',
             'user.fields': 'username,description,verified,created_at,public_metrics,url',
-            'expansions': 'author_id'
-            // start_time temporarily removed to test 400 error
+            'expansions': 'author_id',
+            'start_time': windowStart.toISOString()
         });
         
         const response = await fetch(
@@ -115,7 +115,9 @@ async function scanProjects(tier = 'tier1') {
         );
         
         if (!response.ok) {
+            const errorText = await response.text();
             console.error(`${tierConfig.label} query failed:`, response.status);
+            console.error(`${tierConfig.label} error body:`, errorText);
             return [];
         }
         
