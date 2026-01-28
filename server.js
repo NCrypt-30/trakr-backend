@@ -28,22 +28,29 @@ const SEARCH_TERMS = [
     'crypto launching soon',
     'web3 launching soon',
     'DeFi launching soon',
+    'NFT project launching',
     'testnet launching',
     'testnet live',
     'smart contract deployed',
+    'no token yet',
     'pre-token',
     'before TGE',
     'TGE coming soon',
     'token launch soon',
     'airdrop soon',
+    'rollup launching',
     'DeFi protocol launching',
     'DEX launching',
     'lending protocol',
     'liquid staking',
     'AI agent crypto',
+    'AI blockchain',
+    'DePIN launching',
+    'RWA project launching',
     'shipping web3',
     'stealth crypto project',
     'stealth blockchain',
+    'building in stealth web3',
     'stealth launch',
     'stealth launching'
 ];
@@ -97,7 +104,7 @@ async function scanProjects(numQueries = 5) {
     
     for (const query of queries) {
         try {
-            // Add date filter to query: only tweets from Dec 1, 2025 onwards, exclude retweets
+            // Exclude retweets
             const filteredQuery = `${query} -is:retweet`;
             
             const params = new URLSearchParams({
@@ -105,8 +112,7 @@ async function scanProjects(numQueries = 5) {
                 'max_results': '10',
                 'tweet.fields': 'created_at',
                 'user.fields': 'username,description,verified,created_at,url',
-                'expansions': 'author_id',
-                'start_time': '2025-12-01T00:00:00Z'  // Only tweets from Dec 1, 2025 onwards
+                'expansions': 'author_id'
             });
             
             const response = await fetch(
