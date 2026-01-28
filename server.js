@@ -87,8 +87,44 @@ async function scanProjects(tier = 'tier1') {
     const query = tierConfig.query;
     const allProjects = [];
     
+    // Hard lookup caps per tier (prevents surprise bills)
+    const LOOKUP_CAPS = {
+        tier1: 5,
+        tier2: 10,
+        tier3: 10
+    };
+    
+    // Track old accounts to never fetch again (persistent across scans)
+    if (!global.oldAccounts) {
+        global.oldAccounts = new Set();
+    }
+    
+    // Track lookups performed this scan
+    let lookupsPerformed = 0;
+    
     // In-memory cache for mentioned projects (reduces duplicate API calls)
     const projectCache = new Map();
+    
+    // Cheap tweet filter (before extraction)
+    function looksLikeProjectTweet(text) {
+        // Must contain project-related keywords
+        if (!/testnet|deployed|launch|live|airdrop|presale|mainnet|building|shipping|stealth/i.test(text)) {
+            return false;
+        }
+        // Filter out influencer/opinion content
+        if (/thread|thoughts|opinion|market update|daily|gm |gn /i.test(text)) {
+            return false;
+        }
+        return true;
+    }
+    
+    // Cheap handle heuristic filter
+    function looksLikeProjectHandle(username) {
+        if (!username || username.length < 4) return false;
+        if (/\d{4,}$/.test(username)) return false; // spammy numbers
+        // Allow most, filter obvious junk
+        return true;
+    }
     
     try {
         // Calculate time window based on tier frequency
@@ -153,48 +189,45 @@ async function scanProjects(tier = 'tier1') {
                 continue;
             }
             
-            const user = users[tweet.author_id] || {};
-            
-            // HYBRID: Start with tweet author, but prefer mentioned project if different
-            let projectHandle = user.username;
-            let projectUser = user;  // Track which user data to use
-            
-            const mention = extractProjectHandle(tweet.text);
-            if (mention && mention !== user.username) {
-                // Check cache first to avoid duplicate API calls
-                if (projectCache.has(mention)) {
-                    projectUser = projectCache.get(mention);
-                    projectHandle = mention;
-                    console.log(`📦 ${tierConfig.label}: Using cached data for @${mention}`);
-                } else {
-                    // Fetch the MENTIONED project's account details
-                    const fetchedProject = await fetchProjectDetails(mention);
-                    if (fetchedProject) {
-                        projectCache.set(mention, fetchedProject);  // Cache it
-                        projectUser = fetchedProject;  // Use mentioned project's data
-                        projectHandle = mention;
-                        console.log(`🔍 ${tierConfig.label}: Fetched fresh data for @${mention}`);
-                    } else {
-                        console.log(`⏭️ ${tierConfig.label}: Could not fetch @${mention}, using author instead`);
-                    }
-                }
+            // CHEAP FILTER #1: Tweet content filter (FREE, eliminates 50-70% junk)
+            if (!looksLikeProjectTweet(tweet.text)) {
+                continue;
             }
+            
+            const user = users[tweet.author_id] || {};
+            const projectHandle = user.username;
             
             if (!projectHandle) continue;
             
-            // Tiered age filter - check the PROJECT's age (not tweet author's age)
+            // CHEAP FILTER #2: Handle heuristics (FREE)
+            if (!looksLikeProjectHandle(projectHandle)) {
+                console.log(`⏭️ ${tierConfig.label}: Skipping @${projectHandle} - doesn't look like project handle`);
+                continue;
+            }
+            
+            // CHEAP FILTER #3: Skip known old accounts (FREE, no API call)
+            if (global.oldAccounts.has(projectHandle)) {
+                continue; // Silent skip - already know it's old
+            }
+            
+            // Use author's data (already in response, no extra API call)
+            const projectUser = user;
+            
+            // Tiered age filter - check the PROJECT's age
             const accountCreated = new Date(projectUser.created_at);
             const ageLimitDays = tierConfig.ageLimit || 90;
             const cutoffDate = new Date(Date.now() - ageLimitDays * 24 * 60 * 60 * 1000);
             
             if (accountCreated < cutoffDate) {
+                // Add to permanent skip list
+                global.oldAccounts.add(projectHandle);
                 console.log(`⏭️ ${tierConfig.label}: Skipping @${projectHandle} - account too old (${accountCreated.toISOString().split('T')[0]})`);
                 continue;
             }
             
             console.log(`✅ ${tierConfig.label}: Found @${projectHandle} (created ${accountCreated.toISOString().split('T')[0]})`);
             
-            // Store PROJECT's actual fetched data (not tweet author's data)
+            // Store PROJECT's data
             allProjects.push({
                 tweet_id: tweet.id,
                 project_handle: projectHandle,
