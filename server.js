@@ -92,9 +92,15 @@ async function scanProjects(tier = 'tier1') {
     
     try {
         // Calculate time window based on tier frequency
+        // Add 60-second safety buffer to ensure start_time is safely in the past
+        const SAFETY_BUFFER_SECONDS = 60;
         const now = new Date();
         const windowMinutes = tierConfig.frequency;
-        const windowStart = new Date(now.getTime() - windowMinutes * 60 * 1000);
+        const windowStart = new Date(
+            now.getTime() 
+            - windowMinutes * 60 * 1000 
+            - SAFETY_BUFFER_SECONDS * 1000
+        );
         
         const params = new URLSearchParams({
             query: query,
