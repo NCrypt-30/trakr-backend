@@ -457,6 +457,94 @@ app.get('/api/projects', async (req, res) => {
     }
 });
 
+// DexScreener Live Launches - Get tokens launched in last 1 hour
+app.get('/api/dexscreener-demo', async (req, res) => {
+    try {
+        console.log('🔍 Fetching live Solana launches from DexScreener...');
+        
+        // Fetch latest Solana pairs
+        const response = await fetch('https://api.dexscreener.com/latest/dex/pairs/solana');
+        
+        if (!response.ok) {
+            throw new Error(`DexScreener API error: ${response.status}`);
+        }
+        
+        const data = await response.json();
+        console.log(`📊 DexScreener returned ${data.pairs?.length || 0} total pairs`);
+        
+        if (!data.pairs || data.pairs.length === 0) {
+            return res.json({
+                success: true,
+                launches: [],
+                message: 'No pairs found'
+            });
+        }
+        
+        // Filter for high-quality launches in last 1 hour
+        const launches = data.pairs.filter(pair => {
+            // Check age (last 1 hour only)
+            const createdAt = new Date(pair.pairCreatedAt);
+            const ageHours = (Date.now() - createdAt.getTime()) / (1000 * 60 * 60);
+            if (ageHours > 1) return false;
+            
+            // Check minimum liquidity ($5k)
+            const liquidity = pair.liquidity?.usd || 0;
+            if (liquidity < 5000) return false;
+            
+            // Must have logo OR website OR socials (quality indicator)
+            const hasLogo = pair.info?.imageUrl;
+            const hasWebsite = pair.info?.websites?.length > 0;
+            const hasSocials = pair.info?.socials?.length > 0;
+            
+            if (!hasLogo && !hasWebsite && !hasSocials) return false;
+            
+            return true;
+        });
+        
+        console.log(`✅ Found ${launches.length} quality launches in last hour (filtered from ${data.pairs.length})`);
+        
+        // Format results
+        const formatted = launches.map(launch => {
+            const ageMinutes = ((Date.now() - new Date(launch.pairCreatedAt).getTime()) / (1000 * 60)).toFixed(0);
+            
+            return {
+                symbol: launch.baseToken.symbol,
+                name: launch.baseToken.name,
+                contract: launch.baseToken.address,
+                ageMinutes: parseInt(ageMinutes),
+                liquidity: launch.liquidity.usd,
+                price: launch.priceUsd,
+                dex: launch.dexId,
+                hasLogo: !!launch.info?.imageUrl,
+                hasWebsite: !!launch.info?.websites?.length,
+                hasSocials: !!launch.info?.socials?.length,
+                website: launch.info?.websites?.[0]?.url,
+                dexscreenerUrl: `https://dexscreener.com/solana/${launch.pairAddress}`,
+                priceChange: {
+                    m5: launch.priceChange?.m5 || 0,
+                    h1: launch.priceChange?.h1 || 0
+                }
+            };
+        });
+        
+        res.json({
+            success: true,
+            timestamp: new Date().toISOString(),
+            totalScanned: data.pairs.length,
+            launches: formatted,
+            count: formatted.length,
+            scamFilterRate: `${((1 - formatted.length / data.pairs.length) * 100).toFixed(1)}%`
+        });
+        
+    } catch (error) {
+        console.error('❌ DexScreener error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // Trigger manual scan (rate limited)
 app.get('/api/scan', async (req, res) => {
     try {
