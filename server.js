@@ -460,69 +460,87 @@ app.get('/api/projects', async (req, res) => {
 // DexScreener Live Launches - Get tokens launched in last 1 hour
 app.get('/api/dexscreener-demo', async (req, res) => {
     try {
-        console.log('🔍 Fetching live Solana launches from DexScreener...');
+        console.log('🔍 Fetching live Solana launches from Birdeye...');
         
-        // Fetch latest Solana pairs
-        const response = await fetch('https://api.dexscreener.com/latest/dex/pairs/solana');
+        // Birdeye API for new tokens (free tier)
+        // Gets tokens sorted by creation time
+        const response = await fetch('https://public-api.birdeye.so/public/tokenlist?sort_by=creation_time&sort_type=desc&offset=0&limit=50', {
+            headers: {
+                'X-API-KEY': 'public' // Birdeye allows 'public' for limited free access
+            }
+        });
         
         if (!response.ok) {
-            throw new Error(`DexScreener API error: ${response.status}`);
-        }
-        
-        const data = await response.json();
-        console.log(`📊 DexScreener returned ${data.pairs?.length || 0} total pairs`);
-        
-        if (!data.pairs || data.pairs.length === 0) {
+            console.error(`Birdeye API returned ${response.status}`);
+            // Return empty result instead of failing
             return res.json({
                 success: true,
                 launches: [],
-                message: 'No pairs found'
+                totalScanned: 0,
+                count: 0,
+                timestamp: new Date().toISOString(),
+                message: 'API temporarily unavailable',
+                scamFilterRate: '0%'
+            });
+        }
+        
+        const data = await response.json();
+        const tokens = data.data?.tokens || [];
+        console.log(`📊 Birdeye returned ${tokens.length} tokens`);
+        
+        if (tokens.length === 0) {
+            return res.json({
+                success: true,
+                launches: [],
+                totalScanned: 0,
+                count: 0,
+                timestamp: new Date().toISOString(),
+                message: 'No tokens found',
+                scamFilterRate: '0%'
             });
         }
         
         // Filter for high-quality launches in last 1 hour
-        const launches = data.pairs.filter(pair => {
+        const launches = tokens.filter(token => {
             // Check age (last 1 hour only)
-            const createdAt = new Date(pair.pairCreatedAt);
+            if (!token.createdAt) return false;
+            const createdAt = new Date(token.createdAt * 1000); // Birdeye uses Unix timestamp
             const ageHours = (Date.now() - createdAt.getTime()) / (1000 * 60 * 60);
             if (ageHours > 1) return false;
             
             // Check minimum liquidity ($5k)
-            const liquidity = pair.liquidity?.usd || 0;
+            const liquidity = token.liquidity || 0;
             if (liquidity < 5000) return false;
             
-            // Must have logo OR website OR socials (quality indicator)
-            const hasLogo = pair.info?.imageUrl;
-            const hasWebsite = pair.info?.websites?.length > 0;
-            const hasSocials = pair.info?.socials?.length > 0;
-            
-            if (!hasLogo && !hasWebsite && !hasSocials) return false;
+            // Must have logo (basic quality indicator)
+            if (!token.logoURI) return false;
             
             return true;
         });
         
-        console.log(`✅ Found ${launches.length} quality launches in last hour (filtered from ${data.pairs.length})`);
+        console.log(`✅ Found ${launches.length} quality launches in last hour (filtered from ${tokens.length})`);
         
         // Format results
-        const formatted = launches.map(launch => {
-            const ageMinutes = ((Date.now() - new Date(launch.pairCreatedAt).getTime()) / (1000 * 60)).toFixed(0);
+        const formatted = launches.map(token => {
+            const createdAt = new Date(token.createdAt * 1000);
+            const ageMinutes = Math.floor((Date.now() - createdAt.getTime()) / (1000 * 60));
             
             return {
-                symbol: launch.baseToken.symbol,
-                name: launch.baseToken.name,
-                contract: launch.baseToken.address,
-                ageMinutes: parseInt(ageMinutes),
-                liquidity: launch.liquidity.usd,
-                price: launch.priceUsd,
-                dex: launch.dexId,
-                hasLogo: !!launch.info?.imageUrl,
-                hasWebsite: !!launch.info?.websites?.length,
-                hasSocials: !!launch.info?.socials?.length,
-                website: launch.info?.websites?.[0]?.url,
-                dexscreenerUrl: `https://dexscreener.com/solana/${launch.pairAddress}`,
+                symbol: token.symbol || 'UNKNOWN',
+                name: token.name || 'Unknown Token',
+                contract: token.address,
+                ageMinutes: ageMinutes,
+                liquidity: token.liquidity || 0,
+                price: token.price || 0,
+                dex: 'raydium', // Birdeye doesn't specify, assume Raydium for Solana
+                hasLogo: !!token.logoURI,
+                hasWebsite: false, // Birdeye free tier doesn't include this
+                hasSocials: false,
+                website: null,
+                dexscreenerUrl: `https://dexscreener.com/solana/${token.address}`,
                 priceChange: {
-                    m5: launch.priceChange?.m5 || 0,
-                    h1: launch.priceChange?.h1 || 0
+                    m5: token.priceChange5mPercent || 0,
+                    h1: token.priceChange1hPercent || 0
                 }
             };
         });
@@ -530,14 +548,14 @@ app.get('/api/dexscreener-demo', async (req, res) => {
         res.json({
             success: true,
             timestamp: new Date().toISOString(),
-            totalScanned: data.pairs.length,
+            totalScanned: tokens.length,
             launches: formatted,
             count: formatted.length,
-            scamFilterRate: `${((1 - formatted.length / data.pairs.length) * 100).toFixed(1)}%`
+            scamFilterRate: `${((1 - formatted.length / tokens.length) * 100).toFixed(1)}%`
         });
         
     } catch (error) {
-        console.error('❌ DexScreener error:', error);
+        console.error('❌ Live Launches API error:', error);
         res.status(500).json({
             success: false,
             error: error.message
