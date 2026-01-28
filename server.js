@@ -457,36 +457,67 @@ app.get('/api/projects', async (req, res) => {
     }
 });
 
-// Live Launches - Get tokens launched in last 1 hour (using Birdeye API)
+// Live Launches - Get graduated Pump.fun tokens (using Moralis API)
+// Track last check time to only show NEW graduations going forward
+let lastGraduationCheck = Date.now(); // Initialize to now (ignore past graduations)
+
 app.get('/api/live-launches', async (req, res) => {
     try {
-        console.log('🔍 Fetching live Solana launches from Birdeye...');
+        console.log('🔍 Fetching graduated Pump.fun tokens from Moralis...');
         
-        // Birdeye API for new tokens (free tier)
-        // Gets tokens sorted by creation time
-        const response = await fetch('https://public-api.birdeye.so/public/tokenlist?sort_by=creation_time&sort_type=desc&offset=0&limit=50', {
+        const MORALIS_API_KEY = process.env.MORALIS_API_KEY;
+        
+        if (!MORALIS_API_KEY) {
+            console.error('❌ MORALIS_API_KEY not set in environment variables');
+            return res.json({
+                success: false,
+                error: 'Moralis API key not configured',
+                launches: [],
+                totalScanned: 0,
+                count: 0
+            });
+        }
+        
+        // Moralis Solana API - Get graduated tokens from Raydium
+        // These are Pump.fun tokens that "graduated" (hit bonding curve & migrated to Raydium)
+        // Documentation: https://docs.moralis.com/web3-data-api/solana/reference/get-graduated-tokens-by-exchange
+        const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/exchange/raydium/graduated', {
             headers: {
-                'X-API-KEY': 'public' // Birdeye allows 'public' for limited free access
+                'Accept': 'application/json',
+                'X-API-Key': MORALIS_API_KEY
             }
         });
         
         if (!response.ok) {
-            console.error(`Birdeye API returned ${response.status}`);
-            // Return empty result instead of failing
+            const errorText = await response.text();
+            console.error(`Moralis API returned ${response.status}: ${errorText}`);
             return res.json({
                 success: true,
                 launches: [],
                 totalScanned: 0,
                 count: 0,
                 timestamp: new Date().toISOString(),
-                message: 'API temporarily unavailable',
+                message: `API error: ${response.status}`,
                 scamFilterRate: '0%'
             });
         }
         
         const data = await response.json();
-        const tokens = data.data?.tokens || [];
-        console.log(`📊 Birdeye returned ${tokens.length} tokens`);
+        console.log('📦 Moralis response structure:', Object.keys(data));
+        
+        // Handle different possible response formats
+        let tokens = [];
+        if (Array.isArray(data)) {
+            tokens = data;
+        } else if (data.tokens && Array.isArray(data.tokens)) {
+            tokens = data.tokens;
+        } else if (data.result && Array.isArray(data.result)) {
+            tokens = data.result;
+        } else if (data.data && Array.isArray(data.data)) {
+            tokens = data.data;
+        }
+        
+        console.log(`📊 Moralis returned ${tokens.length} graduated tokens`);
         
         if (tokens.length === 0) {
             return res.json({
@@ -495,53 +526,69 @@ app.get('/api/live-launches', async (req, res) => {
                 totalScanned: 0,
                 count: 0,
                 timestamp: new Date().toISOString(),
-                message: 'No tokens found',
+                message: 'No graduated tokens found',
                 scamFilterRate: '0%'
             });
         }
         
-        // Filter for high-quality launches in last 1 hour
-        const launches = tokens.filter(token => {
-            // Check age (last 1 hour only)
-            if (!token.createdAt) return false;
-            const createdAt = new Date(token.createdAt * 1000); // Birdeye uses Unix timestamp
-            const ageHours = (Date.now() - createdAt.getTime()) / (1000 * 60 * 60);
-            if (ageHours > 1) return false;
+        // ONLY show graduations AFTER last check (going forward only, ignore past)
+        const currentCheckTime = Date.now();
+        
+        const newGraduations = tokens.filter(token => {
+            // Must have address
+            const address = token.address || token.mint || token.token_address;
+            if (!address) return false;
             
-            // Check minimum liquidity ($5k)
-            const liquidity = token.liquidity || 0;
-            if (liquidity < 5000) return false;
+            // Get graduation timestamp
+            const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
+            if (!graduatedAt) return false; // Skip if no timestamp
             
-            // Must have logo (basic quality indicator)
-            if (!token.logoURI) return false;
+            const graduatedTime = typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime();
+            
+            // CRITICAL: Only include if graduated AFTER our last check
+            if (graduatedTime <= lastGraduationCheck) {
+                return false; // Skip - this graduated before we started watching
+            }
             
             return true;
         });
         
-        console.log(`✅ Found ${launches.length} quality launches in last hour (filtered from ${tokens.length})`);
+        // Update last check time for next request
+        lastGraduationCheck = currentCheckTime;
+        
+        console.log(`✅ Found ${newGraduations.length} NEW graduations since last check (filtered from ${tokens.length} total)`);
         
         // Format results
-        const formatted = launches.map(token => {
-            const createdAt = new Date(token.createdAt * 1000);
-            const ageMinutes = Math.floor((Date.now() - createdAt.getTime()) / (1000 * 60));
+        const formatted = newGraduations.map(token => {
+            const address = token.address || token.mint || token.token_address;
+            const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
+            
+            const ageMinutes = graduatedAt 
+                ? Math.floor((currentCheckTime - (typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime())) / (1000 * 60))
+                : 0;
             
             return {
                 symbol: token.symbol || 'UNKNOWN',
                 name: token.name || 'Unknown Token',
-                contract: token.address,
+                contract: address,
                 ageMinutes: ageMinutes,
-                liquidity: token.liquidity || 0,
-                price: token.price || 0,
-                dex: 'raydium', // Birdeye doesn't specify, assume Raydium for Solana
-                hasLogo: !!token.logoURI,
-                hasWebsite: false, // Birdeye free tier doesn't include this
-                hasSocials: false,
-                website: null,
-                dexscreenerUrl: `https://dexscreener.com/solana/${token.address}`,
+                liquidity: token.liquidity || token.reserve_in_usd || token.raydium_liquidity || 0,
+                price: token.price_usd || token.price || token.raydium_price || 0,
+                dex: 'raydium',
+                hasLogo: !!token.logo || !!token.image_uri || !!token.logoURI,
+                hasWebsite: !!token.website,
+                hasSocials: !!(token.twitter || token.telegram),
+                website: token.website || null,
+                dexscreenerUrl: `https://dexscreener.com/solana/${address}`,
+                jupiterUrl: `https://jup.ag/swap/SOL-${address}`,
+                raydiumUrl: `https://raydium.io/swap/?inputCurrency=sol&outputCurrency=${address}`,
                 priceChange: {
-                    m5: token.priceChange5mPercent || 0,
-                    h1: token.priceChange1hPercent || 0
-                }
+                    m5: token.price_change_5m || token.priceChange5m || 0,
+                    h1: token.price_change_1h || token.priceChange1h || 0
+                },
+                graduated: true,
+                marketCap: token.market_cap || token.marketCap || 0,
+                graduatedAt: graduatedAt // Include timestamp
             };
         });
         
@@ -551,7 +598,8 @@ app.get('/api/live-launches', async (req, res) => {
             totalScanned: tokens.length,
             launches: formatted,
             count: formatted.length,
-            scamFilterRate: `${((1 - formatted.length / tokens.length) * 100).toFixed(1)}%`
+            message: 'NEW graduated tokens (only going forward)',
+            scamFilterRate: `${tokens.length > 0 ? ((1 - formatted.length / tokens.length) * 100).toFixed(1) : '0'}%`
         });
         
     } catch (error) {
