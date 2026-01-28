@@ -36,8 +36,8 @@ const SEARCH_TIERS = {
         ageLimit: 365  // days - builders often have older accounts
     },
     tier2: {
-        query: '(stealth OR shipping OR building OR "heads down" OR "working on" OR testnet) (DeFi OR rollup OR DEX OR DePIN OR RWA OR "AI agent") -is:retweet',
-        frequency: 15,  // minutes
+        query: '(stealth OR shipping OR testnet OR "heads down") (DeFi OR rollup OR DEX OR DePIN OR RWA) -is:retweet -thread -opinion -thoughts -market -price -chart',
+        frequency: 30,  // minutes (changed from 15 to reduce cost)
         label: 'TIER 2',
         ageLimit: 180  // days
     },
@@ -140,7 +140,7 @@ async function scanProjects(tier = 'tier1') {
         
         const params = new URLSearchParams({
             query: query,
-            'max_results': '100',
+            'max_results': tier === 'tier1' ? '10' : '15',  // Dramatically reduced from 100
             'tweet.fields': 'created_at',
             'user.fields': 'username,description,verified,created_at,public_metrics,url',
             'expansions': 'author_id',
@@ -430,15 +430,14 @@ app.get('/api/projects', async (req, res) => {
 // Trigger manual scan (rate limited)
 app.get('/api/scan', async (req, res) => {
     try {
-        // Run all 3 tiers
+        // Run Tier 1 and 2 only (Tier 3 disabled due to high cost/low quality)
         const results = [];
         results.push(...await scanProjects('tier1'));
         results.push(...await scanProjects('tier2'));
-        results.push(...await scanProjects('tier3'));
         
         res.json({
             success: true,
-            message: `Scanned all tiers, found ${results.length} new projects`,
+            message: `Scanned Tier 1 & 2, found ${results.length} new projects`,
             projects: results
         });
     } catch (error) {
@@ -1079,11 +1078,11 @@ cron.schedule('*/5 * * * *', async () => {
     }
 });
 
-// TIER 2: Every 15 minutes (builder signals)
-cron.schedule('*/15 * * * *', async () => {
+// TIER 2: Every 30 minutes (builder signals) - reduced from 15 min for cost savings
+cron.schedule('*/30 * * * *', async () => {
     if (!scanningEnabled) return;
     
-    console.log('⏰ TIER 2 scan triggered (every 15 min)');
+    console.log('⏰ TIER 2 scan triggered (every 30 min)');
     try {
         await scanProjects('tier2');
     } catch (error) {
@@ -1091,17 +1090,17 @@ cron.schedule('*/15 * * * *', async () => {
     }
 });
 
-// TIER 3: Every 30 minutes (discovery)
-cron.schedule('*/30 * * * *', async () => {
-    if (!scanningEnabled) return;
-    
-    console.log('⏰ TIER 3 scan triggered (every 30 min)');
-    try {
-        await scanProjects('tier3');
-    } catch (error) {
-        console.error('Tier 3 scan error:', error);
-    }
-});
+// TIER 3: DISABLED (too expensive, low quality results)
+// Was costing ~$19/day for mostly spam/bots
+// cron.schedule('*/30 * * * *', async () => {
+//     if (!scanningEnabled) return;
+//     console.log('⏰ TIER 3 scan triggered (every 30 min)');
+//     try {
+//         await scanProjects('tier3');
+//     } catch (error) {
+//         console.error('Tier 3 scan error:', error);
+//     }
+// });
 
 // Live X Tracker - Check every 15 minutes
 cron.schedule('*/15 * * * *', async () => {
