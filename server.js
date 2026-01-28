@@ -22,37 +22,9 @@ const TWITTER_BASE_URL = 'https://api.twitter.com/2';
 // SCANNER FUNCTIONS
 // ==========================================
 
+// Mega query combining all search parameters
 const SEARCH_TERMS = [
-    'blockchain launching soon',
-    'protocol launching soon',
-    'crypto launching soon',
-    'web3 launching soon',
-    'DeFi launching soon',
-    'NFT project launching',
-    'testnet launching',
-    'testnet live',
-    'smart contract deployed',
-    'no token yet',
-    'pre-token',
-    'before TGE',
-    'TGE coming soon',
-    'token launch soon',
-    'airdrop soon',
-    'rollup launching',
-    'DeFi protocol launching',
-    'DEX launching',
-    'lending protocol',
-    'liquid staking',
-    'AI agent crypto',
-    'AI blockchain',
-    'DePIN launching',
-    'RWA project launching',
-    'shipping web3',
-    'stealth crypto project',
-    'stealth blockchain',
-    'building in stealth web3',
-    'stealth launch',
-    'stealth launching'
+    '(testnet OR blockchain OR protocol OR crypto OR web3 OR DeFi OR NFT OR rollup OR DEX OR "AI agent" OR DePIN OR RWA OR "liquid staking") AND (launching OR "coming soon" OR "launch soon" OR live OR announced OR deployed OR "no token" OR "pre-token" OR "before TGE" OR "TGE coming" OR airdrop OR presale OR stealth OR shipping OR "smart contract deployed") -is:retweet'
 ];
 
 // Fetch project account details
@@ -86,33 +58,28 @@ function extractProjectHandle(text) {
 }
 
 // Scan X API for projects
-async function scanProjects(numQueries = 5) {
-    console.log(`🔍 Starting scan with ${numQueries} queries...`);
+async function scanProjects(numQueries = 1) {
+    console.log(`🔍 Starting scan with mega query...`);
     
-    // Pick random queries
-    const queries = [];
-    const usedIndices = new Set();
-    while (queries.length < numQueries && queries.length < SEARCH_TERMS.length) {
-        const idx = Math.floor(Math.random() * SEARCH_TERMS.length);
-        if (!usedIndices.has(idx)) {
-            usedIndices.add(idx);
-            queries.push(SEARCH_TERMS[idx]);
-        }
-    }
+    // Use the single mega query
+    const queries = SEARCH_TERMS;
     
     const allProjects = [];
     
     for (const query of queries) {
         try {
-            // Exclude retweets
-            const filteredQuery = `${query} -is:retweet`;
+            // Calculate time window - last 15 minutes
+            const now = new Date();
+            const fifteenMinutesAgo = new Date(now.getTime() - 15 * 60 * 1000);
             
+            // Query already includes -is:retweet
             const params = new URLSearchParams({
-                query: filteredQuery,
-                'max_results': '10',
+                query: query,
+                'max_results': '100',  // Increased to catch all tweets in 15-min window
                 'tweet.fields': 'created_at',
                 'user.fields': 'username,description,verified,created_at,url',
-                'expansions': 'author_id'
+                'expansions': 'author_id',
+                'start_time': fifteenMinutesAgo.toISOString()
             });
             
             const response = await fetch(
@@ -1013,16 +980,16 @@ app.delete('/api/admin/projects/filter', verifyAdmin, async (req, res) => {
 // CRON JOBS
 // ==========================================
 
-// Auto-scan every 1 hour
-cron.schedule('0 * * * *', async () => {
+// Auto-scan every 15 minutes with time window
+cron.schedule('*/15 * * * *', async () => {
     if (!scanningEnabled) {
         console.log('⏸️ Auto-scan skipped (paused)');
         return;
     }
     
-    console.log('⏰ Auto-scan triggered');
+    console.log('⏰ Auto-scan triggered (15-min window)');
     try {
-        await scanProjects(5); // 5 queries per auto-scan
+        await scanProjects(1); // 1 mega query per auto-scan
     } catch (error) {
         console.error('Auto-scan error:', error);
     }
