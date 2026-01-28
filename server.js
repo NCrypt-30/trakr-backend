@@ -4,6 +4,10 @@ const cron = require('node-cron');
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
+// FIX: Ensure fetch is available (Node < 18 compatibility)
+const fetch = global.fetch || require('node-fetch');
+console.log('✅ Fetch available:', typeof fetch);
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -18,14 +22,32 @@ const supabase = createClient(
 const TWITTER_BEARER_TOKEN = process.env.TWITTER_BEARER_TOKEN;
 const TWITTER_BASE_URL = 'https://api.twitter.com/2';
 
+
 // ==========================================
 // SCANNER FUNCTIONS
 // ==========================================
 
-// Mega query combining all search parameters
-const SEARCH_TERMS = [
-    '(testnet OR blockchain OR protocol OR crypto OR web3 OR DeFi OR NFT OR rollup OR DEX OR "AI agent" OR DePIN OR RWA OR "liquid staking") AND (launching OR "coming soon" OR "launch soon" OR live OR announced OR deployed OR "no token" OR "pre-token" OR "before TGE" OR "TGE coming" OR airdrop OR presale OR stealth OR shipping OR "smart contract deployed") -is:retweet'
-];
+// 3-Tier Search System
+const SEARCH_TIERS = {
+    tier1: {
+        query: '(testnet OR deployed OR "smart contract deployed" OR "contracts deployed" OR "mainnet live" OR "devnet live" OR "no token" OR "pre-token") AND (DeFi OR rollup OR DEX OR protocol OR DePIN OR RWA) -is:retweet lang:en',
+        frequency: 5,  // minutes
+        label: 'TIER 1',
+        ageLimit: 365  // days - builders often have older accounts
+    },
+    tier2: {
+        query: '(stealth OR shipping OR building OR "heads down" OR "working on" OR testnet) AND (DeFi OR rollup OR DEX OR DePIN OR RWA OR "AI agent") -is:retweet lang:en',
+        frequency: 15,  // minutes
+        label: 'TIER 2',
+        ageLimit: 180  // days
+    },
+    tier3: {
+        query: '("launching" OR "now live" OR "going live" OR announced OR airdrop OR presale OR "TGE coming") AND (DeFi OR DEX OR NFT OR DePIN OR RWA OR "AI agent") -is:retweet lang:en',
+        frequency: 30,  // minutes
+        label: 'TIER 3',
+        ageLimit: 90  // days
+    }
+};
 
 // Fetch project account details
 async function fetchProjectDetails(username) {
@@ -57,108 +79,137 @@ function extractProjectHandle(text) {
     return mentions[0].replace('@', '');
 }
 
-// Scan X API for projects
-async function scanProjects(numQueries = 1) {
-    console.log(`🔍 Starting scan with mega query...`);
+// Scan X API for projects (tiered)
+async function scanProjects(tier = 'tier1') {
+    const tierConfig = SEARCH_TIERS[tier];
+    console.log(`🔍 Starting ${tierConfig.label} scan...`);
     
-    // Use the single mega query
-    const queries = SEARCH_TERMS;
-    
+    const query = tierConfig.query;
     const allProjects = [];
     
-    for (const query of queries) {
-        try {
-            // Calculate time window - last 15 minutes
-            const now = new Date();
-            const fifteenMinutesAgo = new Date(now.getTime() - 15 * 60 * 1000);
-            
-            // Query already includes -is:retweet
-            const params = new URLSearchParams({
-                query: query,
-                'max_results': '100',  // Increased to catch all tweets in 15-min window
-                'tweet.fields': 'created_at',
-                'user.fields': 'username,description,verified,created_at,url',
-                'expansions': 'author_id',
-                'start_time': fifteenMinutesAgo.toISOString()
-            });
-            
-            const response = await fetch(
-                `${TWITTER_BASE_URL}/tweets/search/recent?${params}`,
-                {
-                    headers: {
-                        'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}`
-                    }
+    // In-memory cache for mentioned projects (reduces duplicate API calls)
+    const projectCache = new Map();
+    
+    try {
+        // Calculate time window based on tier frequency
+        const now = new Date();
+        const windowMinutes = tierConfig.frequency;
+        const windowStart = new Date(now.getTime() - windowMinutes * 60 * 1000);
+        
+        const params = new URLSearchParams({
+            query: query,
+            'max_results': '100',
+            'tweet.fields': 'created_at',
+            'user.fields': 'username,description,verified,created_at,public_metrics,url',
+            'expansions': 'author_id',
+            'start_time': windowStart.toISOString()
+        });
+        
+        const response = await fetch(
+            `${TWITTER_BASE_URL}/tweets/search/recent?${params}`,
+            {
+                headers: {
+                    'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}`
                 }
-            );
-            
-            if (!response.ok) {
-                console.error(`Query "${query}" failed`);
+            }
+        );
+        
+        if (!response.ok) {
+            console.error(`${tierConfig.label} query failed:`, response.status);
+            return [];
+        }
+        
+        const data = await response.json();
+        
+        // DEBUG: Log query and results
+        console.log(`${tierConfig.label} query:`, query.substring(0, 100) + '...');
+        console.log(`${tierConfig.label} tweets returned:`, data.data?.length || 0);
+        
+        if (!data.data || data.data.length === 0) {
+            console.log(`${tierConfig.label}: No tweets found in last ${windowMinutes} minutes`);
+            return [];
+        }
+        
+        // Build user map
+        const users = {};
+        if (data.includes && data.includes.users) {
+            data.includes.users.forEach(user => {
+                users[user.id] = user;
+            });
+        }
+        
+        // Parse tweets
+        for (const tweet of data.data) {
+            // Skip retweets
+            if (tweet.text.startsWith('RT @')) {
                 continue;
             }
             
-            const data = await response.json();
+            const user = users[tweet.author_id] || {};
             
-            if (!data.data || data.data.length === 0) continue;
+            // HYBRID: Start with tweet author, but prefer mentioned project if different
+            let projectHandle = user.username;
+            let projectUser = user;  // Track which user data to use
             
-            // Build user map
-            const users = {};
-            if (data.includes && data.includes.users) {
-                data.includes.users.forEach(user => {
-                    users[user.id] = user;
-                });
+            const mention = extractProjectHandle(tweet.text);
+            if (mention && mention !== user.username) {
+                // Check cache first to avoid duplicate API calls
+                if (projectCache.has(mention)) {
+                    projectUser = projectCache.get(mention);
+                    projectHandle = mention;
+                    console.log(`📦 ${tierConfig.label}: Using cached data for @${mention}`);
+                } else {
+                    // Fetch the MENTIONED project's account details
+                    const fetchedProject = await fetchProjectDetails(mention);
+                    if (fetchedProject) {
+                        projectCache.set(mention, fetchedProject);  // Cache it
+                        projectUser = fetchedProject;  // Use mentioned project's data
+                        projectHandle = mention;
+                        console.log(`🔍 ${tierConfig.label}: Fetched fresh data for @${mention}`);
+                    } else {
+                        console.log(`⏭️ ${tierConfig.label}: Could not fetch @${mention}, using author instead`);
+                    }
+                }
             }
             
-            // Parse tweets
-            for (const tweet of data.data) {
-                // Skip retweets (tweets starting with "RT @")
-                if (tweet.text.startsWith('RT @')) {
-                    continue;
-                }
-                
-                const user = users[tweet.author_id] || {};
-                const projectHandle = extractProjectHandle(tweet.text);
-                
-                if (!projectHandle) continue;
-                
-                // Fetch the PROJECT account details (not tweet author)
-                const projectDetails = await fetchProjectDetails(projectHandle);
-                
-                if (!projectDetails) {
-                    console.log(`⏭️ Skipping @${projectHandle} - could not fetch account details`);
-                    continue;
-                }
-                
-                // Filter: Only accounts created on or after December 1, 2025
-                const accountCreated = new Date(projectDetails.created_at);
-                const cutoffDate = new Date('2025-12-01T00:00:00Z');
-                
-                if (accountCreated < cutoffDate) {
-                    console.log(`⏭️ Skipping @${projectHandle} - account too old (created ${accountCreated.toISOString().split('T')[0]})`);
-                    continue;
-                }
-                
-                console.log(`✅ Found project: @${projectHandle} (created ${accountCreated.toISOString().split('T')[0]})`);
-                
-                allProjects.push({
-                    tweet_id: tweet.id,
-                    project_handle: projectHandle,
-                    tweet_text: tweet.text,
-                    tweet_author: user.username,
-                    tweet_url: `https://twitter.com/${user.username}/status/${tweet.id}`,
-                    project_url: `https://twitter.com/${projectHandle}`,
-                    found_by_query: query
-                });
+            if (!projectHandle) continue;
+            
+            // Tiered age filter - check the PROJECT's age (not tweet author's age)
+            const accountCreated = new Date(projectUser.created_at);
+            const ageLimitDays = tierConfig.ageLimit || 90;
+            const cutoffDate = new Date(Date.now() - ageLimitDays * 24 * 60 * 60 * 1000);
+            
+            if (accountCreated < cutoffDate) {
+                console.log(`⏭️ ${tierConfig.label}: Skipping @${projectHandle} - account too old (${accountCreated.toISOString().split('T')[0]})`);
+                continue;
             }
             
-            // Small delay
-            await new Promise(resolve => setTimeout(resolve, 100));
+            console.log(`✅ ${tierConfig.label}: Found @${projectHandle} (created ${accountCreated.toISOString().split('T')[0]})`);
             
-        } catch (error) {
-            console.error(`Error with query "${query}":`, error.message);
+            // Store PROJECT's actual fetched data (not tweet author's data)
+            allProjects.push({
+                tweet_id: tweet.id,
+                project_handle: projectHandle,
+                tweet_text: tweet.text,
+                tweet_author: user.username,
+                tweet_url: `https://twitter.com/${user.username}/status/${tweet.id}`,
+                project_url: `https://twitter.com/${projectHandle}`,
+                account_created: projectUser.created_at,  // PROJECT's data
+                followers: projectUser.public_metrics?.followers_count || 0,  // PROJECT's data
+                verified: projectUser.verified || false,  // PROJECT's data
+                bio: projectUser.description || '',  // PROJECT's data
+                found_by_query: tierConfig.label,  // Store tier label
+                tier: tier  // Store tier ID
+            });
         }
+        
+    } catch (error) {
+        console.error(`${tierConfig.label} error:`, error.message);
+        return [];
     }
     
-    console.log(`📊 Found ${allProjects.length} tweets with project mentions`);
+    console.log(`📊 ${tierConfig.label}: Found ${allProjects.length} projects`);
+    console.log(`📦 ${tierConfig.label}: Cache hits saved ${projectCache.size} API calls`);
     
     // Deduplicate by tweet_id
     const unique = [];
@@ -170,48 +221,38 @@ async function scanProjects(numQueries = 1) {
         }
     }
     
-    console.log(`🎯 ${unique.length} unique tweets after deduplication`);
+    console.log(`✅ ${tierConfig.label}: ${unique.length} unique projects after deduplication`);
     
-    console.log(`✅ Found ${unique.length} unique projects from search`);
-    
-    // Map projects without verification (save API calls!)
-    const projects = unique.map(proj => ({
-        ...proj,
-        account_created: null, // Unknown
-        followers: 0,
-        verified: false,
-        bio: ''
-    }));
-    
-    // Save to database
-    if (projects.length > 0) {
+    // Save to database (FIX #4: Don't overwrite fetched data!)
+    if (unique.length > 0) {
         const { error } = await supabase
             .from('projects')
-            .upsert(projects.map(p => ({
+            .upsert(unique.map(p => ({
                 tweet_id: p.tweet_id,
                 project_handle: p.project_handle,
                 tweet_text: p.tweet_text,
                 tweet_author: p.tweet_author,
                 tweet_url: p.tweet_url,
                 project_url: p.project_url,
-                account_created: p.account_created,
-                followers: p.followers,
-                verified: p.verified,
-                bio: p.bio,
-                found_by_query: p.found_by_query,
+                account_created: p.account_created,  // Keep real data
+                followers: p.followers,  // Keep real data
+                verified: p.verified,  // Keep real data
+                bio: p.bio,  // Keep real data
+                found_by_query: p.found_by_query,  // Tier label
+                tier: p.tier,  // Tier ID
                 found_at: new Date().toISOString()
             })), {
                 onConflict: 'tweet_id'
             });
         
         if (error) {
-            console.error('❌ Database error:', error);
+            console.error(`❌ ${tierConfig.label} database error:`, error);
         } else {
-            console.log(`💾 Saved ${projects.length} projects to database`);
+            console.log(`💾 ${tierConfig.label}: Saved ${unique.length} projects to database`);
         }
     }
     
-    return projects;
+    return unique;
 }
 
 // ==========================================
@@ -350,12 +391,16 @@ app.get('/api/projects', async (req, res) => {
 // Trigger manual scan (rate limited)
 app.get('/api/scan', async (req, res) => {
     try {
-        const projects = await scanProjects(3); // 3 queries per manual scan
+        // Run all 3 tiers
+        const results = [];
+        results.push(...await scanProjects('tier1'));
+        results.push(...await scanProjects('tier2'));
+        results.push(...await scanProjects('tier3'));
         
         res.json({
             success: true,
-            message: `Scanned 3 queries, found ${projects.length} new projects`,
-            projects: projects
+            message: `Scanned all tiers, found ${results.length} new projects`,
+            projects: results
         });
     } catch (error) {
         res.status(500).json({
@@ -980,18 +1025,44 @@ app.delete('/api/admin/projects/filter', verifyAdmin, async (req, res) => {
 // CRON JOBS
 // ==========================================
 
-// Auto-scan every 15 minutes with time window
-cron.schedule('*/15 * * * *', async () => {
-    if (!scanningEnabled) {
-        console.log('⏸️ Auto-scan skipped (paused)');
-        return;
-    }
+// CRON JOBS - Tiered Scanning
+// ==========================================
+
+let scanningEnabled = true; // Control flag
+
+// TIER 1: Every 5 minutes (high-signal)
+cron.schedule('*/5 * * * *', async () => {
+    if (!scanningEnabled) return;
     
-    console.log('⏰ Auto-scan triggered (15-min window)');
+    console.log('⏰ TIER 1 scan triggered (every 5 min)');
     try {
-        await scanProjects(1); // 1 mega query per auto-scan
+        await scanProjects('tier1');
     } catch (error) {
-        console.error('Auto-scan error:', error);
+        console.error('Tier 1 scan error:', error);
+    }
+});
+
+// TIER 2: Every 15 minutes (builder signals)
+cron.schedule('*/15 * * * *', async () => {
+    if (!scanningEnabled) return;
+    
+    console.log('⏰ TIER 2 scan triggered (every 15 min)');
+    try {
+        await scanProjects('tier2');
+    } catch (error) {
+        console.error('Tier 2 scan error:', error);
+    }
+});
+
+// TIER 3: Every 30 minutes (discovery)
+cron.schedule('*/30 * * * *', async () => {
+    if (!scanningEnabled) return;
+    
+    console.log('⏰ TIER 3 scan triggered (every 30 min)');
+    try {
+        await scanProjects('tier3');
+    } catch (error) {
+        console.error('Tier 3 scan error:', error);
     }
 });
 
