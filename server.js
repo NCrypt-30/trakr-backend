@@ -153,16 +153,24 @@ async function scanProjects(numQueries = 5) {
                 
                 if (!projectHandle) continue;
                 
-                // Filter: Only accounts created on or after December 1, 2024
-                if (user.created_at) {
-                    const accountCreated = new Date(user.created_at);
-                    const cutoffDate = new Date('2024-12-01T00:00:00Z');
-                    
-                    if (accountCreated < cutoffDate) {
-                        console.log(`⏭️ Skipping @${projectHandle} - account too old (${accountCreated.toISOString().split('T')[0]})`);
-                        continue;
-                    }
+                // Fetch the PROJECT account details (not tweet author)
+                const projectDetails = await fetchProjectDetails(projectHandle);
+                
+                if (!projectDetails) {
+                    console.log(`⏭️ Skipping @${projectHandle} - could not fetch account details`);
+                    continue;
                 }
+                
+                // Filter: Only accounts created on or after December 1, 2025
+                const accountCreated = new Date(projectDetails.created_at);
+                const cutoffDate = new Date('2025-12-01T00:00:00Z');
+                
+                if (accountCreated < cutoffDate) {
+                    console.log(`⏭️ Skipping @${projectHandle} - account too old (created ${accountCreated.toISOString().split('T')[0]})`);
+                    continue;
+                }
+                
+                console.log(`✅ Found project: @${projectHandle} (created ${accountCreated.toISOString().split('T')[0]})`);
                 
                 allProjects.push({
                     tweet_id: tweet.id,
