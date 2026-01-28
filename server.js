@@ -478,9 +478,10 @@ app.get('/api/live-launches', async (req, res) => {
             });
         }
         
-        // Moralis Solana API - Get Pump.fun tokens and filter for graduated ones
-        // The graduated endpoint might not be available yet, so use pump tokens with filter
-        const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/pump?limit=100', {
+        // Moralis Solana API - Get graduated tokens
+        // Docs: https://docs.moralis.com/web3-data-api/solana/reference/token-api#get-graduated-tokens-by-exchange
+        // Use "pump" as the exchange identifier (Pump.fun tokens that completed bonding curve)
+        const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/exchange/pump/graduated', {
             headers: {
                 'Accept': 'application/json',
                 'X-API-Key': MORALIS_API_KEY
@@ -538,14 +539,8 @@ app.get('/api/live-launches', async (req, res) => {
             const address = token.address || token.mint || token.token_address;
             if (!address) return false;
             
-            // Must be graduated (check various possible field names)
-            const isGraduated = token.graduated || token.is_graduated || token.migrated || 
-                               token.bonding_curve_completed || token.raydium_migrated;
-            if (!isGraduated) return false; // Only show graduated tokens
-            
             // Get graduation timestamp
-            const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || 
-                               token.raydium_migration_time || token.bonding_curve_completion_time || token.timestamp;
+            const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
             if (!graduatedAt) return false; // Skip if no timestamp
             
             const graduatedTime = typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime();
@@ -603,7 +598,7 @@ app.get('/api/live-launches', async (req, res) => {
             totalScanned: tokens.length,
             launches: formatted,
             count: formatted.length,
-            message: 'NEW graduated tokens (only going forward)',
+            message: 'Graduated Pump.fun tokens (completed bonding curve)',
             scamFilterRate: `${tokens.length > 0 ? ((1 - formatted.length / tokens.length) * 100).toFixed(1) : '0'}%`
         });
         
