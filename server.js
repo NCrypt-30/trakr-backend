@@ -27,22 +27,22 @@ const TWITTER_BASE_URL = 'https://api.twitter.com/2';
 // SCANNER FUNCTIONS
 // ==========================================
 
-// 3-Tier Search System - X API v2 compatible (no lang:, no protocol)
+// 3-Tier Search System - X API v2 compatible (spaces instead of AND)
 const SEARCH_TIERS = {
     tier1: {
-        query: '(testnet OR deployed OR "smart contract deployed" OR "mainnet live" OR "devnet live" OR "no token" OR "pre-token") AND (DeFi OR rollup OR DEX OR DePIN OR RWA) -is:retweet',
+        query: '(testnet OR deployed OR "smart contract deployed" OR "mainnet live" OR "devnet live" OR "no token" OR "pre-token") (DeFi OR rollup OR DEX OR DePIN OR RWA) -is:retweet',
         frequency: 5,  // minutes
         label: 'TIER 1',
         ageLimit: 365  // days - builders often have older accounts
     },
     tier2: {
-        query: '(stealth OR shipping OR building OR "heads down" OR "working on" OR testnet) AND (DeFi OR rollup OR DEX OR DePIN OR RWA OR "AI agent") -is:retweet',
+        query: '(stealth OR shipping OR building OR "heads down" OR "working on" OR testnet) (DeFi OR rollup OR DEX OR DePIN OR RWA OR "AI agent") -is:retweet',
         frequency: 15,  // minutes
         label: 'TIER 2',
         ageLimit: 180  // days
     },
     tier3: {
-        query: '("launching" OR "now live" OR "going live" OR announced OR airdrop OR presale OR "TGE coming") AND (DeFi OR DEX OR NFT OR DePIN OR RWA OR "AI agent") -is:retweet',
+        query: '("launching" OR "now live" OR "going live" OR announced OR airdrop OR presale OR "TGE coming") (DeFi OR DEX OR NFT OR DePIN OR RWA OR "AI agent") -is:retweet',
         frequency: 30,  // minutes
         label: 'TIER 3',
         ageLimit: 90  // days
