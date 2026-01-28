@@ -457,8 +457,8 @@ app.get('/api/projects', async (req, res) => {
     }
 });
 
-// DexScreener Live Launches - Get tokens launched in last 1 hour
-app.get('/api/dexscreener-demo', async (req, res) => {
+// Live Launches - Get tokens launched in last 1 hour (using Birdeye API)
+app.get('/api/live-launches', async (req, res) => {
     try {
         console.log('🔍 Fetching live Solana launches from Birdeye...');
         
