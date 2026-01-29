@@ -518,6 +518,7 @@ app.get('/api/live-launches', async (req, res) => {
         }
         
         console.log(`📊 Moralis returned ${tokens.length} graduated tokens`);
+        console.log('🔍 First token sample:', JSON.stringify(tokens[0], null, 2));
         
         if (tokens.length === 0) {
             return res.json({
