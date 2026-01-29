@@ -618,18 +618,18 @@ app.get('/api/live-launches', async (req, res) => {
                 contract: address,
                 ageMinutes: ageMinutes,
                 liquidity: token.liquidity || token.reserve_in_usd || token.raydium_liquidity || 0,
-                price: token.price_usd || token.price || token.raydium_price || 0,
+                price: token.priceUsd || token.price_usd || token.price || token.priceNative || 0,
                 dex: 'raydium',
                 hasLogo: !!token.logo || !!token.image_uri || !!token.logoURI,
                 hasWebsite: !!token.website,
                 hasSocials: !!(token.twitter || token.telegram),
                 website: token.website || null,
                 dexscreenerUrl: `https://dexscreener.com/solana/${address}`,
-                jupiterUrl: `https://jup.ag/swap/SOL-${address}`,
+                jupiterUrl: `https://jup.ag/?sell=So11111111111111111111111111111111111111112&buy=${address}`,
                 raydiumUrl: `https://raydium.io/swap/?inputCurrency=sol&outputCurrency=${address}`,
                 priceChange: {
-                    m5: token.price_change_5m || token.priceChange5m || 0,
-                    h1: token.price_change_1h || token.priceChange1h || 0
+                    m5: token.priceChange5m || token.price_change_5m || token.priceChange?.['5m'] || 0,
+                    h1: token.priceChange1h || token.price_change_1h || token.priceChange?.['1h'] || 0
                 },
                 graduated: true,
                 marketCap: token.market_cap || token.marketCap || 0,
