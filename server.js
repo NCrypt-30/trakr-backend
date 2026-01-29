@@ -459,7 +459,19 @@ app.get('/api/projects', async (req, res) => {
 
 // Live Launches - Get graduated Pump.fun tokens (using Moralis API)
 // Track last check time to only show NEW graduations going forward
-let lastGraduationCheck = Date.now(); // Initialize to now (ignore past graduations)
+// FIX: Start by looking back 1 hour (3600000ms) instead of starting from "now"
+let lastGraduationCheck = Date.now() - (60 * 60 * 1000); // Look back 1 hour on startup
+
+// SAFETY NET: Track seen tokens to prevent duplicates (in-memory)
+const seenTokens = new Set();
+
+// Clean up old seen tokens every hour to prevent memory bloat
+setInterval(() => {
+    if (seenTokens.size > 1000) {
+        console.log(`🧹 Cleaning up seen tokens cache (${seenTokens.size} entries)`);
+        seenTokens.clear();
+    }
+}, 60 * 60 * 1000); // Every hour
 
 app.get('/api/live-launches', async (req, res) => {
     try {
@@ -480,8 +492,8 @@ app.get('/api/live-launches', async (req, res) => {
         
         // Moralis Solana API - Get graduated tokens
         // Docs: https://docs.moralis.com/web3-data-api/solana/reference/token-api#get-graduated-tokens-by-exchange
-        // Try "pumpfun" as one word
-        const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/graduated', {
+        // Use "pump" as the exchange identifier (Pump.fun tokens that completed bonding curve)
+        const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/exchange/pump/graduated', {
             headers: {
                 'Accept': 'application/json',
                 'X-API-Key': MORALIS_API_KEY
@@ -518,7 +530,6 @@ app.get('/api/live-launches', async (req, res) => {
         }
         
         console.log(`📊 Moralis returned ${tokens.length} graduated tokens`);
-        console.log('🔍 First token sample:', JSON.stringify(tokens[0], null, 2));
         
         if (tokens.length === 0) {
             return res.json({
@@ -535,10 +546,22 @@ app.get('/api/live-launches', async (req, res) => {
         // ONLY show graduations AFTER last check (going forward only, ignore past)
         const currentCheckTime = Date.now();
         
+        // Better logging to debug the filtering
+        console.log(`⏰ Last check was at: ${new Date(lastGraduationCheck).toISOString()}`);
+        console.log(`⏰ Current check is at: ${new Date(currentCheckTime).toISOString()}`);
+        console.log(`⏰ Time window: ${Math.floor((currentCheckTime - lastGraduationCheck) / 1000 / 60)} minutes`);
+        console.log(`🗂️ Currently tracking ${seenTokens.size} seen tokens`);
+        
         const newGraduations = tokens.filter(token => {
             // Must have address
             const address = token.address || token.mint || token.token_address;
             if (!address) return false;
+            
+            // DEDUPLICATION CHECK #1: Have we seen this token before?
+            if (seenTokens.has(address)) {
+                console.log(`⏭️ Skipping ${token.symbol || 'UNKNOWN'} (${address.slice(0, 8)}...): already seen (dedup)`);
+                return false;
+            }
             
             // Get graduation timestamp
             const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
@@ -546,10 +569,24 @@ app.get('/api/live-launches', async (req, res) => {
             
             const graduatedTime = typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime();
             
+            // Add debug logging
+            const minutesAgo = Math.floor((currentCheckTime - graduatedTime) / 1000 / 60);
+            const isNew = graduatedTime > lastGraduationCheck;
+            
+            // DEDUPLICATION CHECK #2: Time-based filter
+            if (!isNew) {
+                console.log(`⏭️ Skipping ${token.symbol || 'UNKNOWN'}: graduated ${minutesAgo} min ago (before last check)`);
+            } else {
+                console.log(`✅ Including ${token.symbol || 'UNKNOWN'}: graduated ${minutesAgo} min ago (NEW!)`);
+            }
+            
             // CRITICAL: Only include if graduated AFTER our last check
             if (graduatedTime <= lastGraduationCheck) {
                 return false; // Skip - this graduated before we started watching
             }
+            
+            // Mark as seen (add to deduplication set)
+            seenTokens.add(address);
             
             return true;
         });
@@ -558,6 +595,7 @@ app.get('/api/live-launches', async (req, res) => {
         lastGraduationCheck = currentCheckTime;
         
         console.log(`✅ Found ${newGraduations.length} NEW graduations since last check (filtered from ${tokens.length} total)`);
+        console.log(`🗂️ Now tracking ${seenTokens.size} seen tokens`);
         
         // Format results
         const formatted = newGraduations.map(token => {
@@ -600,7 +638,8 @@ app.get('/api/live-launches', async (req, res) => {
             launches: formatted,
             count: formatted.length,
             message: 'Graduated Pump.fun tokens (completed bonding curve)',
-            scamFilterRate: `${tokens.length > 0 ? ((1 - formatted.length / tokens.length) * 100).toFixed(1) : '0'}%`
+            scamFilterRate: `${tokens.length > 0 ? ((1 - formatted.length / tokens.length) * 100).toFixed(1) : '0'}%`,
+            seenTokensCount: seenTokens.size // For debugging
         });
         
     } catch (error) {
