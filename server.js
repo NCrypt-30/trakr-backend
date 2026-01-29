@@ -554,8 +554,11 @@ app.get('/api/live-launches', async (req, res) => {
         
         const newGraduations = tokens.filter(token => {
             // Must have address
-            const address = token.address || token.mint || token.token_address;
-            if (!address) return false;
+            const address = token.address || token.mint || token.token_address || token.tokenAddress;
+            if (!address) {
+                console.log('⏭️ Skipping token: no address');
+                return false;
+            }
             
             // DEDUPLICATION CHECK #1: Have we seen this token before?
             if (seenTokens.has(address)) {
@@ -565,7 +568,10 @@ app.get('/api/live-launches', async (req, res) => {
             
             // Get graduation timestamp
             const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
-            if (!graduatedAt) return false; // Skip if no timestamp
+            if (!graduatedAt) {
+                console.log(`⏭️ Skipping ${token.symbol || 'UNKNOWN'}: no timestamp`);
+                return false; // Skip if no timestamp
+            }
             
             const graduatedTime = typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime();
             
@@ -599,7 +605,7 @@ app.get('/api/live-launches', async (req, res) => {
         
         // Format results
         const formatted = newGraduations.map(token => {
-            const address = token.address || token.mint || token.token_address;
+            const address = token.address || token.mint || token.token_address || token.tokenAddress;
             const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
             
             const ageMinutes = graduatedAt 
