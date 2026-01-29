@@ -492,8 +492,8 @@ app.get('/api/live-launches', async (req, res) => {
         
         // Moralis Solana API - Get graduated tokens
         // Docs: https://docs.moralis.com/web3-data-api/solana/reference/token-api#get-graduated-tokens-by-exchange
-        // Use "pump" as the exchange identifier (Pump.fun tokens that completed bonding curve)
-        const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/exchange/pump/graduated', {
+        // Use "pumpfun" as the exchange identifier (Pump.fun tokens that completed bonding curve)
+        const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/graduated', {
             headers: {
                 'Accept': 'application/json',
                 'X-API-Key': MORALIS_API_KEY
