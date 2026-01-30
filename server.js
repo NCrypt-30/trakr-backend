@@ -657,6 +657,219 @@ app.get('/api/live-launches', async (req, res) => {
     }
 });
 
+// ==========================================
+// AUTO-TRADER PRICE MONITORING
+// ==========================================
+
+// Bulk token prices endpoint - for auto-trader position monitoring
+// Fetches current prices for up to 20 tokens in parallel
+// Called every 1 second by extension to check positions
+app.post('/api/token-prices', async (req, res) => {
+    try {
+        const { contracts } = req.body;
+        
+        // Validation
+        if (!contracts || !Array.isArray(contracts) || contracts.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'Array of contract addresses required',
+                example: { contracts: ["ABC123...", "DEF456..."] }
+            });
+        }
+        
+        if (contracts.length > 20) {
+            return res.status(400).json({
+                success: false,
+                error: 'Maximum 20 contracts per request',
+                received: contracts.length
+            });
+        }
+        
+        console.log(`💰 Fetching prices for ${contracts.length} tokens...`);
+        const startTime = Date.now();
+        
+        // Fetch all prices in PARALLEL for speed
+        const pricePromises = contracts.map(async (contract) => {
+            try {
+                // DexScreener API - free, reliable, real-time
+                const url = `https://api.dexscreener.com/latest/dex/tokens/${contract}`;
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 3000); // 3s timeout
+                
+                const response = await fetch(url, {
+                    signal: controller.signal
+                });
+                clearTimeout(timeout);
+                
+                if (!response.ok) {
+                    console.error(`DexScreener error for ${contract.slice(0, 8)}: ${response.status}`);
+                    return {
+                        contract: contract,
+                        success: false,
+                        error: `API returned ${response.status}`
+                    };
+                }
+                
+                const data = await response.json();
+                
+                // Check if token has trading pairs
+                if (!data.pairs || data.pairs.length === 0) {
+                    return {
+                        contract: contract,
+                        success: false,
+                        error: 'No trading pairs found'
+                    };
+                }
+                
+                // Get most liquid pair (usually first)
+                const pair = data.pairs[0];
+                
+                return {
+                    contract: contract,
+                    success: true,
+                    price: pair.priceUsd || '0',
+                    priceNative: pair.priceNative || '0',
+                    priceChange: {
+                        m5: parseFloat(pair.priceChange?.m5 || 0),
+                        h1: parseFloat(pair.priceChange?.h1 || 0),
+                        h6: parseFloat(pair.priceChange?.h6 || 0),
+                        h24: parseFloat(pair.priceChange?.h24 || 0)
+                    },
+                    volume: {
+                        m5: parseFloat(pair.volume?.m5 || 0),
+                        h1: parseFloat(pair.volume?.h1 || 0),
+                        h6: parseFloat(pair.volume?.h6 || 0),
+                        h24: parseFloat(pair.volume?.h24 || 0)
+                    },
+                    liquidity: {
+                        usd: parseFloat(pair.liquidity?.usd || 0),
+                        base: parseFloat(pair.liquidity?.base || 0),
+                        quote: parseFloat(pair.liquidity?.quote || 0)
+                    },
+                    pairAddress: pair.pairAddress,
+                    dexId: pair.dexId,
+                    url: pair.url
+                };
+                
+            } catch (error) {
+                console.error(`Error fetching ${contract.slice(0, 8)}:`, error.message);
+                return {
+                    contract: contract,
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+        
+        // Wait for ALL requests to complete
+        const prices = await Promise.all(pricePromises);
+        
+        const elapsed = Date.now() - startTime;
+        const successCount = prices.filter(p => p.success).length;
+        const failedCount = prices.length - successCount;
+        
+        console.log(`✅ Fetched ${successCount}/${contracts.length} prices in ${elapsed}ms (${failedCount} failed)`);
+        
+        res.json({
+            success: true,
+            prices: prices,
+            count: prices.length,
+            successCount: successCount,
+            failedCount: failedCount,
+            elapsed: elapsed,
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('❌ Bulk price fetch error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch token prices',
+            message: error.message
+        });
+    }
+});
+
+// Single token price endpoint - for quick individual checks
+app.get('/api/token-price/:contract', async (req, res) => {
+    try {
+        const { contract } = req.params;
+        
+        if (!contract) {
+            return res.status(400).json({
+                success: false,
+                error: 'Contract address required'
+            });
+        }
+        
+        console.log(`💰 Fetching price for: ${contract.slice(0, 8)}...`);
+        
+        // DexScreener API
+        const url = `https://api.dexscreener.com/latest/dex/tokens/${contract}`;
+        const response = await fetch(url);
+        
+        if (!response.ok) {
+            return res.status(response.status).json({
+                success: false,
+                error: `DexScreener API returned ${response.status}`
+            });
+        }
+        
+        const data = await response.json();
+        
+        if (!data.pairs || data.pairs.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'No trading pairs found for this token'
+            });
+        }
+        
+        const pair = data.pairs[0];
+        
+        res.json({
+            success: true,
+            contract: contract,
+            symbol: pair.baseToken?.symbol || 'UNKNOWN',
+            name: pair.baseToken?.name || 'Unknown Token',
+            price: pair.priceUsd || '0',
+            priceNative: pair.priceNative || '0',
+            priceChange: {
+                m5: parseFloat(pair.priceChange?.m5 || 0),
+                h1: parseFloat(pair.priceChange?.h1 || 0),
+                h6: parseFloat(pair.priceChange?.h6 || 0),
+                h24: parseFloat(pair.priceChange?.h24 || 0)
+            },
+            volume: {
+                m5: parseFloat(pair.volume?.m5 || 0),
+                h1: parseFloat(pair.volume?.h1 || 0),
+                h6: parseFloat(pair.volume?.h6 || 0),
+                h24: parseFloat(pair.volume?.h24 || 0)
+            },
+            liquidity: {
+                usd: parseFloat(pair.liquidity?.usd || 0)
+            },
+            txns: {
+                m5: pair.txns?.m5 || { buys: 0, sells: 0 },
+                h1: pair.txns?.h1 || { buys: 0, sells: 0 },
+                h6: pair.txns?.h6 || { buys: 0, sells: 0 },
+                h24: pair.txns?.h24 || { buys: 0, sells: 0 }
+            },
+            pairAddress: pair.pairAddress,
+            dexId: pair.dexId,
+            url: pair.url,
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('❌ Token price error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch token price',
+            message: error.message
+        });
+    }
+});
+
 // Trigger manual scan (rate limited)
 app.get('/api/scan', async (req, res) => {
     try {
