@@ -1565,6 +1565,83 @@ cron.schedule('*/15 * * * *', async () => {
 });
 
 // ==========================================
+// JUPITER API PROXY (for Chrome Extension)
+// ==========================================
+
+// GET /jupiter/quote - Proxy Jupiter quote requests
+app.get('/jupiter/quote', async (req, res) => {
+    try {
+        const url = 'https://quote-api.jup.ag/v6/quote?' + 
+            new URLSearchParams(req.query);
+        
+        console.log('📊 Jupiter quote request:', url);
+        
+        const response = await fetch(url, {
+            method: 'GET',
+            headers: { 'Accept': 'application/json' }
+        });
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('❌ Jupiter quote error:', response.status, errorText);
+            return res.status(response.status).json({
+                error: 'Jupiter quote failed',
+                status: response.status,
+                message: errorText
+            });
+        }
+        
+        const data = await response.json();
+        console.log('✅ Quote success');
+        res.json(data);
+        
+    } catch (error) {
+        console.error('❌ Quote proxy error:', error);
+        res.status(500).json({
+            error: 'Proxy error',
+            message: error.message
+        });
+    }
+});
+
+// POST /jupiter/swap - Proxy Jupiter swap requests
+app.post('/jupiter/swap', async (req, res) => {
+    try {
+        console.log('🔄 Jupiter swap request');
+        
+        const response = await fetch('https://quote-api.jup.ag/v6/swap', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
+            body: JSON.stringify(req.body)
+        });
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('❌ Jupiter swap error:', response.status, errorText);
+            return res.status(response.status).json({
+                error: 'Jupiter swap failed',
+                status: response.status,
+                message: errorText
+            });
+        }
+        
+        const data = await response.json();
+        console.log('✅ Swap success');
+        res.json(data);
+        
+    } catch (error) {
+        console.error('❌ Swap proxy error:', error);
+        res.status(500).json({
+            error: 'Proxy error',
+            message: error.message
+        });
+    }
+});
+
+// ==========================================
 // START SERVER
 // ==========================================
 
@@ -1586,4 +1663,6 @@ app.listen(PORT, () => {
     console.log(`   DELETE /api/admin/projects/clear-all`);
     console.log(`   DELETE /api/admin/projects/clear-old`);
     console.log(`   DELETE /api/admin/projects/filter`);
+    console.log(`   GET  /jupiter/quote (Jupiter proxy)`);
+    console.log(`   POST /jupiter/swap (Jupiter proxy)`);
 });
