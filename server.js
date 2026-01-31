@@ -1574,7 +1574,7 @@ cron.schedule('*/15 * * * *', async () => {
 // GET /jupiter/quote - Proxy Jupiter quote requests
 app.get('/jupiter/quote', async (req, res) => {
     try {
-        const url = 'https://quote-api.jup.ag/v6/quote?' + 
+        const url = 'https://api.jup.ag/v6/quote?' + 
             new URLSearchParams(req.query);
         
         console.log('📊 Jupiter quote request:', url);
@@ -1612,7 +1612,7 @@ app.post('/jupiter/swap', async (req, res) => {
     try {
         console.log('🔄 Jupiter swap request');
         
-        const response = await fetch('https://quote-api.jup.ag/v6/swap', {
+        const response = await fetch('https://api.jup.ag/v6/swap', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
