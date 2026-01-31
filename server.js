@@ -1581,7 +1581,10 @@ app.get('/jupiter/quote', async (req, res) => {
         
         const response = await fetch(url, {
             method: 'GET',
-            headers: { 'Accept': 'application/json' }
+            headers: { 
+                'Accept': 'application/json',
+                'x-api-key': process.env.JUPITER_API_KEY
+            }
         });
         
         if (!response.ok) {
@@ -1616,7 +1619,8 @@ app.post('/jupiter/swap', async (req, res) => {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Accept': 'application/json'
+                'Accept': 'application/json',
+                'x-api-key': process.env.JUPITER_API_KEY
             },
             body: JSON.stringify(req.body)
         });
