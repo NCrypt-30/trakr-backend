@@ -287,8 +287,23 @@ async function verifyGraduation(signature) {
     }
 }
 
+// Track transactions being processed to avoid duplicates
+const processingTransactions = new Set();
+
 // Process a detected graduation - fetch token details
 async function processGraduation(signature, logs) {
+    // Deduplicate - skip if already processing this transaction
+    if (processingTransactions.has(signature)) {
+        return;
+    }
+    processingTransactions.add(signature);
+    
+    // Clean up old entries (keep set small)
+    if (processingTransactions.size > 200) {
+        const entries = Array.from(processingTransactions);
+        entries.slice(0, 100).forEach(s => processingTransactions.delete(s));
+    }
+    
     try {
         // Extract token mint from logs if possible
         let tokenMint = null;
@@ -298,9 +313,16 @@ async function processGraduation(signature, logs) {
         
         // Debug: Print first few logs to see format
         console.log(`   📋 Logs received (${logs.length} entries):`);
-        logs.slice(0, 5).forEach((log, i) => {
-            console.log(`      [${i}]: ${log.slice(0, 80)}...`);
+        logs.slice(0, 8).forEach((log, i) => {
+            console.log(`      [${i}]: ${log.slice(0, 100)}...`);
         });
+        
+        // Also check if ANY log contains "pump" anywhere
+        const logsWithPump = logs.filter(l => l.toLowerCase().includes('pump'));
+        if (logsWithPump.length > 0) {
+            console.log(`   🔍 Found ${logsWithPump.length} logs containing 'pump':`);
+            logsWithPump.slice(0, 3).forEach(l => console.log(`      ${l.slice(0, 100)}`));
+        }
         
         // Method 1: Look for any Solana address ending with "pump" (pump.fun tokens)
         // Pump.fun mints are 43-44 chars and end with "pump"
@@ -323,10 +345,26 @@ async function processGraduation(signature, logs) {
             }
         }
         
-        // Method 3: If still no mint, try to fetch from transaction (rate limited)
+        // Method 3: If still no mint, try to fetch from transaction WITH RETRY
+        // The WebSocket is faster than RPC confirmation, so we need to wait
         if (!tokenMint) {
-            console.log(`   🔍 No pump token in logs, fetching transaction...`);
-            tokenMint = await extractMintFromTransaction(signature);
+            console.log(`   🔍 No pump token in logs, fetching transaction (with retry)...`);
+            
+            // Try up to 3 times with increasing delays
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                // Wait before fetching (transaction needs time to confirm)
+                const delay = attempt * 1000; // 1s, 2s, 3s
+                await new Promise(r => setTimeout(r, delay));
+                
+                tokenMint = await extractMintFromTransaction(signature);
+                
+                if (tokenMint) {
+                    console.log(`   ✅ Found token on attempt ${attempt}`);
+                    break;
+                } else if (attempt < 3) {
+                    console.log(`   ⏳ Attempt ${attempt} failed, retrying in ${attempt + 1}s...`);
+                }
+            }
         }
         
         if (!tokenMint) {
@@ -605,58 +643,26 @@ app.get('/api/live-launches/fast', async (req, res) => {
     try {
         const now = Date.now();
         
-        // Get WebSocket graduations (fast, real-time)
+        // Get WebSocket graduations (fast, real-time) - NO MORALIS FALLBACK
         const wsLaunches = wsGraduations.map(g => ({
             ...g,
             ageMinutes: Math.floor((now - g.detectedAt) / (1000 * 60))
         })).filter(l => l.ageMinutes < 60); // Last hour only
         
-        // If WebSocket is connected, ALWAYS use WebSocket data (even if empty)
-        // This prevents old Moralis data from appearing on fresh deploys
-        if (wsConnected) {
-            return res.json({
-                success: true,
-                source: 'helius_websocket',
-                timestamp: new Date().toISOString(),
-                launches: wsLaunches,
-                count: wsLaunches.length,
-                wsConnected: true,
-                message: wsLaunches.length > 0 
+        // Always return WebSocket data (even if empty, even if disconnected)
+        return res.json({
+            success: true,
+            source: 'helius_websocket',
+            timestamp: new Date().toISOString(),
+            launches: wsLaunches,
+            count: wsLaunches.length,
+            wsConnected: wsConnected,
+            message: !wsConnected 
+                ? 'WebSocket disconnected - reconnecting...'
+                : wsLaunches.length > 0 
                     ? 'Real-time graduations via Helius WebSocket'
                     : 'WebSocket connected, waiting for graduations...'
-            });
-        }
-        
-        // ONLY fallback to Moralis if WebSocket is DISCONNECTED
-        console.log('⚠️ WebSocket disconnected, falling back to Moralis...');
-        
-        // Forward to existing Moralis endpoint internally
-        try {
-            const moralisResponse = await fetch(`http://localhost:${PORT}/api/live-launches`);
-            
-            if (!moralisResponse.ok) {
-                throw new Error(`Moralis endpoint returned ${moralisResponse.status}`);
-            }
-            
-            const moralisData = await moralisResponse.json();
-            
-            // Mark source
-            moralisData.source = 'moralis_fallback';
-            moralisData.wsConnected = wsConnected;
-            
-            res.json(moralisData);
-        } catch (fallbackError) {
-            console.error('❌ Moralis fallback failed:', fallbackError.message);
-            // Return empty but valid response
-            res.json({
-                success: true,
-                source: 'none',
-                launches: [],
-                count: 0,
-                message: 'WebSocket has no data and Moralis fallback failed',
-                wsConnected: wsConnected
-            });
-        }
+        });
         
     } catch (error) {
         console.error('❌ Fast Live Launches error:', error);
