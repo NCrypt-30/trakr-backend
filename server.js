@@ -37,8 +37,14 @@ const HELIUS_WS_URL = HELIUS_API_KEY
     ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`
     : null;
 
-// PumpSwap AMM Program ID (where Pump.fun tokens graduate to)
-// Verified: https://solscan.io/account/pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
+// Raydium AMM Program ID - this is where pump.fun tokens graduate TO
+// When a pump.fun token graduates, a new Raydium pool is created
+const RAYDIUM_AMM_PROGRAM_ID = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+
+// Pump.fun migration authority PDA - confirms this is a pump.fun graduation
+const PUMPFUN_MIGRATION_AUTHORITY = 'Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1';
+
+// PumpSwap program (kept for backward compatibility in verification)
 const PUMPSWAP_PROGRAM_ID = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
 
 // Store WebSocket-detected graduations (in-memory, last 100)
@@ -67,387 +73,22 @@ async function rateLimitedRpcCall() {
     lastRpcCallTime = Date.now();
 }
 
-// Initialize Helius WebSocket connection
-function initHeliusWebSocket() {
-    // Check if API key is configured
-    if (!HELIUS_API_KEY) {
-        console.log('⚠️ HELIUS_API_KEY not set - WebSocket graduation detection disabled');
-        console.log('   Get a free API key at: https://dashboard.helius.dev');
-        console.log('   Using Moralis fallback only (2-minute polling)');
-        return;
-    }
-    
-    if (heliusWs && wsConnected) {
-        console.log('⚡ Helius WebSocket already connected');
-        return;
-    }
+// ===========================================
+// HELIUS WEBHOOK (replaces WebSocket subscription)
+// ===========================================
+// WebSocket subscription is REMOVED - it was detecting ALL pump.fun activity
+// Instead, use Helius Webhook configured to listen to Raydium AMM
+// This gives us ONLY graduations (Raydium pool creations with pump.fun tokens)
+//
+// Setup in Helius Dashboard:
+// 1. Go to https://dev.helius.xyz/webhooks
+// 2. Create webhook: https://trakr-backend-0v6u.onrender.com/webhooks/helius
+// 3. Add account: 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 (Raydium AMM)
+//
+// The webhook endpoint is defined below in the Express routes section
 
-    console.log('⚡ Connecting to Helius WebSocket...');
-    console.log(`   URL: wss://mainnet.helius-rpc.com/?api-key=****`);
-    console.log(`   Monitoring: ${PUMPSWAP_PROGRAM_ID}`);
-    
-    try {
-        heliusWs = new WebSocket(HELIUS_WS_URL);
-        
-        heliusWs.on('open', () => {
-            console.log('✅ Helius WebSocket connected!');
-            wsConnected = true;
-            wsConnectedAt = Date.now(); // Track connection time for grace period
-            wsReconnectAttempts = 0;
-            console.log(`⏳ Ignoring transactions for ${STARTUP_GRACE_PERIOD_MS/1000}s (startup grace period)...`);
-            
-            // Subscribe to PumpSwap program logs (graduations)
-            const subscribeMsg = {
-                jsonrpc: '2.0',
-                id: 1,
-                method: 'logsSubscribe',
-                params: [
-                    {
-                        mentions: [PUMPSWAP_PROGRAM_ID]
-                    },
-                    {
-                        commitment: 'confirmed'
-                    }
-                ]
-            };
-            
-            heliusWs.send(JSON.stringify(subscribeMsg));
-            console.log(`📡 Subscribed to PumpSwap program: ${PUMPSWAP_PROGRAM_ID}`);
-        });
-        
-        heliusWs.on('message', async (data) => {
-            try {
-                const message = JSON.parse(data.toString());
-                
-                // Handle subscription confirmation
-                if (message.result !== undefined && message.id === 1) {
-                    console.log(`✅ Subscription confirmed, ID: ${message.result}`);
-                    return;
-                }
-                
-                // Handle log notifications
-                if (message.method === 'logsNotification') {
-                    const logs = message.params?.result?.value?.logs || [];
-                    const signature = message.params?.result?.value?.signature;
-                    const err = message.params?.result?.value?.err;
-                    
-                    // Skip failed transactions or missing signature
-                    if (err || !signature) return;
-                    
-                    // Check if already processing this TX (dedupe)
-                    if (processingTransactions.has(signature)) return;
-                    
-                    // Join logs and find ALL instructions
-                    const logsText = logs.join('\n');
-                    
-                    // DEBUG: Print what instruction we found
-                    const instructionMatch = logsText.match(/Instruction: (\w+)/g);
-                    if (instructionMatch) {
-                        console.log(`📋 TX ${signature.slice(0,8)}... Instructions: ${instructionMatch.join(', ')}`);
-                    }
-                    
-                    // STRICT CHECK: Must have EXACTLY "Instruction: Migrate"
-                    if (!logsText.includes('Instruction: Migrate')) return;
-                    
-                    // Double check - reject if it has Create/Initialize (new token, not graduation)
-                    if (logsText.includes('Instruction: Create') || logsText.includes('Instruction: Initialize')) {
-                        console.log(`   ⏭️ Skipping - this is a CREATE, not a graduation`);
-                        return;
-                    }
-                    
-                    // Check grace period (ignore first 30s after connect)
-                    const timeSinceConnect = Date.now() - wsConnectedAt;
-                    if (timeSinceConnect < STARTUP_GRACE_PERIOD_MS) {
-                        console.log(`⏭️ Skipping (grace period: ${Math.ceil((STARTUP_GRACE_PERIOD_MS - timeSinceConnect)/1000)}s left)`);
-                        return;
-                    }
-                    
-                    // Mark as processing
-                    processingTransactions.add(signature);
-                    if (processingTransactions.size > 100) {
-                        const first = processingTransactions.values().next().value;
-                        processingTransactions.delete(first);
-                    }
-                    
-                    // This is a real graduation!
-                    console.log(`🎓 GRADUATION: ${signature.slice(0, 20)}...`);
-                    await processGraduation(signature, logs);
-                }
-            } catch (error) {
-                // Silently ignore parse errors
-            }
-        });
-        
-        heliusWs.on('close', (code, reason) => {
-            console.log(`⚠️ Helius WebSocket closed: ${code} - ${reason}`);
-            wsConnected = false;
-            scheduleReconnect();
-        });
-        
-        heliusWs.on('error', (error) => {
-            console.error('❌ Helius WebSocket error:', error.message);
-            wsConnected = false;
-        });
-        
-        // Keep connection alive with ping
-        setInterval(() => {
-            if (heliusWs && wsConnected && heliusWs.readyState === WebSocket.OPEN) {
-                heliusWs.ping();
-            }
-        }, 30000); // Ping every 30 seconds
-        
-    } catch (error) {
-        console.error('❌ Failed to initialize Helius WebSocket:', error.message);
-        scheduleReconnect();
-    }
-}
-
-// Schedule reconnection with exponential backoff
-function scheduleReconnect() {
-    if (wsReconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        console.error('❌ Max WebSocket reconnection attempts reached. Using Moralis fallback.');
-        return;
-    }
-    
-    wsReconnectAttempts++;
-    const delay = RECONNECT_DELAY_MS * Math.pow(2, wsReconnectAttempts - 1);
-    
-    console.log(`🔄 Reconnecting to Helius WebSocket in ${delay / 1000}s (attempt ${wsReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-    
-    setTimeout(() => {
-        initHeliusWebSocket();
-    }, delay);
-}
-
-// Verify if a transaction is actually a create_pool (graduation)
-async function verifyGraduation(signature) {
-    try {
-        // Use Helius RPC to fetch transaction details
-        const rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-        
-        const response = await fetch(rpcUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                jsonrpc: '2.0',
-                id: 1,
-                method: 'getTransaction',
-                params: [
-                    signature,
-                    { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }
-                ]
-            })
-        });
-        
-        if (!response.ok) return false;
-        
-        const data = await response.json();
-        
-        if (!data.result) return false;
-        
-        // Check instructions for create_pool
-        const instructions = data.result.transaction?.message?.instructions || [];
-        const innerInstructions = data.result.meta?.innerInstructions || [];
-        
-        // Flatten all instructions
-        const allInstructions = [
-            ...instructions,
-            ...innerInstructions.flatMap(ii => ii.instructions || [])
-        ];
-        
-        // Look for create_pool instruction targeting PumpSwap
-        for (const ix of allInstructions) {
-            const programId = ix.programId || ix.program;
-            
-            // Check if instruction is for PumpSwap
-            if (programId === PUMPSWAP_PROGRAM_ID) {
-                // If it's a parsed instruction, check the type
-                if (ix.parsed?.type === 'createPool' || ix.parsed?.type === 'create_pool') {
-                    return true;
-                }
-                
-                // For unparsed instructions, check the data prefix
-                // create_pool instruction typically has a specific discriminator
-                if (ix.data) {
-                    // The first 8 bytes of instruction data is the discriminator
-                    // We'd need to know the exact discriminator for create_pool
-                    // For now, accept any PumpSwap instruction that's not a swap
-                    return true;
-                }
-            }
-        }
-        
-        // Also check if this transaction created new accounts (typical for pool creation)
-        const preTokenBalances = data.result.meta?.preTokenBalances || [];
-        const postTokenBalances = data.result.meta?.postTokenBalances || [];
-        
-        // Pool creation typically creates new token accounts
-        const newAccounts = postTokenBalances.filter(post => 
-            !preTokenBalances.some(pre => pre.accountIndex === post.accountIndex)
-        );
-        
-        // If multiple new token accounts were created, likely a pool creation
-        if (newAccounts.length >= 2) {
-            // Double check it involves a pump token (ends with "pump")
-            const accountKeys = data.result.transaction?.message?.accountKeys || [];
-            const hasPumpToken = accountKeys.some(key => {
-                const pubkey = key.pubkey || key;
-                return typeof pubkey === 'string' && pubkey.endsWith('pump');
-            });
-            
-            if (hasPumpToken) {
-                return true;
-            }
-        }
-        
-        return false;
-        
-    } catch (error) {
-        console.error('Error verifying graduation:', error.message);
-        // On error, assume it could be a graduation to not miss any
-        return true;
-    }
-}
-
-// Track transactions being processed to avoid duplicates
+// Track processed transactions to avoid duplicates
 const processingTransactions = new Set();
-
-// Process a detected graduation - fetch token details
-async function processGraduation(signature, logs) {
-    try {
-        // First, fetch the transaction to check its age
-        console.log(`   ⏳ Checking transaction age...`);
-        await new Promise(r => setTimeout(r, 3000)); // Wait 3s for confirmation
-        
-        const txData = await fetchTransactionWithTimestamp(signature);
-        
-        if (!txData) {
-            console.log(`   ❌ Could not fetch transaction`);
-            return;
-        }
-        
-        // Check if transaction is recent (within last 60 seconds)
-        const txAgeSeconds = (Date.now() / 1000) - txData.blockTime;
-        if (txAgeSeconds > 60) {
-            console.log(`   ⏭️ OLD TRANSACTION (${Math.floor(txAgeSeconds)}s old) - skipping`);
-            return;
-        }
-        
-        console.log(`   ✅ Fresh transaction (${Math.floor(txAgeSeconds)}s old)`);
-        
-        // Get token mint from the transaction data
-        let tokenMint = txData.tokenMint;
-        
-        if (!tokenMint) {
-            console.log(`   ❌ No pump token found in transaction`);
-            return;
-        }
-        
-        console.log(`   ✅ Token: ${tokenMint.slice(0, 12)}...`);
-        
-        // Check if we already have this token
-        if (wsGraduations.some(g => g.contract === tokenMint)) {
-            console.log(`   ⏭️ Already cached`);
-            return;
-        }
-        
-        // Fetch metadata
-        console.log(`   📊 Fetching metadata...`);
-        const metadata = await fetchTokenMetadata(tokenMint);
-        
-        const graduation = {
-            symbol: metadata?.symbol || 'UNKNOWN',
-            name: metadata?.name || 'Unknown Token',
-            contract: tokenMint,
-            ageMinutes: 0, // Just graduated!
-            liquidity: metadata?.liquidity || 0,
-            price: metadata?.priceUsd || 0,
-            dex: 'pumpswap',
-            hasLogo: !!metadata?.logo,
-            hasWebsite: !!metadata?.website,
-            hasSocials: !!(metadata?.twitter || metadata?.telegram),
-            website: metadata?.website || null,
-            twitter: metadata?.twitter || null,
-            telegram: metadata?.telegram || null,
-            logo: metadata?.logo || null,
-            dexscreenerUrl: `https://dexscreener.com/solana/${tokenMint}`,
-            jupiterUrl: `https://jup.ag/?sell=So11111111111111111111111111111111111111112&buy=${tokenMint}`,
-            pumpfunUrl: `https://pump.fun/${tokenMint}`,
-            priceChange: { m5: 0, h1: 0 },
-            graduated: true,
-            graduatedAt: new Date().toISOString(),
-            detectedAt: Date.now(),
-            txSignature: signature,
-            source: 'helius_ws' // Mark as WebSocket-detected
-        };
-        
-        // Add to beginning of array (newest first)
-        wsGraduations.unshift(graduation);
-        
-        // Keep only last 100
-        if (wsGraduations.length > MAX_WS_GRADUATIONS) {
-            wsGraduations.pop();
-        }
-        
-        console.log(`✅ Added graduation: ${graduation.symbol} (${tokenMint.slice(0, 8)}...)`);
-        console.log(`   📊 Logo: ${graduation.hasLogo}, Website: ${graduation.hasWebsite}, Socials: ${graduation.hasSocials}`);
-        console.log(`   💰 Price: $${graduation.price}, Liquidity: $${graduation.liquidity}`);
-        console.log(`   📦 Total WS graduations cached: ${wsGraduations.length}`);
-        
-    } catch (error) {
-        console.error('❌ Error processing graduation:', error.message);
-    }
-}
-
-// Fetch transaction and check timestamp + extract token
-async function fetchTransactionWithTimestamp(signature) {
-    try {
-        await rateLimitedRpcCall();
-        
-        const response = await fetch(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                jsonrpc: '2.0',
-                id: 1,
-                method: 'getTransaction',
-                params: [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
-            })
-        });
-        
-        const data = await response.json();
-        if (!data.result || !data.result.blockTime) return null;
-        
-        // Find pump token in transaction
-        let tokenMint = null;
-        
-        // Check account keys
-        const accountKeys = data.result.transaction?.message?.accountKeys || [];
-        for (const account of accountKeys) {
-            const pubkey = account.pubkey || account;
-            if (typeof pubkey === 'string' && pubkey.endsWith('pump')) {
-                tokenMint = pubkey;
-                break;
-            }
-        }
-        
-        // Check token balances if not found
-        if (!tokenMint) {
-            const balances = [...(data.result.meta?.postTokenBalances || []), ...(data.result.meta?.preTokenBalances || [])];
-            for (const b of balances) {
-                if (b.mint && b.mint.endsWith('pump')) {
-                    tokenMint = b.mint;
-                    break;
-                }
-            }
-        }
-        
-        return { blockTime: data.result.blockTime, tokenMint };
-    } catch (error) {
-        console.log(`   ❌ Error fetching TX: ${error.message}`);
-        return null;
-    }
-}
 
 // Extract token mint from transaction details
 async function extractMintFromTransaction(signature) {
@@ -660,60 +301,237 @@ app.get('/api/live-launches/ws', async (req, res) => {
     }
 });
 
-// NEW: Combined endpoint - tries WS first, falls back to Moralis
-app.get('/api/live-launches/fast', async (req, res) => {
+// ===========================================
+// HELIUS WEBHOOK ENDPOINT - Receives graduations
+// ===========================================
+// Configure in Helius Dashboard:
+// - Webhook URL: https://trakr-backend-0v6u.onrender.com/webhooks/helius
+// - Transaction Type: Any
+// - Account Addresses: 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 (Raydium AMM)
+
+app.post('/webhooks/helius', async (req, res) => {
+    // Always respond 200 quickly (Helius expects fast response)
+    res.status(200).send('OK');
+    
     try {
-        const now = Date.now();
+        const payload = req.body;
+        const transactions = Array.isArray(payload) ? payload : [payload];
         
-        // Get WebSocket graduations (fast, real-time) - NO MORALIS FALLBACK
-        const wsLaunches = wsGraduations.map(g => ({
-            ...g,
-            ageMinutes: Math.floor((now - g.detectedAt) / (1000 * 60))
-        })).filter(l => l.ageMinutes < 60); // Last hour only
+        console.log(`📨 Webhook received ${transactions.length} transaction(s)`);
         
-        // Always return WebSocket data (even if empty, even if disconnected)
-        return res.json({
-            success: true,
-            source: 'helius_websocket',
-            timestamp: new Date().toISOString(),
-            launches: wsLaunches,
-            count: wsLaunches.length,
-            wsConnected: wsConnected,
-            message: !wsConnected 
-                ? 'WebSocket disconnected - reconnecting...'
-                : wsLaunches.length > 0 
-                    ? 'Real-time graduations via Helius WebSocket'
-                    : 'WebSocket connected, waiting for graduations...'
-        });
-        
+        for (const tx of transactions) {
+            await processHeliusWebhook(tx);
+        }
     } catch (error) {
-        console.error('❌ Fast Live Launches error:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        console.error('❌ Webhook error:', error.message);
     }
 });
 
-// WebSocket status endpoint
+// Process transaction from Helius webhook
+async function processHeliusWebhook(tx) {
+    try {
+        if (!tx || !tx.signature) return;
+        
+        // Find pump.fun token (ends with 'pump')
+        let tokenMint = null;
+        
+        // Check token transfers
+        if (tx.tokenTransfers) {
+            for (const transfer of tx.tokenTransfers) {
+                if (transfer.mint?.endsWith('pump')) {
+                    tokenMint = transfer.mint;
+                    break;
+                }
+            }
+        }
+        
+        // Check account data
+        if (!tokenMint && tx.accountData) {
+            for (const account of tx.accountData) {
+                const addr = account.account || account;
+                if (typeof addr === 'string' && addr.endsWith('pump')) {
+                    tokenMint = addr;
+                    break;
+                }
+            }
+        }
+        
+        // Check description
+        if (!tokenMint && tx.description) {
+            const match = tx.description.match(/([1-9A-HJ-NP-Za-km-z]{40,44}pump)/);
+            if (match) tokenMint = match[1];
+        }
+        
+        // Check all accounts
+        if (!tokenMint) {
+            const allAccounts = [
+                ...(tx.accountData?.map(a => a.account) || []),
+                ...(tx.nativeTransfers?.map(t => t.toUserAccount) || []),
+                ...(tx.nativeTransfers?.map(t => t.fromUserAccount) || []),
+                tx.feePayer
+            ].filter(Boolean);
+            
+            for (const acc of allAccounts) {
+                if (typeof acc === 'string' && acc.endsWith('pump')) {
+                    tokenMint = acc;
+                    break;
+                }
+            }
+        }
+        
+        if (!tokenMint) return; // Not a pump.fun token
+        
+        // Check if already cached
+        if (wsGraduations.some(g => g.contract === tokenMint)) {
+            console.log(`   ⏭️ Already cached: ${tokenMint.slice(0, 12)}...`);
+            return;
+        }
+        
+        console.log(`🎓 GRADUATION: ${tokenMint.slice(0, 12)}...`);
+        console.log(`   TX: ${tx.signature?.slice(0, 20)}...`);
+        
+        // Fetch metadata with tags
+        const graduationData = await getGraduationWithTags(tokenMint);
+        
+        const graduation = {
+            symbol: graduationData.symbol || 'UNKNOWN',
+            name: graduationData.name || 'Unknown Token',
+            contract: tokenMint,
+            ageMinutes: 0,
+            liquidity: graduationData.liquidityUsd || 0,
+            liquiditySol: graduationData.liquiditySol || 0,
+            price: graduationData.price || 0,
+            dex: 'raydium',
+            hasLogo: !!graduationData.image,
+            hasWebsite: !!graduationData.website,
+            hasSocials: !!(graduationData.twitter || graduationData.telegram),
+            website: graduationData.website || null,
+            twitter: graduationData.twitter || null,
+            telegram: graduationData.telegram || null,
+            logo: graduationData.image || null,
+            dexscreenerUrl: `https://dexscreener.com/solana/${tokenMint}`,
+            jupiterUrl: `https://jup.ag/swap/SOL-${tokenMint}`,
+            pumpfunUrl: `https://pump.fun/${tokenMint}`,
+            graduated: true,
+            graduatedAt: new Date().toISOString(),
+            detectedAt: Date.now(),
+            txSignature: tx.signature,
+            source: 'helius_webhook',
+            tags: graduationData.tags || []
+        };
+        
+        wsGraduations.unshift(graduation);
+        if (wsGraduations.length > MAX_WS_GRADUATIONS) {
+            wsGraduations.pop();
+        }
+        
+        console.log(`✅ Added: ${graduation.symbol} (${tokenMint.slice(0, 8)}...)`);
+        console.log(`   🏷️ Tags: ${graduation.tags.join(', ')}`);
+        console.log(`   📦 Total cached: ${wsGraduations.length}`);
+        
+    } catch (error) {
+        console.error(`❌ Process webhook error:`, error.message);
+    }
+}
+
+// Get graduation data with tags
+async function getGraduationWithTags(mint) {
+    const tags = ['PUMP_FUN_GRADUATED'];
+    let image = null, website = null, twitter = null, telegram = null;
+    let symbol = null, name = null, liquiditySol = 0, liquidityUsd = 0, price = 0;
+    
+    // Try Helius metadata API
+    if (HELIUS_API_KEY) {
+        try {
+            const metaRes = await fetch(
+                `https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mintAccounts: [mint] })
+                }
+            );
+            const metaData = await metaRes.json();
+            const meta = metaData?.[0];
+            
+            if (meta) {
+                symbol = meta.symbol || meta.onChainMetadata?.metadata?.symbol;
+                name = meta.name || meta.onChainMetadata?.metadata?.name;
+                const offChain = meta.offChainMetadata?.metadata || {};
+                image = offChain.image;
+                website = offChain.website;
+                twitter = offChain.twitter;
+                telegram = offChain.telegram;
+            }
+        } catch (e) {
+            console.log(`   ⚠️ Helius metadata error: ${e.message}`);
+        }
+    }
+    
+    // Try Moralis for additional data
+    try {
+        const moralisData = await fetchTokenMetadata(mint);
+        if (moralisData) {
+            symbol = symbol || moralisData.symbol;
+            name = name || moralisData.name;
+            image = image || moralisData.logo;
+            liquidityUsd = moralisData.liquidity || 0;
+            liquiditySol = liquidityUsd / 150;
+            price = moralisData.priceUsd || 0;
+        }
+    } catch (e) {
+        console.log(`   ⚠️ Moralis error: ${e.message}`);
+    }
+    
+    // Add tags
+    if (image) tags.push('HAS_LOGO'); else tags.push('NO_LOGO');
+    if (website) tags.push('HAS_WEBSITE');
+    if (twitter) tags.push('HAS_TWITTER');
+    if (telegram) tags.push('HAS_TELEGRAM');
+    if (!(website || twitter || telegram)) tags.push('NO_SOCIALS');
+    if (image && (website || twitter || telegram)) tags.push('FULL_METADATA');
+    else tags.push('BARE_METADATA');
+    if (liquiditySol < 5) tags.push('LOW_LIQUIDITY');
+    else if (liquiditySol < 20) tags.push('MEDIUM_LIQUIDITY');
+    else tags.push('HIGH_LIQUIDITY');
+    
+    return { mint, symbol, name, image, website, twitter, telegram, liquiditySol, liquidityUsd, price, tags };
+}
+
+// Polling endpoint for extension
+app.get('/api/live-launches/fast', (req, res) => {
+    const now = Date.now();
+    const launches = wsGraduations.map(g => ({
+        ...g,
+        ageMinutes: Math.floor((now - g.detectedAt) / (1000 * 60))
+    })).filter(l => l.ageMinutes < 60);
+    
+    res.json({
+        success: true,
+        source: 'helius_webhook',
+        timestamp: new Date().toISOString(),
+        launches,
+        count: launches.length,
+        message: launches.length > 0 
+            ? 'Real-time graduations via Helius Webhook'
+            : 'Waiting for graduations...'
+    });
+});
+
+// Status endpoint
 app.get('/api/live-launches/status', (req, res) => {
     res.json({
         success: true,
-        websocket: {
-            connected: wsConnected,
-            reconnectAttempts: wsReconnectAttempts,
+        webhook: {
+            endpoint: '/webhooks/helius',
             cachedGraduations: wsGraduations.length,
-            oldestGraduation: wsGraduations.length > 0 
-                ? wsGraduations[wsGraduations.length - 1].graduatedAt 
-                : null,
-            newestGraduation: wsGraduations.length > 0 
-                ? wsGraduations[0].graduatedAt 
-                : null
+            oldestGraduation: wsGraduations.length > 0 ? wsGraduations[wsGraduations.length - 1].graduatedAt : null,
+            newestGraduation: wsGraduations.length > 0 ? wsGraduations[0].graduatedAt : null
         },
-        endpoints: {
-            fast: '/api/live-launches/fast (recommended - auto fallback)',
-            websocket: '/api/live-launches/ws (WebSocket only)',
-            moralis: '/api/live-launches (Moralis only - original)'
+        setup: {
+            step1: 'Go to https://dev.helius.xyz/webhooks',
+            step2: 'Create webhook with URL: https://trakr-backend-0v6u.onrender.com/webhooks/helius',
+            step3: 'Add account: 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 (Raydium AMM)'
         }
     });
 });
@@ -2040,13 +1858,10 @@ app.listen(PORT, () => {
     console.log(`   DELETE /api/admin/projects/filter`);
     console.log(`   GET  /jupiter/quote (Jupiter proxy)`);
     console.log(`   POST /jupiter/swap (Jupiter proxy)`);
-    console.log(`\n⚡ NEW ENDPOINTS (Helius WebSocket):`);
-    console.log(`   GET  /api/live-launches/fast (recommended - auto fallback)`);
-    console.log(`   GET  /api/live-launches/ws (WebSocket only)`);
+    console.log(`\n⚡ GRADUATION DETECTION (Helius Webhook):`);
+    console.log(`   POST /webhooks/helius (Helius posts here)`);
+    console.log(`   GET  /api/live-launches/fast (polling endpoint)`);
     console.log(`   GET  /api/live-launches/status (connection status)`);
-    console.log(`   GET  /api/live-launches (Moralis - original)`);
-    
-    // Initialize Helius WebSocket after server starts
-    console.log('\n⚡ Initializing Helius WebSocket for instant graduations...');
-    initHeliusWebSocket();
+    console.log(`\n✅ Webhook ready - configure Helius webhook to POST to:`);
+    console.log(`   https://trakr-backend-0v6u.onrender.com/webhooks/helius`);
 });
