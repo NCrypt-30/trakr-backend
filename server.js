@@ -296,12 +296,18 @@ async function processGraduation(signature, logs) {
         // Join all logs for searching
         const allLogs = logs.join('\n');
         
+        // Debug: Print first few logs to see format
+        console.log(`   📋 Logs received (${logs.length} entries):`);
+        logs.slice(0, 5).forEach((log, i) => {
+            console.log(`      [${i}]: ${log.slice(0, 80)}...`);
+        });
+        
         // Method 1: Look for any Solana address ending with "pump" (pump.fun tokens)
         // Pump.fun mints are 43-44 chars and end with "pump"
         const pumpMintMatch = allLogs.match(/[1-9A-HJ-NP-Za-km-z]{40,44}pump/g);
         if (pumpMintMatch && pumpMintMatch.length > 0) {
             tokenMint = pumpMintMatch[0];
-            console.log(`   Found pump token in logs: ${tokenMint.slice(0, 12)}...`);
+            console.log(`   ✅ Found pump token in logs: ${tokenMint.slice(0, 12)}...`);
         }
         
         // Method 2: If no pump suffix found, look for mint patterns in logs
@@ -311,7 +317,7 @@ async function processGraduation(signature, logs) {
                 const mintMatch = log.match(/mint[:\s]+([1-9A-HJ-NP-Za-km-z]{32,44})/i);
                 if (mintMatch) {
                     tokenMint = mintMatch[1];
-                    console.log(`   Found mint in log pattern: ${tokenMint.slice(0, 12)}...`);
+                    console.log(`   ✅ Found mint in log pattern: ${tokenMint.slice(0, 12)}...`);
                     break;
                 }
             }
@@ -319,6 +325,7 @@ async function processGraduation(signature, logs) {
         
         // Method 3: If still no mint, try to fetch from transaction (rate limited)
         if (!tokenMint) {
+            console.log(`   🔍 No pump token in logs, fetching transaction...`);
             tokenMint = await extractMintFromTransaction(signature);
         }
         
@@ -388,6 +395,8 @@ async function extractMintFromTransaction(signature) {
         // Rate limit RPC calls to avoid hitting limits
         await rateLimitedRpcCall();
         
+        console.log(`   📡 Fetching transaction: ${signature.slice(0, 20)}...`);
+        
         const response = await fetch(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -402,32 +411,81 @@ async function extractMintFromTransaction(signature) {
             })
         });
         
+        if (!response.ok) {
+            console.log(`   ❌ RPC error: ${response.status}`);
+            return null;
+        }
+        
         const data = await response.json();
         
-        if (!data.result) return null;
+        if (data.error) {
+            console.log(`   ❌ RPC returned error: ${data.error.message}`);
+            return null;
+        }
         
-        // Look through account keys for pump.fun token mints
+        if (!data.result) {
+            console.log(`   ❌ No transaction result (may still be processing)`);
+            return null;
+        }
+        
+        // Method 1: Look through account keys for pump.fun token mints
         const accountKeys = data.result.transaction?.message?.accountKeys || [];
+        console.log(`   🔍 Checking ${accountKeys.length} account keys...`);
         
         for (const account of accountKeys) {
             const pubkey = account.pubkey || account;
-            // Pump.fun tokens end with "pump"
             if (typeof pubkey === 'string' && pubkey.endsWith('pump')) {
+                console.log(`   ✅ Found pump token in accountKeys: ${pubkey.slice(0, 12)}...`);
                 return pubkey;
             }
         }
         
-        // Also check post token balances
+        // Method 2: Check post token balances
         const postTokenBalances = data.result.meta?.postTokenBalances || [];
+        console.log(`   🔍 Checking ${postTokenBalances.length} postTokenBalances...`);
+        
         for (const balance of postTokenBalances) {
             if (balance.mint && balance.mint.endsWith('pump')) {
+                console.log(`   ✅ Found pump token in postTokenBalances: ${balance.mint.slice(0, 12)}...`);
                 return balance.mint;
             }
         }
         
+        // Method 3: Check pre token balances
+        const preTokenBalances = data.result.meta?.preTokenBalances || [];
+        for (const balance of preTokenBalances) {
+            if (balance.mint && balance.mint.endsWith('pump')) {
+                console.log(`   ✅ Found pump token in preTokenBalances: ${balance.mint.slice(0, 12)}...`);
+                return balance.mint;
+            }
+        }
+        
+        // Method 4: Check inner instructions for token mints
+        const innerInstructions = data.result.meta?.innerInstructions || [];
+        for (const inner of innerInstructions) {
+            for (const ix of inner.instructions || []) {
+                // Check parsed instruction info
+                if (ix.parsed?.info?.mint && ix.parsed.info.mint.endsWith('pump')) {
+                    console.log(`   ✅ Found pump token in innerInstruction: ${ix.parsed.info.mint.slice(0, 12)}...`);
+                    return ix.parsed.info.mint;
+                }
+            }
+        }
+        
+        // Method 5: Scan all account keys for ANY pump-ending address
+        const allAddresses = JSON.stringify(data.result);
+        const pumpMatches = allAddresses.match(/[1-9A-HJ-NP-Za-km-z]{40,44}pump/g);
+        if (pumpMatches && pumpMatches.length > 0) {
+            // Filter out duplicates and return first valid one
+            const uniqueMints = [...new Set(pumpMatches)];
+            console.log(`   ✅ Found pump token via regex scan: ${uniqueMints[0].slice(0, 12)}...`);
+            return uniqueMints[0];
+        }
+        
+        console.log(`   ❌ No pump token found in transaction`);
         return null;
     } catch (error) {
-        console.error('Error fetching transaction:', error.message);
+        console.error(`   ❌ Error fetching transaction: ${error.message}`);
         return null;
     }
 }
@@ -551,24 +609,26 @@ app.get('/api/live-launches/fast', async (req, res) => {
         const wsLaunches = wsGraduations.map(g => ({
             ...g,
             ageMinutes: Math.floor((now - g.detectedAt) / (1000 * 60))
-        }));
+        })).filter(l => l.ageMinutes < 60); // Last hour only
         
-        // If we have recent WS data (< 5 min old), return it
-        const hasRecentWsData = wsLaunches.some(l => l.ageMinutes < 5);
-        
-        if (wsConnected && hasRecentWsData) {
+        // If WebSocket is connected, ALWAYS use WebSocket data (even if empty)
+        // This prevents old Moralis data from appearing on fresh deploys
+        if (wsConnected) {
             return res.json({
                 success: true,
                 source: 'helius_websocket',
                 timestamp: new Date().toISOString(),
-                launches: wsLaunches.filter(l => l.ageMinutes < 60), // Last hour only
-                count: wsLaunches.filter(l => l.ageMinutes < 60).length,
-                message: 'Real-time graduations via Helius WebSocket'
+                launches: wsLaunches,
+                count: wsLaunches.length,
+                wsConnected: true,
+                message: wsLaunches.length > 0 
+                    ? 'Real-time graduations via Helius WebSocket'
+                    : 'WebSocket connected, waiting for graduations...'
             });
         }
         
-        // Fallback to Moralis if WS is not connected or no recent data
-        console.log('⚠️ WebSocket data stale, falling back to Moralis...');
+        // ONLY fallback to Moralis if WebSocket is DISCONNECTED
+        console.log('⚠️ WebSocket disconnected, falling back to Moralis...');
         
         // Forward to existing Moralis endpoint internally
         try {
