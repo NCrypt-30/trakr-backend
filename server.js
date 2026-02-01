@@ -311,17 +311,28 @@ async function processGraduation(signature, logs) {
         // Join all logs for searching
         const allLogs = logs.join('\n');
         
-        // Debug: Print first few logs to see format
-        console.log(`   📋 Logs received (${logs.length} entries):`);
-        logs.slice(0, 8).forEach((log, i) => {
-            console.log(`      [${i}]: ${log.slice(0, 100)}...`);
-        });
+        // Debug: Print ALL logs to find where token mint is
+        console.log(`   📋 Logs received (${logs.length} entries) - searching all...`);
         
-        // Also check if ANY log contains "pump" anywhere
+        // Search ALL logs for anything ending in "pump"
+        for (let i = 0; i < logs.length; i++) {
+            const log = logs[i];
+            if (log.match(/[1-9A-HJ-NP-Za-km-z]{40,44}pump/)) {
+                console.log(`   🎯 Found pump address in log[${i}]: ${log.slice(0, 120)}`);
+            }
+        }
+        
+        // Also check if ANY log contains "pump" anywhere (case insensitive)
         const logsWithPump = logs.filter(l => l.toLowerCase().includes('pump'));
         if (logsWithPump.length > 0) {
             console.log(`   🔍 Found ${logsWithPump.length} logs containing 'pump':`);
-            logsWithPump.slice(0, 3).forEach(l => console.log(`      ${l.slice(0, 100)}`));
+            logsWithPump.slice(0, 5).forEach(l => console.log(`      ${l.slice(0, 120)}`));
+        } else {
+            // Print some middle logs to see what format they have
+            console.log(`   ❌ No 'pump' found in any log. Sample logs:`);
+            [0, 10, 20, 40, 60, 82].forEach(i => {
+                if (logs[i]) console.log(`      [${i}]: ${logs[i].slice(0, 120)}`);
+            });
         }
         
         // Method 1: Look for any Solana address ending with "pump" (pump.fun tokens)
@@ -345,26 +356,11 @@ async function processGraduation(signature, logs) {
             }
         }
         
-        // Method 3: If still no mint, try to fetch from transaction WITH RETRY
-        // The WebSocket is faster than RPC confirmation, so we need to wait
+        // Method 3: If still no mint in logs, skip this graduation
+        // We're NOT making RPC calls to save Helius credits
         if (!tokenMint) {
-            console.log(`   🔍 No pump token in logs, fetching transaction (with retry)...`);
-            
-            // Try up to 3 times with increasing delays
-            for (let attempt = 1; attempt <= 3; attempt++) {
-                // Wait before fetching (transaction needs time to confirm)
-                const delay = attempt * 1000; // 1s, 2s, 3s
-                await new Promise(r => setTimeout(r, delay));
-                
-                tokenMint = await extractMintFromTransaction(signature);
-                
-                if (tokenMint) {
-                    console.log(`   ✅ Found token on attempt ${attempt}`);
-                    break;
-                } else if (attempt < 3) {
-                    console.log(`   ⏳ Attempt ${attempt} failed, retrying in ${attempt + 1}s...`);
-                }
-            }
+            console.log(`   ⏭️ No pump token in logs - skipping (saving credits)`);
+            return;
         }
         
         if (!tokenMint) {
