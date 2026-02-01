@@ -1,7 +1,7 @@
 {
   "name": "trakr-backend",
-  "version": "1.0.0",
-  "description": "Backend API for Trakr Chrome Extension",
+  "version": "1.1.0",
+  "description": "Backend API for Trakr Chrome Extension - with Helius WebSocket",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -13,7 +13,7 @@
     "node-cron": "^3.0.3",
     "@supabase/supabase-js": "^2.39.3",
     "dotenv": "^16.3.1",
-    "node-fetch": "^2.6.7"
+    "ws": "^8.16.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
