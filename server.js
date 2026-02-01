@@ -23,6 +23,9 @@ const supabase = createClient(
 const TWITTER_BEARER_TOKEN = process.env.TWITTER_BEARER_TOKEN;
 const TWITTER_BASE_URL = 'https://api.twitter.com/2';
 
+// X API pause state
+let xApiPaused = false;
+
 // ==========================================
 // HELIUS WEBSOCKET - INSTANT GRADUATIONS
 // ==========================================
@@ -576,6 +579,12 @@ function detectStage(text) {
 
 // Scan Twitter for pre-TGE projects
 async function scanTwitter(tier = 'tier2') {
+    // Check if paused
+    if (xApiPaused) {
+        console.log('⏸️ X API is paused - skipping scan');
+        return { success: false, error: 'X API is paused' };
+    }
+    
     if (!TWITTER_BEARER_TOKEN) {
         console.error('❌ TWITTER_BEARER_TOKEN not set');
         return { success: false, error: 'Twitter API not configured' };
@@ -1274,6 +1283,25 @@ app.get('/api/stats', async (req, res) => {
 // ==========================================
 // ADMIN ENDPOINTS
 // ==========================================
+
+// Pause X API
+app.post('/api/admin/pause', (req, res) => {
+    xApiPaused = true;
+    console.log('⏸️ X API paused');
+    res.json({ success: true, paused: true });
+});
+
+// Resume X API
+app.post('/api/admin/resume', (req, res) => {
+    xApiPaused = false;
+    console.log('▶️ X API resumed');
+    res.json({ success: true, paused: false });
+});
+
+// Get pause status
+app.get('/api/admin/status', (req, res) => {
+    res.json({ success: true, xApiPaused });
+});
 
 // Get project count
 app.get('/api/admin/projects/count', async (req, res) => {
