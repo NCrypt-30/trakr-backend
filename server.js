@@ -136,10 +136,21 @@ function initHeliusWebSocket() {
                     // Join all logs for searching
                     const logsText = logs.join('\n');
                     
-                    // KEY INSIGHT from Bitquery docs:
-                    // Pump.fun migrations (graduations) have "Migrate" in the logs
-                    // This is the signal that distinguishes graduation from regular swaps
-                    const isMigration = logsText.includes('Migrate');
+                    // STRICT migration detection:
+                    // Must have "Instruction: Migrate" (the actual migration instruction)
+                    // NOT just any log containing the word "Migrate"
+                    const hasMigrateInstruction = logsText.includes('Instruction: Migrate');
+                    
+                    // Also verify it's from the Pump.fun program (6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P)
+                    const hasPumpFunProgram = logsText.includes('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+                    
+                    // Must have BOTH - this is a real graduation
+                    const isMigration = hasMigrateInstruction && hasPumpFunProgram;
+                    
+                    // Debug: log what we found
+                    if (hasPumpFunProgram) {
+                        console.log(`📋 PumpSwap TX detected - hasMigrateInstruction: ${hasMigrateInstruction}`);
+                    }
                     
                     // Only process if this is a migration (graduation)
                     if (isMigration) {
@@ -356,10 +367,19 @@ async function processGraduation(signature, logs) {
             }
         }
         
-        // Method 3: If still no mint in logs, skip this graduation
-        // We're NOT making RPC calls to save Helius credits
+        // Method 3: Fetch from transaction (single RPC call)
+        // Now that we have proper filtering, this only runs ~100-270 times/day
         if (!tokenMint) {
-            console.log(`   ⏭️ No pump token in logs - skipping (saving credits)`);
+            console.log(`   🔍 No pump token in logs, fetching transaction...`);
+            
+            // Wait 3 seconds for transaction to confirm
+            await new Promise(r => setTimeout(r, 3000));
+            
+            tokenMint = await extractMintFromTransaction(signature);
+        }
+        
+        if (!tokenMint) {
+            console.log(`   ⏭️ Could not extract token - skipping`);
             return;
         }
         
