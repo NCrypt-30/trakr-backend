@@ -49,8 +49,10 @@ const MAX_WS_GRADUATIONS = 100;
 let heliusWs = null;
 let wsConnected = false;
 let wsReconnectAttempts = 0;
+let wsConnectedAt = 0; // Track when WS connected
 const MAX_RECONNECT_ATTEMPTS = 10;
 const RECONNECT_DELAY_MS = 5000;
+const STARTUP_GRACE_PERIOD_MS = 15000; // Ignore transactions for 15s after connecting
 
 // Rate limiter for RPC calls (max 2 per second to avoid rate limits)
 let lastRpcCallTime = 0;
@@ -90,7 +92,9 @@ function initHeliusWebSocket() {
         heliusWs.on('open', () => {
             console.log('✅ Helius WebSocket connected!');
             wsConnected = true;
+            wsConnectedAt = Date.now(); // Track connection time for grace period
             wsReconnectAttempts = 0;
+            console.log(`⏳ Ignoring transactions for ${STARTUP_GRACE_PERIOD_MS/1000}s (startup grace period)...`);
             
             // Subscribe to PumpSwap program logs (graduations)
             const subscribeMsg = {
@@ -147,13 +151,18 @@ function initHeliusWebSocket() {
                     // Must have BOTH - this is a real graduation
                     const isMigration = hasMigrateInstruction && hasPumpFunProgram;
                     
-                    // Debug: log what we found
-                    if (hasPumpFunProgram) {
-                        console.log(`📋 PumpSwap TX detected - hasMigrateInstruction: ${hasMigrateInstruction}`);
-                    }
+                    // Only log when it's actually a migration
+                    // (skip logging for the thousands of regular swaps)
                     
                     // Only process if this is a migration (graduation)
                     if (isMigration) {
+                        // Check if we're still in startup grace period
+                        const timeSinceConnect = Date.now() - wsConnectedAt;
+                        if (timeSinceConnect < STARTUP_GRACE_PERIOD_MS) {
+                            console.log(`⏭️ Ignoring graduation (startup grace period: ${Math.ceil((STARTUP_GRACE_PERIOD_MS - timeSinceConnect)/1000)}s remaining)`);
+                            return;
+                        }
+                        
                         console.log(`🎓 GRADUATION DETECTED! TX: ${signature.slice(0, 20)}...`);
                         await processGraduation(signature, logs);
                     }
@@ -372,8 +381,8 @@ async function processGraduation(signature, logs) {
         if (!tokenMint) {
             console.log(`   🔍 No pump token in logs, fetching transaction...`);
             
-            // Wait 3 seconds for transaction to confirm
-            await new Promise(r => setTimeout(r, 3000));
+            // Wait 5 seconds for transaction to confirm on chain
+            await new Promise(r => setTimeout(r, 5000));
             
             tokenMint = await extractMintFromTransaction(signature);
         }
