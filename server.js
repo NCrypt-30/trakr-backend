@@ -317,9 +317,41 @@ app.post('/webhooks/helius', async (req, res) => {
         const payload = req.body;
         const transactions = Array.isArray(payload) ? payload : [payload];
         
-        console.log(`📨 Webhook received ${transactions.length} transaction(s)`);
-        
         for (const tx of transactions) {
+            // FILTER: Only process pool creations, not swaps
+            // Look for Initialize instruction (pool creation)
+            const txType = tx.type?.toLowerCase() || '';
+            const description = tx.description?.toLowerCase() || '';
+            
+            // Check if this is a pool creation (graduation)
+            const isPoolCreation = 
+                txType.includes('create') ||
+                txType.includes('initialize') ||
+                description.includes('initialize') ||
+                description.includes('created') ||
+                description.includes('pool');
+            
+            // Skip swaps (Buy, Sell, etc.)
+            const isSwap = 
+                txType.includes('swap') ||
+                description.includes('swap') ||
+                description.includes('bought') ||
+                description.includes('sold');
+            
+            if (isSwap && !isPoolCreation) {
+                // Skip swaps silently
+                continue;
+            }
+            
+            // Log for debugging
+            console.log(`📨 Webhook: ${tx.signature?.slice(0,8)}... Type: ${txType || 'unknown'}`);
+            
+            if (!isPoolCreation) {
+                // Not a pool creation, skip
+                continue;
+            }
+            
+            console.log(`   🔍 Possible pool creation detected`);
             await processHeliusWebhook(tx);
         }
     } catch (error) {
