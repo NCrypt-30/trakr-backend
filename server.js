@@ -52,6 +52,19 @@ let wsReconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
 const RECONNECT_DELAY_MS = 5000;
 
+// Rate limiter for RPC calls (max 2 per second to avoid rate limits)
+let lastRpcCallTime = 0;
+const RPC_MIN_INTERVAL_MS = 500; // 500ms between RPC calls
+
+async function rateLimitedRpcCall() {
+    const now = Date.now();
+    const timeSinceLastCall = now - lastRpcCallTime;
+    if (timeSinceLastCall < RPC_MIN_INTERVAL_MS) {
+        await new Promise(r => setTimeout(r, RPC_MIN_INTERVAL_MS - timeSinceLastCall));
+    }
+    lastRpcCallTime = Date.now();
+}
+
 // Initialize Helius WebSocket connection
 function initHeliusWebSocket() {
     // Check if API key is configured
@@ -120,45 +133,20 @@ function initHeliusWebSocket() {
                     // Skip if no signature
                     if (!signature) return;
                     
-                    // Check if this MIGHT be a graduation (create_pool)
-                    // We look for patterns that suggest pool creation, not just any trade
-                    // PumpSwap logs typically include the instruction type
-                    const logsText = logs.join(' ').toLowerCase();
+                    // Join all logs for searching
+                    const logsText = logs.join('\n');
                     
-                    // Patterns that indicate pool creation (graduation)
-                    const isLikelyGraduation = 
-                        logsText.includes('create_pool') ||
-                        logsText.includes('createpool') ||
-                        logsText.includes('initialize') ||
-                        logsText.includes('poolcreated') ||
-                        // Check for mint creation pattern (LP mint)
-                        (logsText.includes('mint') && logsText.includes('initialize'));
+                    // KEY INSIGHT from Bitquery docs:
+                    // Pump.fun migrations (graduations) have "Migrate" in the logs
+                    // This is the signal that distinguishes graduation from regular swaps
+                    const isMigration = logsText.includes('Migrate');
                     
-                    // Patterns that indicate regular trades (NOT graduation)
-                    const isDefinitelyTrade = 
-                        (logsText.includes('swap') && !logsText.includes('create')) ||
-                        logsText.includes('selltokens') ||
-                        logsText.includes('buytokens');
-                    
-                    // If it looks like a regular trade, skip it
-                    if (isDefinitelyTrade && !isLikelyGraduation) {
-                        return;
+                    // Only process if this is a migration (graduation)
+                    if (isMigration) {
+                        console.log(`🎓 GRADUATION DETECTED! TX: ${signature.slice(0, 20)}...`);
+                        await processGraduation(signature, logs);
                     }
-                    
-                    // For potential graduations, verify by fetching transaction details
-                    if (isLikelyGraduation) {
-                        console.log(`🔍 Potential graduation detected, verifying... TX: ${signature.slice(0, 20)}...`);
-                        
-                        // Verify it's actually a create_pool by checking transaction
-                        const isConfirmedGraduation = await verifyGraduation(signature);
-                        
-                        if (isConfirmedGraduation) {
-                            console.log(`🎓 GRADUATION CONFIRMED! TX: ${signature}`);
-                            await processGraduation(signature, logs);
-                        } else {
-                            console.log(`   ❌ Not a graduation (false positive)`);
-                        }
-                    }
+                    // Silently skip all other transactions (swaps, etc.)
                 }
             } catch (error) {
                 // Ignore parse errors for ping/pong frames
@@ -305,25 +293,37 @@ async function processGraduation(signature, logs) {
         // Extract token mint from logs if possible
         let tokenMint = null;
         
-        // Try to find token mint in logs
-        for (const log of logs) {
-            // Look for token mint patterns
-            const mintMatch = log.match(/mint[:\s]+([A-Za-z0-9]{32,44})/i) ||
-                             log.match(/token[:\s]+([A-Za-z0-9]{32,44})/i) ||
-                             log.match(/([A-Za-z0-9]{43,44}pump)/);
-            if (mintMatch) {
-                tokenMint = mintMatch[1];
-                break;
+        // Join all logs for searching
+        const allLogs = logs.join('\n');
+        
+        // Method 1: Look for any Solana address ending with "pump" (pump.fun tokens)
+        // Pump.fun mints are 43-44 chars and end with "pump"
+        const pumpMintMatch = allLogs.match(/[1-9A-HJ-NP-Za-km-z]{40,44}pump/g);
+        if (pumpMintMatch && pumpMintMatch.length > 0) {
+            tokenMint = pumpMintMatch[0];
+            console.log(`   Found pump token in logs: ${tokenMint.slice(0, 12)}...`);
+        }
+        
+        // Method 2: If no pump suffix found, look for mint patterns in logs
+        if (!tokenMint) {
+            for (const log of logs) {
+                // Look for "mint" followed by an address
+                const mintMatch = log.match(/mint[:\s]+([1-9A-HJ-NP-Za-km-z]{32,44})/i);
+                if (mintMatch) {
+                    tokenMint = mintMatch[1];
+                    console.log(`   Found mint in log pattern: ${tokenMint.slice(0, 12)}...`);
+                    break;
+                }
             }
         }
         
-        // If we couldn't extract mint from logs, fetch transaction details
+        // Method 3: If still no mint, try to fetch from transaction (rate limited)
         if (!tokenMint) {
             tokenMint = await extractMintFromTransaction(signature);
         }
         
         if (!tokenMint) {
-            console.log(`⚠️ Could not extract token mint from graduation TX: ${signature}`);
+            console.log(`⚠️ Could not extract token mint from graduation TX: ${signature.slice(0, 20)}...`);
             return;
         }
         
@@ -333,7 +333,7 @@ async function processGraduation(signature, logs) {
             return;
         }
         
-        console.log(`🔍 Fetching metadata for graduated token: ${tokenMint}`);
+        console.log(`🔍 Fetching metadata for graduated token: ${tokenMint.slice(0, 12)}...`);
         
         // Fetch token metadata from Moralis (enrichment)
         const metadata = await fetchTokenMetadata(tokenMint);
@@ -385,6 +385,9 @@ async function processGraduation(signature, logs) {
 // Extract token mint from transaction details
 async function extractMintFromTransaction(signature) {
     try {
+        // Rate limit RPC calls to avoid hitting limits
+        await rateLimitedRpcCall();
+        
         const response = await fetch(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -568,14 +571,32 @@ app.get('/api/live-launches/fast', async (req, res) => {
         console.log('⚠️ WebSocket data stale, falling back to Moralis...');
         
         // Forward to existing Moralis endpoint internally
-        const moralisResponse = await fetch(`http://localhost:${PORT}/api/live-launches`);
-        const moralisData = await moralisResponse.json();
-        
-        // Mark source
-        moralisData.source = 'moralis_fallback';
-        moralisData.wsConnected = wsConnected;
-        
-        res.json(moralisData);
+        try {
+            const moralisResponse = await fetch(`http://localhost:${PORT}/api/live-launches`);
+            
+            if (!moralisResponse.ok) {
+                throw new Error(`Moralis endpoint returned ${moralisResponse.status}`);
+            }
+            
+            const moralisData = await moralisResponse.json();
+            
+            // Mark source
+            moralisData.source = 'moralis_fallback';
+            moralisData.wsConnected = wsConnected;
+            
+            res.json(moralisData);
+        } catch (fallbackError) {
+            console.error('❌ Moralis fallback failed:', fallbackError.message);
+            // Return empty but valid response
+            res.json({
+                success: true,
+                source: 'none',
+                launches: [],
+                count: 0,
+                message: 'WebSocket has no data and Moralis fallback failed',
+                wsConnected: wsConnected
+            });
+        }
         
     } catch (error) {
         console.error('❌ Fast Live Launches error:', error);
