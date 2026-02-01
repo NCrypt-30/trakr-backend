@@ -137,11 +137,25 @@ function initHeliusWebSocket() {
                     // Check if already processing this TX (dedupe)
                     if (processingTransactions.has(signature)) return;
                     
-                    // Check for "Instruction: Migrate" - the ONLY signal for graduation
+                    // Join logs and find ALL instructions
                     const logsText = logs.join('\n');
+                    
+                    // DEBUG: Print what instruction we found
+                    const instructionMatch = logsText.match(/Instruction: (\w+)/g);
+                    if (instructionMatch) {
+                        console.log(`📋 TX ${signature.slice(0,8)}... Instructions: ${instructionMatch.join(', ')}`);
+                    }
+                    
+                    // STRICT CHECK: Must have EXACTLY "Instruction: Migrate"
                     if (!logsText.includes('Instruction: Migrate')) return;
                     
-                    // Check grace period (ignore first 15s after connect)
+                    // Double check - reject if it has Create/Initialize (new token, not graduation)
+                    if (logsText.includes('Instruction: Create') || logsText.includes('Instruction: Initialize')) {
+                        console.log(`   ⏭️ Skipping - this is a CREATE, not a graduation`);
+                        return;
+                    }
+                    
+                    // Check grace period (ignore first 30s after connect)
                     const timeSinceConnect = Date.now() - wsConnectedAt;
                     if (timeSinceConnect < STARTUP_GRACE_PERIOD_MS) {
                         console.log(`⏭️ Skipping (grace period: ${Math.ceil((STARTUP_GRACE_PERIOD_MS - timeSinceConnect)/1000)}s left)`);
@@ -301,35 +315,35 @@ const processingTransactions = new Set();
 // Process a detected graduation - fetch token details
 async function processGraduation(signature, logs) {
     try {
-        let tokenMint = null;
-        const allLogs = logs.join('\n');
+        // First, fetch the transaction to check its age
+        console.log(`   ⏳ Checking transaction age...`);
+        await new Promise(r => setTimeout(r, 3000)); // Wait 3s for confirmation
         
-        // Try to find pump token in logs first
-        const pumpMintMatch = allLogs.match(/[1-9A-HJ-NP-Za-km-z]{40,44}pump/g);
-        if (pumpMintMatch && pumpMintMatch.length > 0) {
-            tokenMint = pumpMintMatch[0];
-            console.log(`   ✅ Found in logs: ${tokenMint.slice(0, 12)}...`);
-        }
+        const txData = await fetchTransactionWithTimestamp(signature);
         
-        // If not in logs, fetch from transaction with retry
-        if (!tokenMint) {
-            // Try twice with 10 second delays
-            for (let attempt = 1; attempt <= 2; attempt++) {
-                console.log(`   ⏳ Attempt ${attempt}: waiting 10s then fetching TX...`);
-                await new Promise(r => setTimeout(r, 10000));
-                tokenMint = await extractMintFromTransaction(signature);
-                
-                if (tokenMint) {
-                    console.log(`   ✅ Found in TX: ${tokenMint.slice(0, 12)}...`);
-                    break;
-                }
-            }
-        }
-        
-        if (!tokenMint) {
-            console.log(`   ❌ Failed to extract token after 2 attempts`);
+        if (!txData) {
+            console.log(`   ❌ Could not fetch transaction`);
             return;
         }
+        
+        // Check if transaction is recent (within last 60 seconds)
+        const txAgeSeconds = (Date.now() / 1000) - txData.blockTime;
+        if (txAgeSeconds > 60) {
+            console.log(`   ⏭️ OLD TRANSACTION (${Math.floor(txAgeSeconds)}s old) - skipping`);
+            return;
+        }
+        
+        console.log(`   ✅ Fresh transaction (${Math.floor(txAgeSeconds)}s old)`);
+        
+        // Get token mint from the transaction data
+        let tokenMint = txData.tokenMint;
+        
+        if (!tokenMint) {
+            console.log(`   ❌ No pump token found in transaction`);
+            return;
+        }
+        
+        console.log(`   ✅ Token: ${tokenMint.slice(0, 12)}...`);
         
         // Check if we already have this token
         if (wsGraduations.some(g => g.contract === tokenMint)) {
@@ -382,6 +396,56 @@ async function processGraduation(signature, logs) {
         
     } catch (error) {
         console.error('❌ Error processing graduation:', error.message);
+    }
+}
+
+// Fetch transaction and check timestamp + extract token
+async function fetchTransactionWithTimestamp(signature) {
+    try {
+        await rateLimitedRpcCall();
+        
+        const response = await fetch(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'getTransaction',
+                params: [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
+            })
+        });
+        
+        const data = await response.json();
+        if (!data.result || !data.result.blockTime) return null;
+        
+        // Find pump token in transaction
+        let tokenMint = null;
+        
+        // Check account keys
+        const accountKeys = data.result.transaction?.message?.accountKeys || [];
+        for (const account of accountKeys) {
+            const pubkey = account.pubkey || account;
+            if (typeof pubkey === 'string' && pubkey.endsWith('pump')) {
+                tokenMint = pubkey;
+                break;
+            }
+        }
+        
+        // Check token balances if not found
+        if (!tokenMint) {
+            const balances = [...(data.result.meta?.postTokenBalances || []), ...(data.result.meta?.preTokenBalances || [])];
+            for (const b of balances) {
+                if (b.mint && b.mint.endsWith('pump')) {
+                    tokenMint = b.mint;
+                    break;
+                }
+            }
+        }
+        
+        return { blockTime: data.result.blockTime, tokenMint };
+    } catch (error) {
+        console.log(`   ❌ Error fetching TX: ${error.message}`);
+        return null;
     }
 }
 
