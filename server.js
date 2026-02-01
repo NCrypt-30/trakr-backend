@@ -52,7 +52,7 @@ let wsReconnectAttempts = 0;
 let wsConnectedAt = 0; // Track when WS connected
 const MAX_RECONNECT_ATTEMPTS = 10;
 const RECONNECT_DELAY_MS = 5000;
-const STARTUP_GRACE_PERIOD_MS = 15000; // Ignore transactions for 15s after connecting
+const STARTUP_GRACE_PERIOD_MS = 30000; // Ignore transactions for 30s after connecting
 
 // Rate limiter for RPC calls (max 2 per second to avoid rate limits)
 let lastRpcCallTime = 0;
@@ -131,48 +131,36 @@ function initHeliusWebSocket() {
                     const signature = message.params?.result?.value?.signature;
                     const err = message.params?.result?.value?.err;
                     
-                    // Skip failed transactions
-                    if (err) return;
+                    // Skip failed transactions or missing signature
+                    if (err || !signature) return;
                     
-                    // Skip if no signature
-                    if (!signature) return;
+                    // Check if already processing this TX (dedupe)
+                    if (processingTransactions.has(signature)) return;
                     
-                    // Join all logs for searching
+                    // Check for "Instruction: Migrate" - the ONLY signal for graduation
                     const logsText = logs.join('\n');
+                    if (!logsText.includes('Instruction: Migrate')) return;
                     
-                    // STRICT migration detection:
-                    // Must have "Instruction: Migrate" (the actual migration instruction)
-                    // NOT just any log containing the word "Migrate"
-                    const hasMigrateInstruction = logsText.includes('Instruction: Migrate');
-                    
-                    // Also verify it's from the Pump.fun program (6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P)
-                    const hasPumpFunProgram = logsText.includes('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
-                    
-                    // Must have BOTH - this is a real graduation
-                    const isMigration = hasMigrateInstruction && hasPumpFunProgram;
-                    
-                    // Only log when it's actually a migration
-                    // (skip logging for the thousands of regular swaps)
-                    
-                    // Only process if this is a migration (graduation)
-                    if (isMigration) {
-                        // Check if we're still in startup grace period
-                        const timeSinceConnect = Date.now() - wsConnectedAt;
-                        if (timeSinceConnect < STARTUP_GRACE_PERIOD_MS) {
-                            console.log(`⏭️ Ignoring graduation (startup grace period: ${Math.ceil((STARTUP_GRACE_PERIOD_MS - timeSinceConnect)/1000)}s remaining)`);
-                            return;
-                        }
-                        
-                        console.log(`🎓 GRADUATION DETECTED! TX: ${signature.slice(0, 20)}...`);
-                        await processGraduation(signature, logs);
+                    // Check grace period (ignore first 15s after connect)
+                    const timeSinceConnect = Date.now() - wsConnectedAt;
+                    if (timeSinceConnect < STARTUP_GRACE_PERIOD_MS) {
+                        console.log(`⏭️ Skipping (grace period: ${Math.ceil((STARTUP_GRACE_PERIOD_MS - timeSinceConnect)/1000)}s left)`);
+                        return;
                     }
-                    // Silently skip all other transactions (swaps, etc.)
+                    
+                    // Mark as processing
+                    processingTransactions.add(signature);
+                    if (processingTransactions.size > 100) {
+                        const first = processingTransactions.values().next().value;
+                        processingTransactions.delete(first);
+                    }
+                    
+                    // This is a real graduation!
+                    console.log(`🎓 GRADUATION: ${signature.slice(0, 20)}...`);
+                    await processGraduation(signature, logs);
                 }
             } catch (error) {
-                // Ignore parse errors for ping/pong frames
-                if (!data.toString().includes('ping')) {
-                    console.error('WebSocket message parse error:', error.message);
-                }
+                // Silently ignore parse errors
             }
         });
         
@@ -312,100 +300,45 @@ const processingTransactions = new Set();
 
 // Process a detected graduation - fetch token details
 async function processGraduation(signature, logs) {
-    // Deduplicate - skip if already processing this transaction
-    if (processingTransactions.has(signature)) {
-        return;
-    }
-    processingTransactions.add(signature);
-    
-    // Clean up old entries (keep set small)
-    if (processingTransactions.size > 200) {
-        const entries = Array.from(processingTransactions);
-        entries.slice(0, 100).forEach(s => processingTransactions.delete(s));
-    }
-    
     try {
-        // Extract token mint from logs if possible
         let tokenMint = null;
-        
-        // Join all logs for searching
         const allLogs = logs.join('\n');
         
-        // Debug: Print ALL logs to find where token mint is
-        console.log(`   📋 Logs received (${logs.length} entries) - searching all...`);
-        
-        // Search ALL logs for anything ending in "pump"
-        for (let i = 0; i < logs.length; i++) {
-            const log = logs[i];
-            if (log.match(/[1-9A-HJ-NP-Za-km-z]{40,44}pump/)) {
-                console.log(`   🎯 Found pump address in log[${i}]: ${log.slice(0, 120)}`);
-            }
-        }
-        
-        // Also check if ANY log contains "pump" anywhere (case insensitive)
-        const logsWithPump = logs.filter(l => l.toLowerCase().includes('pump'));
-        if (logsWithPump.length > 0) {
-            console.log(`   🔍 Found ${logsWithPump.length} logs containing 'pump':`);
-            logsWithPump.slice(0, 5).forEach(l => console.log(`      ${l.slice(0, 120)}`));
-        } else {
-            // Print some middle logs to see what format they have
-            console.log(`   ❌ No 'pump' found in any log. Sample logs:`);
-            [0, 10, 20, 40, 60, 82].forEach(i => {
-                if (logs[i]) console.log(`      [${i}]: ${logs[i].slice(0, 120)}`);
-            });
-        }
-        
-        // Method 1: Look for any Solana address ending with "pump" (pump.fun tokens)
-        // Pump.fun mints are 43-44 chars and end with "pump"
+        // Try to find pump token in logs first
         const pumpMintMatch = allLogs.match(/[1-9A-HJ-NP-Za-km-z]{40,44}pump/g);
         if (pumpMintMatch && pumpMintMatch.length > 0) {
             tokenMint = pumpMintMatch[0];
-            console.log(`   ✅ Found pump token in logs: ${tokenMint.slice(0, 12)}...`);
+            console.log(`   ✅ Found in logs: ${tokenMint.slice(0, 12)}...`);
         }
         
-        // Method 2: If no pump suffix found, look for mint patterns in logs
+        // If not in logs, fetch from transaction with retry
         if (!tokenMint) {
-            for (const log of logs) {
-                // Look for "mint" followed by an address
-                const mintMatch = log.match(/mint[:\s]+([1-9A-HJ-NP-Za-km-z]{32,44})/i);
-                if (mintMatch) {
-                    tokenMint = mintMatch[1];
-                    console.log(`   ✅ Found mint in log pattern: ${tokenMint.slice(0, 12)}...`);
+            // Try twice with 10 second delays
+            for (let attempt = 1; attempt <= 2; attempt++) {
+                console.log(`   ⏳ Attempt ${attempt}: waiting 10s then fetching TX...`);
+                await new Promise(r => setTimeout(r, 10000));
+                tokenMint = await extractMintFromTransaction(signature);
+                
+                if (tokenMint) {
+                    console.log(`   ✅ Found in TX: ${tokenMint.slice(0, 12)}...`);
                     break;
                 }
             }
         }
         
-        // Method 3: Fetch from transaction (single RPC call)
-        // Now that we have proper filtering, this only runs ~100-270 times/day
         if (!tokenMint) {
-            console.log(`   🔍 No pump token in logs, fetching transaction...`);
-            
-            // Wait 5 seconds for transaction to confirm on chain
-            await new Promise(r => setTimeout(r, 5000));
-            
-            tokenMint = await extractMintFromTransaction(signature);
-        }
-        
-        if (!tokenMint) {
-            console.log(`   ⏭️ Could not extract token - skipping`);
-            return;
-        }
-        
-        if (!tokenMint) {
-            console.log(`⚠️ Could not extract token mint from graduation TX: ${signature.slice(0, 20)}...`);
+            console.log(`   ❌ Failed to extract token after 2 attempts`);
             return;
         }
         
         // Check if we already have this token
         if (wsGraduations.some(g => g.contract === tokenMint)) {
-            console.log(`⏭️ Token ${tokenMint.slice(0, 8)}... already in WS cache`);
+            console.log(`   ⏭️ Already cached`);
             return;
         }
         
-        console.log(`🔍 Fetching metadata for graduated token: ${tokenMint.slice(0, 12)}...`);
-        
-        // Fetch token metadata from Moralis (enrichment)
+        // Fetch metadata
+        console.log(`   📊 Fetching metadata...`);
         const metadata = await fetchTokenMetadata(tokenMint);
         
         const graduation = {
