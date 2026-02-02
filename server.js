@@ -1,3 +1,6 @@
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
@@ -1571,14 +1574,17 @@ cron.schedule('*/15 * * * *', async () => {
 // GET /jupiter/quote - Proxy Jupiter quote requests
 app.get('/jupiter/quote', async (req, res) => {
     try {
-        const url = 'https://quote-api.jup.ag/v6/quote?' + 
+        const url = 'https://api.jup.ag/swap/v1/quote?' + 
             new URLSearchParams(req.query);
         
         console.log('📊 Jupiter quote request:', url);
         
         const response = await fetch(url, {
             method: 'GET',
-            headers: { 'Accept': 'application/json' }
+            headers: { 
+                'Accept': 'application/json',
+                'x-api-key': process.env.JUPITER_API_KEY
+            }
         });
         
         if (!response.ok) {
@@ -1609,11 +1615,12 @@ app.post('/jupiter/swap', async (req, res) => {
     try {
         console.log('🔄 Jupiter swap request');
         
-        const response = await fetch('https://quote-api.jup.ag/v6/swap', {
+        const response = await fetch('https://api.jup.ag/swap/v1/swap', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Accept': 'application/json'
+                'Accept': 'application/json',
+                'x-api-key': process.env.JUPITER_API_KEY
             },
             body: JSON.stringify(req.body)
         });
