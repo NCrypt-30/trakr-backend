@@ -1639,18 +1639,20 @@ cron.schedule('*/15 * * * *', async () => {
 // GET /jupiter/quote - Proxy Jupiter quote requests
 app.get('/jupiter/quote', async (req, res) => {
     try {
-        // Jupiter Ultra API - Free tier with dynamic scaling
-        // https://api.jup.ag/ultra (from Jupiter dashboard)
-        const jupiterBaseUrl = 'https://api.jup.ag/ultra/quote/v6/quote';
+        // Jupiter API v6 with API key from environment variable
+        const jupiterBaseUrl = 'https://api.jup.ag/quote/v6/quote';
         const url = jupiterBaseUrl + '?' + new URLSearchParams(req.query);
         
         console.log('📊 Jupiter quote request:', url);
+        
+        const JUPITER_API_KEY = process.env.JUPITER_API_KEY || '7294308a-bf02-4d78-99f7-9c6d0a061a9d';
         
         const response = await fetch(url, {
             method: 'GET',
             headers: { 
                 'Accept': 'application/json',
-                'User-Agent': 'Trakr-Bot/1.0'
+                'User-Agent': 'Trakr-Bot/1.0',
+                'x-api-key': JUPITER_API_KEY
             }
         });
         
@@ -1687,13 +1689,16 @@ app.post('/jupiter/swap', async (req, res) => {
     try {
         console.log('🔄 Jupiter swap request');
         
-        // Jupiter Ultra API - Free tier with dynamic scaling
-        const response = await fetch('https://api.jup.ag/ultra/swap/v6/swap', {
+        const JUPITER_API_KEY = process.env.JUPITER_API_KEY || '7294308a-bf02-4d78-99f7-9c6d0a061a9d';
+        
+        // Jupiter API v6 with API key from environment variable
+        const response = await fetch('https://api.jup.ag/swap/v6/swap', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
-                'User-Agent': 'Trakr-Bot/1.0'
+                'User-Agent': 'Trakr-Bot/1.0',
+                'x-api-key': JUPITER_API_KEY
             },
             body: JSON.stringify(req.body)
         });
@@ -1731,19 +1736,23 @@ app.get('/test/jupiter', async (req, res) => {
     // Test 1: Can we reach Jupiter at all?
     try {
         console.log('🧪 Testing Jupiter API connection...');
-        const response = await fetch('https://api.jup.ag/ultra/quote/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000000&slippageBps=50', {
+        const JUPITER_API_KEY = process.env.JUPITER_API_KEY || '7294308a-bf02-4d78-99f7-9c6d0a061a9d';
+        
+        const response = await fetch('https://api.jup.ag/quote/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000000&slippageBps=50', {
             method: 'GET',
             headers: { 
                 'Accept': 'application/json',
-                'User-Agent': 'Trakr-Bot/1.0'
+                'User-Agent': 'Trakr-Bot/1.0',
+                'x-api-key': JUPITER_API_KEY
             }
         });
         
         testResults.tests.push({
-            name: 'Jupiter Ultra API Reachability',
+            name: 'Jupiter API Reachability (With API Key)',
             status: response.ok ? 'PASS' : 'FAIL',
             statusCode: response.status,
-            message: response.ok ? 'Can reach Jupiter Ultra API' : await response.text()
+            message: response.ok ? 'Can reach Jupiter API with authentication' : await response.text(),
+            apiKeySet: !!process.env.JUPITER_API_KEY
         });
         
         if (response.ok) {
@@ -1756,7 +1765,7 @@ app.get('/test/jupiter', async (req, res) => {
         }
     } catch (error) {
         testResults.tests.push({
-            name: 'Jupiter Ultra API Reachability',
+            name: 'Jupiter API Reachability (With API Key)',
             status: 'ERROR',
             message: error.message,
             stack: error.stack
