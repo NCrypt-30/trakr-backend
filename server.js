@@ -1639,14 +1639,19 @@ cron.schedule('*/15 * * * *', async () => {
 // GET /jupiter/quote - Proxy Jupiter quote requests
 app.get('/jupiter/quote', async (req, res) => {
     try {
-        const url = 'https://quote-api.jup.ag/v6/quote?' + 
-            new URLSearchParams(req.query);
+        // Jupiter Ultra API - Free tier with dynamic scaling
+        // https://api.jup.ag/ultra (from Jupiter dashboard)
+        const jupiterBaseUrl = 'https://api.jup.ag/ultra/quote/v6/quote';
+        const url = jupiterBaseUrl + '?' + new URLSearchParams(req.query);
         
         console.log('📊 Jupiter quote request:', url);
         
         const response = await fetch(url, {
             method: 'GET',
-            headers: { 'Accept': 'application/json' }
+            headers: { 
+                'Accept': 'application/json',
+                'User-Agent': 'Trakr-Bot/1.0'
+            }
         });
         
         if (!response.ok) {
@@ -1665,9 +1670,14 @@ app.get('/jupiter/quote', async (req, res) => {
         
     } catch (error) {
         console.error('❌ Quote proxy error:', error);
+        console.error('   Error type:', error.constructor.name);
+        console.error('   Error message:', error.message);
+        console.error('   Error stack:', error.stack);
+        
         res.status(500).json({
             error: 'Proxy error',
-            message: error.message
+            message: error.message,
+            type: error.constructor.name
         });
     }
 });
@@ -1677,11 +1687,13 @@ app.post('/jupiter/swap', async (req, res) => {
     try {
         console.log('🔄 Jupiter swap request');
         
-        const response = await fetch('https://quote-api.jup.ag/v6/swap', {
+        // Jupiter Ultra API - Free tier with dynamic scaling
+        const response = await fetch('https://api.jup.ag/ultra/swap/v6/swap', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Accept': 'application/json'
+                'Accept': 'application/json',
+                'User-Agent': 'Trakr-Bot/1.0'
             },
             body: JSON.stringify(req.body)
         });
@@ -1707,6 +1719,68 @@ app.post('/jupiter/swap', async (req, res) => {
             message: error.message
         });
     }
+});
+
+// TEST ENDPOINT - Jupiter Diagnostic
+app.get('/test/jupiter', async (req, res) => {
+    const testResults = {
+        timestamp: new Date().toISOString(),
+        tests: []
+    };
+    
+    // Test 1: Can we reach Jupiter at all?
+    try {
+        console.log('🧪 Testing Jupiter API connection...');
+        const response = await fetch('https://api.jup.ag/ultra/quote/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000000&slippageBps=50', {
+            method: 'GET',
+            headers: { 
+                'Accept': 'application/json',
+                'User-Agent': 'Trakr-Bot/1.0'
+            }
+        });
+        
+        testResults.tests.push({
+            name: 'Jupiter Ultra API Reachability',
+            status: response.ok ? 'PASS' : 'FAIL',
+            statusCode: response.status,
+            message: response.ok ? 'Can reach Jupiter Ultra API' : await response.text()
+        });
+        
+        if (response.ok) {
+            const data = await response.json();
+            testResults.tests.push({
+                name: 'Jupiter Response Format',
+                status: 'PASS',
+                message: `Quote returned: ${data.outAmount} (${Object.keys(data).length} fields)`
+            });
+        }
+    } catch (error) {
+        testResults.tests.push({
+            name: 'Jupiter Ultra API Reachability',
+            status: 'ERROR',
+            message: error.message,
+            stack: error.stack
+        });
+    }
+    
+    // Test 2: DNS resolution
+    try {
+        const dns = require('dns').promises;
+        const addresses = await dns.resolve4('api.jup.ag');
+        testResults.tests.push({
+            name: 'DNS Resolution (api.jup.ag)',
+            status: 'PASS',
+            addresses: addresses
+        });
+    } catch (error) {
+        testResults.tests.push({
+            name: 'DNS Resolution',
+            status: 'ERROR',
+            message: error.message
+        });
+    }
+    
+    res.json(testResults);
 });
 
 // ==========================================
