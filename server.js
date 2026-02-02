@@ -1576,18 +1576,9 @@ app.get('/jupiter/quote', async (req, res) => {
         
         console.log('📊 Jupiter quote request:', url);
         
-        // Jupiter now requires API key even for public endpoints
-        const JUPITER_API_KEY = process.env.JUPITER_API_KEY;
-        if (!JUPITER_API_KEY) {
-            throw new Error('JUPITER_API_KEY environment variable not set');
-        }
-        
         const response = await fetch(url, {
             method: 'GET',
-            headers: { 
-                'Accept': 'application/json',
-                'x-api-key': JUPITER_API_KEY
-            }
+            headers: { 'Accept': 'application/json' }
         });
         
         if (!response.ok) {
@@ -1618,18 +1609,11 @@ app.post('/jupiter/swap', async (req, res) => {
     try {
         console.log('🔄 Jupiter swap request');
         
-        // Jupiter now requires API key even for public endpoints
-        const JUPITER_API_KEY = process.env.JUPITER_API_KEY;
-        if (!JUPITER_API_KEY) {
-            throw new Error('JUPITER_API_KEY environment variable not set');
-        }
-        
         const response = await fetch('https://quote-api.jup.ag/v6/swap', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'x-api-key': JUPITER_API_KEY
+                'Accept': 'application/json'
             },
             body: JSON.stringify(req.body)
         });
@@ -1657,83 +1641,6 @@ app.post('/jupiter/swap', async (req, res) => {
     }
 });
 
-// TEST ENDPOINT - Jupiter Public API Diagnostic
-app.get('/test/jupiter', async (req, res) => {
-    const testResults = {
-        timestamp: new Date().toISOString(),
-        tests: []
-    };
-    
-    // Test 1: Can we reach Jupiter Public API?
-    try {
-        console.log('🧪 Testing Jupiter Public API connection...');
-        
-        const JUPITER_API_KEY = process.env.JUPITER_API_KEY;
-        
-        if (!JUPITER_API_KEY) {
-            testResults.tests.push({
-                name: 'Jupiter Public API Reachability',
-                status: 'FAIL',
-                message: 'JUPITER_API_KEY environment variable not set',
-                apiKeySet: false
-            });
-        } else {
-            // Public API now requires authentication
-            const response = await fetch('https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000000&slippageBps=50', {
-                method: 'GET',
-                headers: { 
-                    'Accept': 'application/json',
-                    'x-api-key': JUPITER_API_KEY
-                }
-            });
-            
-            testResults.tests.push({
-                name: 'Jupiter Public API Reachability',
-                status: response.ok ? 'PASS' : 'FAIL',
-                statusCode: response.status,
-                message: response.ok ? 'Jupiter API working with authentication' : await response.text(),
-                endpoint: 'https://quote-api.jup.ag/v6/quote',
-                apiKeySet: true
-            });
-            
-            if (response.ok) {
-                const data = await response.json();
-                testResults.tests.push({
-                    name: 'Jupiter Response Format',
-                    status: 'PASS',
-                    message: `Quote returned: ${data.outAmount} (${Object.keys(data).length} fields)`
-                });
-            }
-        }
-    } catch (error) {
-        testResults.tests.push({
-            name: 'Jupiter Public API Reachability',
-            status: 'ERROR',
-            message: error.message,
-            stack: error.stack
-        });
-    }
-    
-    // Test 2: DNS resolution
-    try {
-        const dns = require('dns').promises;
-        const addresses = await dns.resolve4('quote-api.jup.ag');
-        testResults.tests.push({
-            name: 'DNS Resolution (quote-api.jup.ag)',
-            status: 'PASS',
-            addresses: addresses
-        });
-    } catch (error) {
-        testResults.tests.push({
-            name: 'DNS Resolution',
-            status: 'ERROR',
-            message: error.message
-        });
-    }
-    
-    res.json(testResults);
-});
-
 // ==========================================
 // START SERVER
 // ==========================================
@@ -1758,5 +1665,4 @@ app.listen(PORT, () => {
     console.log(`   DELETE /api/admin/projects/filter`);
     console.log(`   GET  /jupiter/quote (Jupiter proxy)`);
     console.log(`   POST /jupiter/swap (Jupiter proxy)`);
-    console.log(`   GET  /test/jupiter (Jupiter diagnostic)`);
 });
