@@ -603,8 +603,74 @@ app.get('/api/live-launches', async (req, res) => {
         console.log(`✅ Found ${newGraduations.length} NEW graduations since last check (filtered from ${tokens.length} total)`);
         console.log(`🗂️ Now tracking ${seenTokens.size} seen tokens`);
         
-        // Format results
-        const formatted = newGraduations.map(token => {
+        // ENRICH NEW GRADUATIONS with Helius metadata (on-chain socials/website)
+        // CRITICAL: Only enrich NEW tokens (not all 50 from Moralis)
+        // This keeps Helius usage sustainable: ~3-5 calls/min instead of 1.6M/day
+        console.log(`📊 Enriching ${newGraduations.length} NEW tokens with Helius metadata...`);
+        const enrichStart = Date.now();
+        
+        const HELIUS_KEY = process.env.HELIUS_API_KEY || 'b6a9d5a0-1c30-4684-939f-e3cb0f53fc1f';
+        
+        const enrichedGraduations = await Promise.all(
+            newGraduations.map(async (token) => {
+                const address = token.address || token.mint || token.token_address || token.tokenAddress;
+                
+                try {
+                    const controller = new AbortController();
+                    const timeout = setTimeout(() => controller.abort(), 3000); // 3s timeout
+                    
+                    const response = await fetch(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            jsonrpc: '2.0',
+                            id: 1,
+                            method: 'getAsset',
+                            params: { id: address }
+                        }),
+                        signal: controller.signal
+                    });
+                    
+                    clearTimeout(timeout);
+                    
+                    if (!response.ok) {
+                        throw new Error(`Helius returned ${response.status}`);
+                    }
+                    
+                    const data = await response.json();
+                    const result = data.result;
+                    
+                    if (result && result.content) {
+                        const links = result.content.links || {};
+                        const metadata = result.content.metadata || {};
+                        
+                        // Extract socials and website from on-chain metadata
+                        token.website = links.external_url || metadata.external_url || null;
+                        token.twitter = links.twitter || null;
+                        token.telegram = links.telegram || null;
+                        token.discord = links.discord || null;
+                        
+                        // Update logo if Helius has better quality
+                        if (result.content.files && result.content.files.length > 0) {
+                            token.logo = result.content.files[0].uri || token.logo;
+                        }
+                        
+                        console.log(`   ✅ ${token.symbol}: website=${!!token.website}, twitter=${!!token.twitter}, telegram=${!!token.telegram}`);
+                    }
+                    
+                } catch (error) {
+                    console.warn(`   ⚠️ Helius enrichment failed for ${address.slice(0, 8)}: ${error.message}`);
+                    // Continue without enrichment - don't block the response
+                }
+                
+                return token;
+            })
+        );
+        
+        console.log(`✅ Enrichment complete in ${Date.now() - enrichStart}ms`);
+        
+        // Format results (use enrichedGraduations instead of newGraduations)
+        const formatted = enrichedGraduations.map(token => {
             const address = token.address || token.mint || token.token_address || token.tokenAddress;
             const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
             
@@ -624,6 +690,8 @@ app.get('/api/live-launches', async (req, res) => {
                 hasWebsite: !!token.website,
                 hasSocials: !!(token.twitter || token.telegram),
                 website: token.website || null,
+                twitter: token.twitter || null,
+                telegram: token.telegram || null,
                 dexscreenerUrl: `https://dexscreener.com/solana/${address}`,
                 jupiterUrl: `https://jup.ag/?sell=So11111111111111111111111111111111111111112&buy=${address}`,
                 raydiumUrl: `https://raydium.io/swap/?inputCurrency=sol&outputCurrency=${address}`,
