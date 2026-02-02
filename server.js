@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
 const { createClient } = require('@supabase/supabase-js');
-const WebSocket = require('ws');
 require('dotenv').config();
 
 // FIX: Ensure fetch is available (Node < 18 compatibility)
@@ -23,436 +22,9 @@ const supabase = createClient(
 const TWITTER_BEARER_TOKEN = process.env.TWITTER_BEARER_TOKEN;
 const TWITTER_BASE_URL = 'https://api.twitter.com/2';
 
-// X API pause state
-let xApiPaused = false;
 
 // ==========================================
-// HELIUS WEBSOCKET - INSTANT GRADUATIONS
-// ==========================================
-
-// Helius API Key (REQUIRED for WebSocket)
-// Get your free API key at: https://dashboard.helius.dev
-const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
-
-// WebSocket URL for standard (free tier) Helius WebSocket
-// Docs: https://www.helius.dev/docs/api-reference/rpc/websocket/logssubscribe
-const HELIUS_WS_URL = HELIUS_API_KEY 
-    ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`
-    : null;
-
-// Raydium AMM Program ID - this is where pump.fun tokens graduate TO
-// When a pump.fun token graduates, a new Raydium pool is created
-const RAYDIUM_AMM_PROGRAM_ID = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
-
-// Pump.fun migration authority PDA - confirms this is a pump.fun graduation
-const PUMPFUN_MIGRATION_AUTHORITY = 'Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1';
-
-// PumpSwap program (kept for backward compatibility in verification)
-const PUMPSWAP_PROGRAM_ID = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
-
-// Store webhook-detected graduations (in-memory, last 100)
-const wsGraduations = [];
-const MAX_WS_GRADUATIONS = 100;
-
-// NOTE: WebSocket variables removed - now using webhook
-// Webhook provides: time-gated, authority-verified graduations only
-
-// Rate limiter for RPC calls (used for metadata enrichment)
-let lastRpcCallTime = 0;
-const RPC_MIN_INTERVAL_MS = 500; // 500ms between RPC calls
-
-async function rateLimitedRpcCall() {
-    const now = Date.now();
-    const timeSinceLastCall = now - lastRpcCallTime;
-    if (timeSinceLastCall < RPC_MIN_INTERVAL_MS) {
-        await new Promise(r => setTimeout(r, RPC_MIN_INTERVAL_MS - timeSinceLastCall));
-    }
-    lastRpcCallTime = Date.now();
-}
-
-// ===========================================
-// HELIUS WEBHOOK (replaces WebSocket subscription)
-// ===========================================
-// WebSocket subscription is REMOVED - it was detecting ALL pump.fun activity
-// Instead, use Helius Webhook configured to listen to Raydium AMM
-// This gives us ONLY graduations (Raydium pool creations with pump.fun tokens)
-//
-// Setup in Helius Dashboard:
-// 1. Go to https://dev.helius.xyz/webhooks
-// 2. Create webhook: https://trakr-backend-0v6u.onrender.com/webhooks/helius
-// 3. Add account: 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 (Raydium AMM)
-//
-// The webhook endpoint is defined below in the Express routes section
-
-// Track processed transactions to avoid duplicates
-const processingTransactions = new Set();
-
-// NOTE: extractMintFromTransaction REMOVED - webhook now provides mint directly
-// No more endsWith('pump') heuristics - we trust the pump.fun authority check
-
-// Fetch token metadata from Moralis (for enrichment)
-async function fetchTokenMetadata(tokenMint) {
-    try {
-        const MORALIS_API_KEY = process.env.MORALIS_API_KEY;
-        
-        if (!MORALIS_API_KEY) {
-            console.log('⚠️ No Moralis API key for metadata enrichment');
-            return null;
-        }
-        
-        // Fetch token metadata
-        const response = await fetch(
-            `https://solana-gateway.moralis.io/token/mainnet/${tokenMint}/metadata`,
-            {
-                headers: {
-                    'Accept': 'application/json',
-                    'X-API-Key': MORALIS_API_KEY
-                }
-            }
-        );
-        
-        if (!response.ok) {
-            // Try DexScreener as fallback
-            return await fetchDexScreenerMetadata(tokenMint);
-        }
-        
-        const data = await response.json();
-        
-        return {
-            symbol: data.symbol,
-            name: data.name,
-            logo: data.logo || data.image_uri || data.logoURI,
-            website: data.website,
-            twitter: data.twitter,
-            telegram: data.telegram,
-            priceUsd: data.priceUsd || 0,
-            liquidity: data.liquidity || 0
-        };
-        
-    } catch (error) {
-        console.error('Error fetching Moralis metadata:', error.message);
-        // Try DexScreener as fallback
-        return await fetchDexScreenerMetadata(tokenMint);
-    }
-}
-
-// Fallback: Fetch metadata from DexScreener
-async function fetchDexScreenerMetadata(tokenMint) {
-    try {
-        const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${tokenMint}`);
-        
-        if (!response.ok) return null;
-        
-        const data = await response.json();
-        const pair = data.pairs?.[0];
-        
-        if (!pair) return null;
-        
-        return {
-            symbol: pair.baseToken?.symbol,
-            name: pair.baseToken?.name,
-            logo: pair.info?.imageUrl,
-            website: pair.info?.websites?.[0]?.url,
-            twitter: pair.info?.socials?.find(s => s.type === 'twitter')?.url,
-            telegram: pair.info?.socials?.find(s => s.type === 'telegram')?.url,
-            priceUsd: parseFloat(pair.priceUsd) || 0,
-            liquidity: pair.liquidity?.usd || 0
-        };
-        
-    } catch (error) {
-        console.error('Error fetching DexScreener metadata:', error.message);
-        return null;
-    }
-}
-
-// ==========================================
-// LIVE LAUNCHES ENDPOINTS
-// ==========================================
-
-// NEW: WebSocket-detected graduations (FAST - 1-3 seconds)
-// Legacy endpoint - now uses webhook data (same as /fast)
-app.get('/api/live-launches/ws', async (req, res) => {
-    try {
-        const now = Date.now();
-        const launches = wsGraduations.map(g => ({
-            ...g,
-            ageMinutes: Math.floor((now - g.detectedAt) / (1000 * 60))
-        })).filter(l => l.ageMinutes < 60);
-        
-        res.json({
-            success: true,
-            source: 'helius_webhook',
-            timestamp: new Date().toISOString(),
-            launches: launches,
-            count: launches.length,
-            message: 'Real-time graduations via Helius Webhook (1-3 sec delay)'
-        });
-        
-    } catch (error) {
-        console.error('❌ WS Live Launches error:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ===========================================
-// HELIUS WEBHOOK ENDPOINT - Receives graduations
-// ===========================================
-// Configure in Helius Dashboard:
-// - Webhook URL: https://trakr-backend-0v6u.onrender.com/webhooks/helius
-// - Transaction Type: Any
-// - Account Addresses: 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 (Raydium AMM)
-
-// Track when webhook started - reject anything before this
-const WEBHOOK_START_TIME = Math.floor(Date.now() / 1000);
-console.log(`🕐 Webhook start time: ${WEBHOOK_START_TIME} (${new Date().toISOString()})`);
-
-// Pump.fun migration authority PDA - MUST be present for real graduations
-const PUMP_FUN_AUTHORITY_PDA = 'Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1';
-// RAYDIUM_AMM_PROGRAM_ID already declared at top of file
-
-app.post('/webhooks/helius', async (req, res) => {
-    res.status(200).send('OK');
-    
-    try {
-        const payload = req.body;
-        const transactions = Array.isArray(payload) ? payload : [payload];
-        const now = Math.floor(Date.now() / 1000);
-        
-        for (const tx of transactions) {
-            // TIME GATE: Reject old transactions
-            if (tx.blockTime && (now - tx.blockTime) > 60) continue;
-            if (tx.blockTime && tx.blockTime < WEBHOOK_START_TIME) continue;
-            
-            // MANDATORY: Check for pump.fun authority in signers
-            const hasPumpFunAuthority = tx.signers?.includes(PUMP_FUN_AUTHORITY_PDA);
-            if (!hasPumpFunAuthority) continue;
-            
-            // MANDATORY: Verify this is a Raydium pool initialization
-            const isRaydiumInit = tx.instructions?.some(ix =>
-                ix.programId === RAYDIUM_AMM_PROGRAM_ID &&
-                (ix.name?.toLowerCase().includes('initialize') || 
-                 ix.type?.toLowerCase().includes('init'))
-            );
-            if (!isRaydiumInit) continue;
-            
-            // ✅ THIS IS A REAL GRADUATION
-            // Now find the token mint from the transaction
-            let tokenMint = null;
-            
-            // Get from token transfers
-            if (tx.tokenTransfers) {
-                for (const t of tx.tokenTransfers) {
-                    if (t.mint && t.mint !== 'So11111111111111111111111111111111111111112') {
-                        tokenMint = t.mint;
-                        break;
-                    }
-                }
-            }
-            
-            // Get from token balances
-            if (!tokenMint && tx.tokenBalanceChanges) {
-                for (const b of tx.tokenBalanceChanges) {
-                    if (b.mint && b.mint !== 'So11111111111111111111111111111111111111112') {
-                        tokenMint = b.mint;
-                        break;
-                    }
-                }
-            }
-            
-            if (!tokenMint) {
-                console.log(`⚠️ Graduation detected but no token mint found`);
-                console.log(`   TX: ${tx.signature?.slice(0,16)}...`);
-                continue;
-            }
-            
-            // Skip if already cached
-            if (wsGraduations.some(g => g.contract === tokenMint)) continue;
-            
-            const txAge = tx.blockTime ? (now - tx.blockTime) : 'unknown';
-            console.log(`🎓 GRADUATION CONFIRMED: ${tokenMint.slice(0,12)}...`);
-            console.log(`   TX: ${tx.signature?.slice(0,16)}... Age: ${txAge}s`);
-            
-            await processHeliusWebhook(tx, tokenMint);
-        }
-    } catch (error) {
-        console.error('❌ Webhook error:', error.message);
-    }
-});
-
-// Process transaction from Helius webhook
-async function processHeliusWebhook(tx, tokenMint) {
-    try {
-        if (!tx || !tx.signature || !tokenMint) return;
-        
-        // Fetch metadata with tags
-        const graduationData = await getGraduationWithTags(tokenMint);
-        
-        const graduation = {
-            symbol: graduationData.symbol || 'UNKNOWN',
-            name: graduationData.name || 'Unknown Token',
-            contract: tokenMint,
-            ageMinutes: 0,
-            liquidity: graduationData.liquidityUsd || 0,
-            liquiditySol: graduationData.liquiditySol || 0,
-            price: graduationData.price || 0,
-            dex: 'raydium',
-            hasLogo: !!graduationData.image,
-            hasWebsite: !!graduationData.website,
-            hasSocials: !!(graduationData.twitter || graduationData.telegram),
-            website: graduationData.website || null,
-            twitter: graduationData.twitter || null,
-            telegram: graduationData.telegram || null,
-            logo: graduationData.image || null,
-            dexscreenerUrl: `https://dexscreener.com/solana/${tokenMint}`,
-            jupiterUrl: `https://jup.ag/swap/SOL-${tokenMint}`,
-            pumpfunUrl: `https://pump.fun/${tokenMint}`,
-            graduated: true,
-            graduatedAt: new Date().toISOString(),
-            detectedAt: Date.now(),
-            txSignature: tx.signature,
-            source: 'helius_webhook',
-            tags: graduationData.tags || []
-        };
-        
-        wsGraduations.unshift(graduation);
-        if (wsGraduations.length > MAX_WS_GRADUATIONS) {
-            wsGraduations.pop();
-        }
-        
-        console.log(`✅ Added: ${graduation.symbol} (${tokenMint.slice(0, 8)}...)`);
-        console.log(`   🏷️ Tags: ${graduation.tags.join(', ')}`);
-        console.log(`   📦 Total cached: ${wsGraduations.length}`);
-        
-    } catch (error) {
-        console.error(`❌ Process webhook error:`, error.message);
-    }
-}
-
-// Get graduation data with tags
-async function getGraduationWithTags(mint) {
-    const tags = ['PUMP_FUN_GRADUATED'];
-    let image = null, website = null, twitter = null, telegram = null;
-    let symbol = null, name = null, liquiditySol = 0, liquidityUsd = 0, price = 0;
-    
-    // Try Helius metadata API
-    if (HELIUS_API_KEY) {
-        try {
-            const metaRes = await fetch(
-                `https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ mintAccounts: [mint] })
-                }
-            );
-            const metaData = await metaRes.json();
-            const meta = metaData?.[0];
-            
-            // DEBUG: Log full metadata structure
-            console.log(`   📋 Helius metadata for ${mint.slice(0,8)}...:`);
-            console.log(`   ${JSON.stringify(meta, null, 2).slice(0, 500)}`);
-            
-            if (meta) {
-                symbol = meta.symbol || meta.onChainMetadata?.metadata?.symbol;
-                name = meta.name || meta.onChainMetadata?.metadata?.name;
-                
-                // Try multiple paths for off-chain data
-                const offChain = meta.offChainMetadata?.metadata || meta.offChainMetadata || {};
-                
-                // DEBUG: Log offchain specifically
-                console.log(`   📋 OffChain: ${JSON.stringify(offChain, null, 2).slice(0, 300)}`);
-                
-                image = offChain.image || offChain.logo;
-                website = offChain.website || offChain.external_url;
-                twitter = offChain.twitter || offChain.properties?.twitter;
-                telegram = offChain.telegram || offChain.properties?.telegram;
-                
-                // Check properties object (some tokens store socials there)
-                if (offChain.properties) {
-                    website = website || offChain.properties.website;
-                    twitter = twitter || offChain.properties.twitter;
-                    telegram = telegram || offChain.properties.telegram;
-                }
-            }
-        } catch (e) {
-            console.log(`   ⚠️ Helius metadata error: ${e.message}`);
-        }
-    }
-    
-    // Try Moralis for additional data
-    try {
-        const moralisData = await fetchTokenMetadata(mint);
-        if (moralisData) {
-            symbol = symbol || moralisData.symbol;
-            name = name || moralisData.name;
-            image = image || moralisData.logo;
-            liquidityUsd = moralisData.liquidity || 0;
-            liquiditySol = liquidityUsd / 150;
-            price = moralisData.priceUsd || 0;
-        }
-    } catch (e) {
-        console.log(`   ⚠️ Moralis error: ${e.message}`);
-    }
-    
-    // Add tags
-    if (image) tags.push('HAS_LOGO'); else tags.push('NO_LOGO');
-    if (website) tags.push('HAS_WEBSITE');
-    if (twitter) tags.push('HAS_TWITTER');
-    if (telegram) tags.push('HAS_TELEGRAM');
-    if (!(website || twitter || telegram)) tags.push('NO_SOCIALS');
-    if (image && (website || twitter || telegram)) tags.push('FULL_METADATA');
-    else tags.push('BARE_METADATA');
-    if (liquiditySol < 5) tags.push('LOW_LIQUIDITY');
-    else if (liquiditySol < 20) tags.push('MEDIUM_LIQUIDITY');
-    else tags.push('HIGH_LIQUIDITY');
-    
-    return { mint, symbol, name, image, website, twitter, telegram, liquiditySol, liquidityUsd, price, tags };
-}
-
-// Polling endpoint for extension
-app.get('/api/live-launches/fast', (req, res) => {
-    const now = Date.now();
-    const launches = wsGraduations.map(g => ({
-        ...g,
-        ageMinutes: Math.floor((now - g.detectedAt) / (1000 * 60))
-    })).filter(l => l.ageMinutes < 60);
-    
-    res.json({
-        success: true,
-        source: 'helius_webhook',
-        timestamp: new Date().toISOString(),
-        launches,
-        count: launches.length,
-        message: launches.length > 0 
-            ? 'Real-time graduations via Helius Webhook'
-            : 'Waiting for graduations...'
-    });
-});
-
-// Status endpoint
-app.get('/api/live-launches/status', (req, res) => {
-    res.json({
-        success: true,
-        webhook: {
-            endpoint: '/webhooks/helius',
-            cachedGraduations: wsGraduations.length,
-            oldestGraduation: wsGraduations.length > 0 ? wsGraduations[wsGraduations.length - 1].graduatedAt : null,
-            newestGraduation: wsGraduations.length > 0 ? wsGraduations[0].graduatedAt : null
-        },
-        setup: {
-            step1: 'Go to https://dev.helius.xyz/webhooks',
-            step2: 'Create webhook with URL: https://trakr-backend-0v6u.onrender.com/webhooks/helius',
-            step3: 'Add account: 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8 (Raydium AMM)'
-        }
-    });
-});
-
-
-// ==========================================
-// SCANNER FUNCTIONS (EXISTING)
+// SCANNER FUNCTIONS
 // ==========================================
 
 // 3-Tier Search System - X API v2 compatible (spaces instead of AND)
@@ -507,99 +79,93 @@ function extractProjectHandle(text) {
     return mentions[0].replace('@', '');
 }
 
-// Calculate credibility score (0-100)
-function calculateScore(user) {
-    if (!user) return 0;
-    
-    let score = 0;
-    const metrics = user.public_metrics;
-    
-    // Followers (0-30 points)
-    if (metrics.followers_count >= 10000) score += 30;
-    else if (metrics.followers_count >= 5000) score += 25;
-    else if (metrics.followers_count >= 1000) score += 20;
-    else if (metrics.followers_count >= 500) score += 15;
-    else if (metrics.followers_count >= 100) score += 10;
-    else score += 5;
-    
-    // Following ratio (0-15 points)
-    const ratio = metrics.followers_count / (metrics.following_count || 1);
-    if (ratio >= 2) score += 15;
-    else if (ratio >= 1) score += 10;
-    else if (ratio >= 0.5) score += 5;
-    
-    // Tweet count (0-15 points)
-    if (metrics.tweet_count >= 500) score += 15;
-    else if (metrics.tweet_count >= 100) score += 10;
-    else if (metrics.tweet_count >= 50) score += 5;
-    
-    // Account age (0-20 points) - NEW: longer = better
-    const createdAt = new Date(user.created_at);
-    const ageInDays = (Date.now() - createdAt) / (1000 * 60 * 60 * 24);
-    if (ageInDays >= 365) score += 20;       // 1+ year = trustworthy
-    else if (ageInDays >= 180) score += 15;  // 6+ months
-    else if (ageInDays >= 90) score += 10;   // 3+ months
-    else if (ageInDays >= 30) score += 5;    // 1+ month
-    // < 30 days = no points (suspicious)
-    
-    // Verified badge (0-10 points)
-    if (user.verified) score += 10;
-    
-    // Bio check (0-10 points)
-    if (user.description && user.description.length > 50) score += 10;
-    else if (user.description && user.description.length > 20) score += 5;
-    
-    return Math.min(100, score);
-}
-
-// Detect blockchain from text
-function detectBlockchain(text) {
-    const lowerText = text.toLowerCase();
-    if (lowerText.includes('solana') || lowerText.includes('$sol')) return 'Solana';
-    if (lowerText.includes('ethereum') || lowerText.includes('$eth') || lowerText.includes('erc20')) return 'Ethereum';
-    if (lowerText.includes('base')) return 'Base';
-    if (lowerText.includes('arbitrum') || lowerText.includes('$arb')) return 'Arbitrum';
-    if (lowerText.includes('polygon') || lowerText.includes('$matic')) return 'Polygon';
-    if (lowerText.includes('optimism') || lowerText.includes('$op')) return 'Optimism';
-    if (lowerText.includes('avalanche') || lowerText.includes('$avax')) return 'Avalanche';
-    if (lowerText.includes('bnb') || lowerText.includes('bsc')) return 'BSC';
-    return 'Unknown';
-}
-
-// Detect project stage
-function detectStage(text) {
-    const lowerText = text.toLowerCase();
-    if (lowerText.includes('mainnet') || lowerText.includes('live now') || lowerText.includes('launched')) return 'MAINNET';
-    if (lowerText.includes('testnet') || lowerText.includes('beta')) return 'TESTNET';
-    if (lowerText.includes('stealth') || lowerText.includes('building')) return 'STEALTH';
-    if (lowerText.includes('airdrop')) return 'AIRDROP';
-    if (lowerText.includes('presale') || lowerText.includes('private sale')) return 'PRESALE';
-    return 'PRE-LAUNCH';
-}
-
-// Scan Twitter for pre-TGE projects
-async function scanTwitter(tier = 'tier2') {
-    // Check if paused
-    if (xApiPaused) {
-        console.log('⏸️ X API is paused - skipping scan');
-        return { success: false, error: 'X API is paused' };
-    }
-    
-    if (!TWITTER_BEARER_TOKEN) {
-        console.error('❌ TWITTER_BEARER_TOKEN not set');
-        return { success: false, error: 'Twitter API not configured' };
-    }
-    
+// Scan X API for projects (tiered)
+async function scanProjects(tier = 'tier1') {
     const tierConfig = SEARCH_TIERS[tier];
-    if (!tierConfig) {
-        return { success: false, error: `Invalid tier: ${tier}` };
+    console.log(`🔍 Starting ${tierConfig.label} scan...`);
+    
+    // Track last tweet count per tier (for cooldown skip)
+    if (!global.lastTweetCount) {
+        global.lastTweetCount = {};
     }
     
-    console.log(`\n🔍 Scanning ${tierConfig.label}...`);
+    // Fix #3: Cooldown skip for Tier 1 if last run returned 0 tweets
+    if (tier === 'tier1' && global.lastTweetCount[tier] === 0) {
+        console.log('⏭️ Skipping TIER 1 — last run empty (cooldown)');
+        global.lastTweetCount[tier] = undefined; // Reset so next run executes
+        return [];
+    }
+    
+    const query = tierConfig.query;
+    const allProjects = [];
+    
+    // Track projects found in this scan cycle (across all tiers)
+    if (!global.currentScanProjects) {
+        global.currentScanProjects = new Set();
+    }
+    
+    // Hard lookup caps per tier (prevents surprise bills)
+    const LOOKUP_CAPS = {
+        tier1: 5,
+        tier2: 10,
+        tier3: 10
+    };
+    
+    // Track old accounts to never fetch again (persistent across scans)
+    if (!global.oldAccounts) {
+        global.oldAccounts = new Set();
+    }
+    
+    // Track lookups performed this scan
+    let lookupsPerformed = 0;
+    
+    // In-memory cache for mentioned projects (reduces duplicate API calls)
+    const projectCache = new Map();
+    
+    // Cheap tweet filter (before extraction)
+    function looksLikeProjectTweet(text) {
+        // Must contain project-related keywords
+        if (!/testnet|deployed|launch|live|airdrop|presale|mainnet|building|shipping|stealth/i.test(text)) {
+            return false;
+        }
+        // Filter out influencer/opinion content
+        if (/thread|thoughts|opinion|market update|daily|gm |gn /i.test(text)) {
+            return false;
+        }
+        return true;
+    }
+    
+    // Cheap handle heuristic filter
+    function looksLikeProjectHandle(username) {
+        if (!username || username.length < 4) return false;
+        if (/\d{4,}$/.test(username)) return false; // spammy numbers
+        // Allow most, filter obvious junk
+        return true;
+    }
     
     try {
+        // Calculate time window based on tier frequency
+        // Add 60-second safety buffer to ensure start_time is safely in the past
+        const SAFETY_BUFFER_SECONDS = 60;
+        const now = new Date();
+        const windowMinutes = tierConfig.frequency;
+        const windowStart = new Date(
+            now.getTime() 
+            - windowMinutes * 60 * 1000 
+            - SAFETY_BUFFER_SECONDS * 1000
+        );
+        
+        const params = new URLSearchParams({
+            query: query,
+            'max_results': '10',  // Both tiers capped at 10 for cost control
+            'tweet.fields': 'created_at',
+            'user.fields': 'username,description,verified,created_at,public_metrics,url',
+            'expansions': 'author_id',
+            'start_time': windowStart.toISOString()
+        });
+        
         const response = await fetch(
-            `${TWITTER_BASE_URL}/tweets/search/recent?query=${encodeURIComponent(tierConfig.query)}&max_results=20&tweet.fields=created_at,author_id&expansions=author_id&user.fields=username,public_metrics,created_at,description,verified`,
+            `${TWITTER_BASE_URL}/tweets/search/recent?${params}`,
             {
                 headers: {
                     'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}`
@@ -609,98 +175,242 @@ async function scanTwitter(tier = 'tier2') {
         
         if (!response.ok) {
             const errorText = await response.text();
-            console.error(`Twitter API error: ${response.status} - ${errorText}`);
-            return { success: false, error: `API error: ${response.status}` };
+            console.error(`${tierConfig.label} query failed:`, response.status);
+            console.error(`${tierConfig.label} error body:`, errorText);
+            return [];
         }
         
         const data = await response.json();
-        const tweets = data.data || [];
-        const users = data.includes?.users || [];
         
-        console.log(`📊 Found ${tweets.length} tweets`);
+        // Track tweet count for cooldown skip logic
+        const tweetCount = data.data?.length || 0;
+        global.lastTweetCount[tier] = tweetCount;
         
-        // Map users by ID for easy lookup
-        const userMap = {};
-        users.forEach(user => {
-            userMap[user.id] = user;
-        });
+        // DEBUG: Log query and results
+        console.log(`${tierConfig.label} query:`, query.substring(0, 100) + '...');
+        console.log(`${tierConfig.label} tweets returned:`, tweetCount);
         
-        // Process each tweet
-        const projects = [];
-        
-        for (const tweet of tweets) {
-            const user = userMap[tweet.author_id];
-            if (!user) continue;
-            
-            // Check account age
-            const createdAt = new Date(user.created_at);
-            const ageInDays = (Date.now() - createdAt) / (1000 * 60 * 60 * 24);
-            
-            // Calculate score
-            const score = calculateScore(user);
-            
-            // Only include if meets criteria
-            if (score >= 20) {  // Minimum score threshold
-                const project = {
-                    id: `twitter_${user.username}_${Date.now()}`,
-                    handle: user.username,
-                    name: user.username,
-                    description: user.description || '',
-                    followers: user.public_metrics.followers_count,
-                    following: user.public_metrics.following_count,
-                    tweets: user.public_metrics.tweet_count,
-                    accountAge: Math.floor(ageInDays),
-                    score: score,
-                    tier: tierConfig.label,
-                    blockchain: detectBlockchain(tweet.text + ' ' + (user.description || '')),
-                    stage: detectStage(tweet.text + ' ' + (user.description || '')),
-                    verified: user.verified || false,
-                    tweetText: tweet.text,
-                    tweetId: tweet.id,
-                    foundAt: new Date().toISOString(),
-                    profileUrl: `https://twitter.com/${user.username}`
-                };
-                
-                projects.push(project);
-            }
+        if (!data.data || data.data.length === 0) {
+            console.log(`${tierConfig.label}: No tweets found in last ${windowMinutes} minutes`);
+            return [];
         }
         
-        console.log(`✅ ${projects.length} projects passed filters`);
+        // Build user map
+        const users = {};
+        if (data.includes && data.includes.users) {
+            data.includes.users.forEach(user => {
+                users[user.id] = user;
+            });
+        }
         
-        return {
-            success: true,
-            tier: tierConfig.label,
-            projects: projects,
-            totalScanned: tweets.length,
-            timestamp: new Date().toISOString()
-        };
+        // Parse tweets
+        for (const tweet of data.data) {
+            // Skip retweets
+            if (tweet.text.startsWith('RT @')) {
+                continue;
+            }
+            
+            // CHEAP FILTER #1: Tweet content filter (FREE, eliminates 50-70% junk)
+            if (!looksLikeProjectTweet(tweet.text)) {
+                continue;
+            }
+            
+            const user = users[tweet.author_id] || {};
+            const projectHandle = user.username;
+            
+            if (!projectHandle) continue;
+            
+            // CROSS-TIER DEDUPLICATION: Skip if already found by higher tier this scan cycle
+            if (global.currentScanProjects.has(projectHandle)) {
+                console.log(`⏭️ ${tierConfig.label}: Skipping @${projectHandle} - already found by higher tier`);
+                continue;
+            }
+            
+            // CHEAP FILTER #2: Handle heuristics (FREE)
+            if (!looksLikeProjectHandle(projectHandle)) {
+                console.log(`⏭️ ${tierConfig.label}: Skipping @${projectHandle} - doesn't look like project handle`);
+                continue;
+            }
+            
+            // CHEAP FILTER #3: Skip known old accounts (FREE, no API call)
+            if (global.oldAccounts.has(projectHandle)) {
+                continue; // Silent skip - already know it's old
+            }
+            
+            // Use author's data (already in response, no extra API call)
+            const projectUser = user;
+            
+            // Tiered age filter - check the PROJECT's age
+            const accountCreated = new Date(projectUser.created_at);
+            const ageLimitDays = tierConfig.ageLimit || 90;
+            const cutoffDate = new Date(Date.now() - ageLimitDays * 24 * 60 * 60 * 1000);
+            
+            if (accountCreated < cutoffDate) {
+                // Add to permanent skip list
+                global.oldAccounts.add(projectHandle);
+                console.log(`⏭️ ${tierConfig.label}: Skipping @${projectHandle} - account too old (${accountCreated.toISOString().split('T')[0]})`);
+                continue;
+            }
+            
+            console.log(`✅ ${tierConfig.label}: Found @${projectHandle} (created ${accountCreated.toISOString().split('T')[0]})`);
+            
+            // Mark as found in this scan cycle
+            global.currentScanProjects.add(projectHandle);
+            
+            // Store PROJECT's data
+            allProjects.push({
+                tweet_id: tweet.id,
+                project_handle: projectHandle,
+                tweet_text: tweet.text,
+                tweet_author: user.username,
+                tweet_url: `https://twitter.com/${user.username}/status/${tweet.id}`,
+                project_url: `https://twitter.com/${projectHandle}`,
+                account_created: projectUser.created_at,  // PROJECT's data
+                followers: projectUser.public_metrics?.followers_count || 0,  // PROJECT's data
+                verified: projectUser.verified || false,  // PROJECT's data
+                bio: projectUser.description || '',  // PROJECT's data
+                found_by_query: tierConfig.label  // Store tier label (TIER 1, TIER 2, TIER 3)
+            });
+        }
         
     } catch (error) {
-        console.error('Scan error:', error);
-        return { success: false, error: error.message };
+        console.error(`${tierConfig.label} error:`, error.message);
+        return [];
+    }
+    
+    console.log(`📊 ${tierConfig.label}: Found ${allProjects.length} projects`);
+    console.log(`📦 ${tierConfig.label}: Cache hits saved ${projectCache.size} API calls`);
+    
+    // Deduplicate by tweet_id
+    const unique = [];
+    const seenIds = new Set();
+    for (const proj of allProjects) {
+        if (!seenIds.has(proj.tweet_id)) {
+            seenIds.add(proj.tweet_id);
+            unique.push(proj);
+        }
+    }
+    
+    console.log(`✅ ${tierConfig.label}: ${unique.length} unique projects after deduplication`);
+    
+    // Save to database (FIX #4: Don't overwrite fetched data!)
+    if (unique.length > 0) {
+        const { error } = await supabase
+            .from('projects')
+            .upsert(unique.map(p => ({
+                tweet_id: p.tweet_id,
+                project_handle: p.project_handle,
+                tweet_text: p.tweet_text,
+                tweet_author: p.tweet_author,
+                tweet_url: p.tweet_url,
+                project_url: p.project_url,
+                account_created: p.account_created,  // Keep real data
+                followers: p.followers,  // Keep real data
+                verified: p.verified,  // Keep real data
+                bio: p.bio,  // Keep real data
+                found_by_query: p.found_by_query,  // Tier label (TIER 1, TIER 2, TIER 3)
+                found_at: new Date().toISOString()
+            })), {
+                onConflict: 'tweet_id'
+            });
+        
+        if (error) {
+            console.error(`❌ ${tierConfig.label} database error:`, error);
+        } else {
+            console.log(`💾 ${tierConfig.label}: Saved ${unique.length} projects to database`);
+        }
+    }
+    
+    return unique;
+}
+
+// ==========================================
+// WHALE TRACKER FUNCTIONS
+// ==========================================
+
+// Fetch user's following list
+async function fetchUserFollowing(username, limit = 10) {
+    try {
+        // First get user ID
+        const userResponse = await fetch(
+            `${TWITTER_BASE_URL}/users/by/username/${username}`,
+            {
+                headers: {
+                    'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}`
+                }
+            }
+        );
+        
+        if (!userResponse.ok) {
+            throw new Error(`User ${username} not found`);
+        }
+        
+        const userData = await userResponse.json();
+        const userId = userData.data.id;
+        
+        // Now get following list
+        const params = new URLSearchParams({
+            'max_results': limit.toString(),
+            'user.fields': 'username,description,created_at,public_metrics,verified,url'
+        });
+        
+        const response = await fetch(
+            `${TWITTER_BASE_URL}/users/${userId}/following?${params}`,
+            {
+                headers: {
+                    'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}`
+                }
+            }
+        );
+        
+        if (!response.ok) {
+            throw new Error('Failed to fetch following list');
+        }
+        
+        const data = await response.json();
+        return data.data || [];
+        
+    } catch (error) {
+        throw error;
     }
 }
 
-// Save projects to Supabase
-async function saveProjects(projects) {
-    if (!projects || projects.length === 0) return;
+// Check rate limit for wallet
+async function checkRateLimit(walletAddress) {
+    const { data, error } = await supabase
+        .from('whale_searches')
+        .select('*')
+        .eq('wallet_address', walletAddress)
+        .gte('searched_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
     
-    try {
-        // Upsert to handle duplicates
-        const { error } = await supabase
-            .from('projects')
-            .upsert(projects, {
-                onConflict: 'handle',
-                ignoreDuplicates: false
-            });
-            
-        if (error) {
-            console.error('Supabase save error:', error);
-        } else {
-            console.log(`💾 Saved ${projects.length} projects to database`);
-        }
-    } catch (error) {
-        console.error('Save error:', error);
+    if (error) {
+        console.error('Rate limit check error:', error);
+        return { allowed: true, remaining: 10 };
+    }
+    
+    const searchCount = data.length;
+    const remaining = Math.max(0, 10 - searchCount);
+    
+    return {
+        allowed: searchCount < 10,
+        remaining: remaining,
+        count: searchCount
+    };
+}
+
+// Log whale search
+async function logWhaleSearch(walletAddress, username, resultsCount) {
+    const { error } = await supabase
+        .from('whale_searches')
+        .insert({
+            wallet_address: walletAddress,
+            username_searched: username,
+            results_count: resultsCount,
+            searched_at: new Date().toISOString()
+        });
+    
+    if (error) {
+        console.error('Error logging search:', error);
     }
 }
 
@@ -714,563 +424,30 @@ app.get('/api/projects', async (req, res) => {
         const { data, error } = await supabase
             .from('projects')
             .select('*')
-            .order('foundAt', { ascending: false })
-            .limit(50);
-            
+            .order('found_at', { ascending: false })
+            .limit(200); // Get more to ensure we have 100 unique after dedup
+        
         if (error) throw error;
         
-        res.json({
-            success: true,
-            count: data.length,
-            projects: data
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Trigger manual scan
-app.get('/api/scan', async (req, res) => {
-    const tier = req.query.tier || 'tier2';
-    
-    const result = await scanTwitter(tier);
-    
-    if (result.success && result.projects.length > 0) {
-        await saveProjects(result.projects);
-    }
-    
-    res.json(result);
-});
-
-// ==========================================
-// WHALE TRACKER ENDPOINTS
-// ==========================================
-
-// Search whale follows (rate limited: 10 searches per wallet per day)
-app.post('/api/whale/search', async (req, res) => {
-    try {
-        const { walletAddress, username, limit = 50 } = req.body;
+        // Deduplicate by project_handle (keep most recent)
+        const uniqueProjects = [];
+        const seenHandles = new Set();
         
-        if (!walletAddress || !username) {
-            return res.status(400).json({
-                success: false,
-                error: 'walletAddress and username required'
-            });
-        }
-        
-        // Check rate limit (10 searches per day per wallet)
-        const today = new Date().toISOString().split('T')[0];
-        
-        const { data: existingSearches } = await supabase
-            .from('whale_searches')
-            .select('search_count')
-            .eq('wallet_address', walletAddress)
-            .eq('search_date', today)
-            .single();
-            
-        const currentCount = existingSearches?.search_count || 0;
-        
-        if (currentCount >= 10) {
-            return res.json({
-                success: false,
-                error: 'Daily search limit reached (10/day)',
-                searchesRemaining: 0
-            });
-        }
-        
-        // Perform the search
-        console.log(`🐋 Searching follows for @${username}...`);
-        
-        // Get user ID first
-        const userResponse = await fetch(
-            `${TWITTER_BASE_URL}/users/by/username/${username}`,
-            {
-                headers: { 'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}` }
-            }
-        );
-        
-        if (!userResponse.ok) {
-            return res.json({
-                success: false,
-                error: `User @${username} not found`
-            });
-        }
-        
-        const userData = await userResponse.json();
-        const userId = userData.data?.id;
-        
-        if (!userId) {
-            return res.json({
-                success: false,
-                error: `Could not find user ID for @${username}`
-            });
-        }
-        
-        // Get their following list
-        const followingResponse = await fetch(
-            `${TWITTER_BASE_URL}/users/${userId}/following?max_results=${Math.min(limit, 100)}&user.fields=created_at,description,public_metrics,verified`,
-            {
-                headers: { 'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}` }
-            }
-        );
-        
-        if (!followingResponse.ok) {
-            const errorText = await followingResponse.text();
-            return res.json({
-                success: false,
-                error: `Failed to fetch following: ${followingResponse.status}`
-            });
-        }
-        
-        const followingData = await followingResponse.json();
-        const accounts = followingData.data || [];
-        
-        // Filter for crypto projects
-        const cryptoKeywords = ['defi', 'crypto', 'web3', 'blockchain', 'nft', 'token', '$', 'dao', 'protocol', 'swap', 'dex', 'yield', 'stake', 'mint'];
-        
-        const cryptoProjects = accounts.filter(account => {
-            const bio = (account.description || '').toLowerCase();
-            return cryptoKeywords.some(kw => bio.includes(kw));
-        }).map(account => ({
-            username: account.username,
-            name: account.name,
-            description: account.description,
-            followers: account.public_metrics?.followers_count || 0,
-            verified: account.verified || false,
-            score: calculateScore(account),
-            profileUrl: `https://twitter.com/${account.username}`
-        }));
-        
-        // Update search count
-        await supabase
-            .from('whale_searches')
-            .upsert({
-                wallet_address: walletAddress,
-                search_date: today,
-                search_count: currentCount + 1
-            }, {
-                onConflict: 'wallet_address,search_date'
-            });
-        
-        res.json({
-            success: true,
-            username: username,
-            totalChecked: accounts.length,
-            accounts: cryptoProjects,
-            searchesRemaining: 9 - currentCount
-        });
-        
-    } catch (error) {
-        console.error('Whale search error:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Live whale tracking - Add whale to track
-app.post('/api/whale/live/track', async (req, res) => {
-    try {
-        const { userWallet, whaleUsername } = req.body;
-        
-        if (!userWallet || !whaleUsername) {
-            return res.status(400).json({
-                success: false,
-                error: 'userWallet and whaleUsername required'
-            });
-        }
-        
-        // Check limit (2 whales per user on free tier)
-        const { data: existing } = await supabase
-            .from('whale_live_tracking')
-            .select('id')
-            .eq('user_wallet', userWallet);
-            
-        if (existing && existing.length >= 2) {
-            return res.json({
-                success: false,
-                error: 'Free tier limit: 2 tracked accounts max'
-            });
-        }
-        
-        // Verify whale exists on Twitter
-        const userResponse = await fetch(
-            `${TWITTER_BASE_URL}/users/by/username/${whaleUsername}`,
-            {
-                headers: { 'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}` }
-            }
-        );
-        
-        if (!userResponse.ok) {
-            return res.json({
-                success: false,
-                error: `User @${whaleUsername} not found on Twitter`
-            });
-        }
-        
-        const userData = await userResponse.json();
-        
-        // Get their current following list (for baseline)
-        const followingResponse = await fetch(
-            `${TWITTER_BASE_URL}/users/${userData.data.id}/following?max_results=100`,
-            {
-                headers: { 'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}` }
-            }
-        );
-        
-        let currentFollowing = [];
-        if (followingResponse.ok) {
-            const followingData = await followingResponse.json();
-            currentFollowing = (followingData.data || []).map(u => u.username);
-        }
-        
-        // Save to database
-        const { error } = await supabase
-            .from('whale_live_tracking')
-            .insert({
-                user_wallet: userWallet,
-                whale_username: whaleUsername.toLowerCase(),
-                whale_user_id: userData.data.id,
-                last_following: currentFollowing,
-                last_checked: new Date().toISOString()
-            });
-            
-        if (error) {
-            if (error.code === '23505') { // Unique violation
-                return res.json({
-                    success: false,
-                    error: `Already tracking @${whaleUsername}`
-                });
-            }
-            throw error;
-        }
-        
-        res.json({
-            success: true,
-            message: `Now tracking @${whaleUsername}`,
-            baselineFollowing: currentFollowing.length
-        });
-        
-    } catch (error) {
-        console.error('Track whale error:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Live whale tracking - Remove whale
-app.post('/api/whale/live/untrack', async (req, res) => {
-    try {
-        const { userWallet, whaleUsername } = req.body;
-        
-        const { error } = await supabase
-            .from('whale_live_tracking')
-            .delete()
-            .eq('user_wallet', userWallet)
-            .eq('whale_username', whaleUsername.toLowerCase());
-            
-        if (error) throw error;
-        
-        res.json({
-            success: true,
-            message: `Stopped tracking @${whaleUsername}`
-        });
-        
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Live whale tracking - Get tracking list
-app.post('/api/whale/live/list', async (req, res) => {
-    try {
-        const { userWallet } = req.body;
-        
-        const { data, error } = await supabase
-            .from('whale_live_tracking')
-            .select('*')
-            .eq('user_wallet', userWallet);
-            
-        if (error) throw error;
-        
-        res.json({
-            success: true,
-            data: data || [],
-            limit: 2,
-            current: data?.length || 0
-        });
-        
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Live whale tracking - Get notifications
-app.post('/api/whale/live/notifications', async (req, res) => {
-    try {
-        const { userWallet, limit = 50 } = req.body;
-        
-        // Get notifications for whales this user is tracking
-        const { data: tracking } = await supabase
-            .from('whale_live_tracking')
-            .select('whale_username')
-            .eq('user_wallet', userWallet);
-            
-        if (!tracking || tracking.length === 0) {
-            return res.json({
-                success: true,
-                data: [],
-                unreadCount: 0
-            });
-        }
-        
-        const whaleUsernames = tracking.map(t => t.whale_username);
-        
-        const { data: notifications, error } = await supabase
-            .from('whale_live_notifications')
-            .select(`
-                *,
-                whale_user_notifications!left(read)
-            `)
-            .in('whale_username', whaleUsernames)
-            .order('detected_at', { ascending: false })
-            .limit(limit);
-            
-        if (error) throw error;
-        
-        // Count unread
-        const unreadCount = (notifications || []).filter(n => 
-            !n.whale_user_notifications || 
-            n.whale_user_notifications.length === 0 ||
-            !n.whale_user_notifications[0].read
-        ).length;
-        
-        res.json({
-            success: true,
-            data: notifications || [],
-            unreadCount
-        });
-        
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Mark notification as read
-app.post('/api/whale/live/mark-read', async (req, res) => {
-    try {
-        const { userWallet, notificationId } = req.body;
-        
-        await supabase
-            .from('whale_user_notifications')
-            .upsert({
-                user_wallet: userWallet,
-                notification_id: notificationId,
-                read: true
-            });
-            
-        res.json({ success: true });
-        
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Mark all notifications as read
-app.post('/api/whale/live/mark-all-read', async (req, res) => {
-    try {
-        const { userWallet } = req.body;
-        
-        // Get all unread notifications for this user's tracked whales
-        const { data: tracking } = await supabase
-            .from('whale_live_tracking')
-            .select('whale_username')
-            .eq('user_wallet', userWallet);
-            
-        if (!tracking || tracking.length === 0) {
-            return res.json({ success: true });
-        }
-        
-        const whaleUsernames = tracking.map(t => t.whale_username);
-        
-        const { data: notifications } = await supabase
-            .from('whale_live_notifications')
-            .select('id')
-            .in('whale_username', whaleUsernames);
-            
-        if (notifications && notifications.length > 0) {
-            const records = notifications.map(n => ({
-                user_wallet: userWallet,
-                notification_id: n.id,
-                read: true
-            }));
-            
-            await supabase
-                .from('whale_user_notifications')
-                .upsert(records);
-        }
-        
-        res.json({ success: true });
-        
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Check live whales for new follows (called by cron)
-async function checkLiveWhales() {
-    console.log('\n🔄 Checking live whale follows...');
-    
-    try {
-        // Get all tracked whales
-        const { data: tracked } = await supabase
-            .from('whale_live_tracking')
-            .select('*');
-            
-        if (!tracked || tracked.length === 0) {
-            console.log('No whales being tracked');
-            return;
-        }
-        
-        console.log(`Checking ${tracked.length} tracked whales...`);
-        
-        for (const whale of tracked) {
-            try {
-                // Get current following
-                const followingResponse = await fetch(
-                    `${TWITTER_BASE_URL}/users/${whale.whale_user_id}/following?max_results=100&user.fields=description,public_metrics,verified`,
-                    {
-                        headers: { 'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}` }
-                    }
-                );
+        for (const project of data) {
+            if (!seenHandles.has(project.project_handle)) {
+                seenHandles.add(project.project_handle);
+                uniqueProjects.push(project);
                 
-                if (!followingResponse.ok) {
-                    console.error(`Failed to fetch following for @${whale.whale_username}`);
-                    continue;
-                }
-                
-                const followingData = await followingResponse.json();
-                const currentFollowing = followingData.data || [];
-                const currentUsernames = currentFollowing.map(u => u.username.toLowerCase());
-                
-                // Compare with last known following
-                const lastFollowing = (whale.last_following || []).map(u => u.toLowerCase());
-                const newFollows = currentFollowing.filter(u => 
-                    !lastFollowing.includes(u.username.toLowerCase())
-                );
-                
-                if (newFollows.length > 0) {
-                    console.log(`🆕 @${whale.whale_username} has ${newFollows.length} new follows!`);
-                    
-                    // Create notifications for new follows
-                    for (const follow of newFollows) {
-                        await supabase
-                            .from('whale_live_notifications')
-                            .insert({
-                                whale_username: whale.whale_username,
-                                followed_username: follow.username,
-                                followed_user_data: {
-                                    name: follow.name,
-                                    bio: follow.description,
-                                    followers: follow.public_metrics?.followers_count,
-                                    verified: follow.verified
-                                },
-                                detected_at: new Date().toISOString()
-                            });
-                    }
-                }
-                
-                // Update last following
-                await supabase
-                    .from('whale_live_tracking')
-                    .update({
-                        last_following: currentUsernames,
-                        last_checked: new Date().toISOString()
-                    })
-                    .eq('id', whale.id);
-                    
-            } catch (error) {
-                console.error(`Error checking @${whale.whale_username}:`, error.message);
+                if (uniqueProjects.length >= 100) break; // Stop at 100 unique
             }
-            
-            // Small delay between requests
-            await new Promise(r => setTimeout(r, 1000));
         }
         
-        console.log('✅ Live whale check complete');
+        console.log(`📤 Returning ${uniqueProjects.length} unique projects (from ${data.length} total tweets)`);
         
-    } catch (error) {
-        console.error('Live whale check error:', error);
-    }
-}
-
-// Scheduled jobs
-// Check live whales every 15 minutes
-cron.schedule('*/15 * * * *', () => {
-    checkLiveWhales();
-});
-
-// Run tier scans on schedule
-cron.schedule('*/5 * * * *', async () => {
-    const result = await scanTwitter('tier1');
-    if (result.success && result.projects.length > 0) {
-        await saveProjects(result.projects);
-    }
-});
-
-// Tier 2 & 3 are now disabled to reduce costs
-// cron.schedule('*/30 * * * *', async () => {
-//     const result = await scanTwitter('tier2');
-//     if (result.success && result.projects.length > 0) {
-//         await saveProjects(result.projects);
-//     }
-// });
-
-// Stats endpoint
-app.get('/api/stats', async (req, res) => {
-    try {
-        const { count: projectCount } = await supabase
-            .from('projects')
-            .select('*', { count: 'exact', head: true });
-            
-        const { count: trackedWhales } = await supabase
-            .from('whale_live_tracking')
-            .select('*', { count: 'exact', head: true });
-            
-        const { count: notifications } = await supabase
-            .from('whale_live_notifications')
-            .select('*', { count: 'exact', head: true });
-            
         res.json({
             success: true,
-            stats: {
-                totalProjects: projectCount || 0,
-                trackedWhales: trackedWhales || 0,
-                totalNotifications: notifications || 0,
-                wsGraduations: wsGraduations.length,
-                webhookActive: true // Using Helius webhook
-            }
+            count: uniqueProjects.length,
+            projects: uniqueProjects
         });
     } catch (error) {
         res.status(500).json({
@@ -1279,124 +456,6 @@ app.get('/api/stats', async (req, res) => {
         });
     }
 });
-
-// ==========================================
-// ADMIN ENDPOINTS
-// ==========================================
-
-// Pause X API
-app.post('/api/admin/pause', (req, res) => {
-    xApiPaused = true;
-    console.log('⏸️ X API paused');
-    res.json({ success: true, paused: true });
-});
-
-// Resume X API
-app.post('/api/admin/resume', (req, res) => {
-    xApiPaused = false;
-    console.log('▶️ X API resumed');
-    res.json({ success: true, paused: false });
-});
-
-// Get pause status
-app.get('/api/admin/status', (req, res) => {
-    res.json({ success: true, xApiPaused });
-});
-
-// Get project count
-app.get('/api/admin/projects/count', async (req, res) => {
-    try {
-        const { count, error } = await supabase
-            .from('projects')
-            .select('*', { count: 'exact', head: true });
-            
-        if (error) throw error;
-        
-        res.json({
-            success: true,
-            count: count || 0
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Clear all projects
-app.delete('/api/admin/projects/clear-all', async (req, res) => {
-    try {
-        const { error } = await supabase
-            .from('projects')
-            .delete()
-            .neq('id', '00000000-0000-0000-0000-000000000000'); // Delete all
-            
-        if (error) throw error;
-        
-        res.json({
-            success: true,
-            message: 'All projects cleared'
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Clear old projects (older than 7 days)
-app.delete('/api/admin/projects/clear-old', async (req, res) => {
-    try {
-        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-        
-        const { error } = await supabase
-            .from('projects')
-            .delete()
-            .lt('foundAt', sevenDaysAgo);
-            
-        if (error) throw error;
-        
-        res.json({
-            success: true,
-            message: 'Old projects cleared'
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Filter projects by score
-app.delete('/api/admin/projects/filter', async (req, res) => {
-    try {
-        const minScore = parseInt(req.query.minScore) || 30;
-        
-        const { error } = await supabase
-            .from('projects')
-            .delete()
-            .lt('score', minScore);
-            
-        if (error) throw error;
-        
-        res.json({
-            success: true,
-            message: `Projects with score < ${minScore} removed`
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// ==========================================
-// MORALIS LIVE LAUNCHES (ORIGINAL - FALLBACK)
-// ==========================================
 
 // Live Launches - Get graduated Pump.fun tokens (using Moralis API)
 // Track last check time to only show NEW graduations going forward
@@ -1574,14 +633,12 @@ app.get('/api/live-launches', async (req, res) => {
                 },
                 graduated: true,
                 marketCap: token.market_cap || token.marketCap || 0,
-                graduatedAt: graduatedAt, // Include timestamp
-                source: 'moralis' // Mark source
+                graduatedAt: graduatedAt // Include timestamp
             };
         });
         
         res.json({
             success: true,
-            source: 'moralis',
             timestamp: new Date().toISOString(),
             totalScanned: tokens.length,
             launches: formatted,
@@ -1623,76 +680,210 @@ app.post('/api/token-prices', async (req, res) => {
         if (contracts.length > 20) {
             return res.status(400).json({
                 success: false,
-                error: 'Maximum 20 contracts per request'
+                error: 'Maximum 20 contracts per request',
+                received: contracts.length
             });
         }
         
         console.log(`💰 Fetching prices for ${contracts.length} tokens...`);
+        const startTime = Date.now();
         
-        // Fetch prices from DexScreener (free, fast, no auth needed)
-        const prices = {};
-        
-        // DexScreener supports up to 30 tokens per request
-        const dexScreenerUrl = `https://api.dexscreener.com/latest/dex/tokens/${contracts.join(',')}`;
-        
-        try {
-            const response = await fetch(dexScreenerUrl);
-            
-            if (response.ok) {
+        // Fetch all prices in PARALLEL for speed
+        const pricePromises = contracts.map(async (contract) => {
+            try {
+                // DexScreener API - free, reliable, real-time
+                const url = `https://api.dexscreener.com/latest/dex/tokens/${contract}`;
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 3000); // 3s timeout
+                
+                const response = await fetch(url, {
+                    signal: controller.signal
+                });
+                clearTimeout(timeout);
+                
+                if (!response.ok) {
+                    console.error(`DexScreener error for ${contract.slice(0, 8)}: ${response.status}`);
+                    return {
+                        contract: contract,
+                        success: false,
+                        error: `API returned ${response.status}`
+                    };
+                }
+                
                 const data = await response.json();
                 
-                // Map prices by contract address
-                if (data.pairs) {
-                    for (const pair of data.pairs) {
-                        const contract = pair.baseToken?.address;
-                        if (contract && contracts.includes(contract)) {
-                            // Use first pair found for each token (usually highest liquidity)
-                            if (!prices[contract]) {
-                                prices[contract] = {
-                                    priceUsd: parseFloat(pair.priceUsd) || 0,
-                                    priceNative: parseFloat(pair.priceNative) || 0,
-                                    liquidity: pair.liquidity?.usd || 0,
-                                    volume24h: pair.volume?.h24 || 0,
-                                    priceChange: {
-                                        m5: pair.priceChange?.m5 || 0,
-                                        h1: pair.priceChange?.h1 || 0,
-                                        h24: pair.priceChange?.h24 || 0
-                                    },
-                                    dex: pair.dexId,
-                                    pairAddress: pair.pairAddress
-                                };
-                            }
-                        }
-                    }
+                // Check if token has trading pairs
+                if (!data.pairs || data.pairs.length === 0) {
+                    return {
+                        contract: contract,
+                        success: false,
+                        error: 'No trading pairs found'
+                    };
                 }
-            }
-        } catch (error) {
-            console.error('DexScreener fetch error:', error.message);
-        }
-        
-        // For any missing tokens, return 0 price
-        for (const contract of contracts) {
-            if (!prices[contract]) {
-                prices[contract] = {
-                    priceUsd: 0,
-                    priceNative: 0,
-                    liquidity: 0,
-                    volume24h: 0,
-                    priceChange: { m5: 0, h1: 0, h24: 0 },
-                    dex: null,
-                    pairAddress: null
+                
+                // Get most liquid pair (usually first)
+                const pair = data.pairs[0];
+                
+                return {
+                    contract: contract,
+                    success: true,
+                    price: pair.priceUsd || '0',
+                    priceNative: pair.priceNative || '0',
+                    priceChange: {
+                        m5: parseFloat(pair.priceChange?.m5 || 0),
+                        h1: parseFloat(pair.priceChange?.h1 || 0),
+                        h6: parseFloat(pair.priceChange?.h6 || 0),
+                        h24: parseFloat(pair.priceChange?.h24 || 0)
+                    },
+                    volume: {
+                        m5: parseFloat(pair.volume?.m5 || 0),
+                        h1: parseFloat(pair.volume?.h1 || 0),
+                        h6: parseFloat(pair.volume?.h6 || 0),
+                        h24: parseFloat(pair.volume?.h24 || 0)
+                    },
+                    liquidity: {
+                        usd: parseFloat(pair.liquidity?.usd || 0),
+                        base: parseFloat(pair.liquidity?.base || 0),
+                        quote: parseFloat(pair.liquidity?.quote || 0)
+                    },
+                    pairAddress: pair.pairAddress,
+                    dexId: pair.dexId,
+                    url: pair.url
+                };
+                
+            } catch (error) {
+                console.error(`Error fetching ${contract.slice(0, 8)}:`, error.message);
+                return {
+                    contract: contract,
+                    success: false,
+                    error: error.message
                 };
             }
-        }
+        });
+        
+        // Wait for ALL requests to complete
+        const prices = await Promise.all(pricePromises);
+        
+        const elapsed = Date.now() - startTime;
+        const successCount = prices.filter(p => p.success).length;
+        const failedCount = prices.length - successCount;
+        
+        console.log(`✅ Fetched ${successCount}/${contracts.length} prices in ${elapsed}ms (${failedCount} failed)`);
         
         res.json({
             success: true,
-            timestamp: Date.now(),
-            prices: prices
+            prices: prices,
+            count: prices.length,
+            successCount: successCount,
+            failedCount: failedCount,
+            elapsed: elapsed,
+            timestamp: new Date().toISOString()
         });
         
     } catch (error) {
-        console.error('❌ Token prices error:', error);
+        console.error('❌ Bulk price fetch error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch token prices',
+            message: error.message
+        });
+    }
+});
+
+// Single token price endpoint - for quick individual checks
+app.get('/api/token-price/:contract', async (req, res) => {
+    try {
+        const { contract } = req.params;
+        
+        if (!contract) {
+            return res.status(400).json({
+                success: false,
+                error: 'Contract address required'
+            });
+        }
+        
+        console.log(`💰 Fetching price for: ${contract.slice(0, 8)}...`);
+        
+        // DexScreener API
+        const url = `https://api.dexscreener.com/latest/dex/tokens/${contract}`;
+        const response = await fetch(url);
+        
+        if (!response.ok) {
+            return res.status(response.status).json({
+                success: false,
+                error: `DexScreener API returned ${response.status}`
+            });
+        }
+        
+        const data = await response.json();
+        
+        if (!data.pairs || data.pairs.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'No trading pairs found for this token'
+            });
+        }
+        
+        const pair = data.pairs[0];
+        
+        res.json({
+            success: true,
+            contract: contract,
+            symbol: pair.baseToken?.symbol || 'UNKNOWN',
+            name: pair.baseToken?.name || 'Unknown Token',
+            price: pair.priceUsd || '0',
+            priceNative: pair.priceNative || '0',
+            priceChange: {
+                m5: parseFloat(pair.priceChange?.m5 || 0),
+                h1: parseFloat(pair.priceChange?.h1 || 0),
+                h6: parseFloat(pair.priceChange?.h6 || 0),
+                h24: parseFloat(pair.priceChange?.h24 || 0)
+            },
+            volume: {
+                m5: parseFloat(pair.volume?.m5 || 0),
+                h1: parseFloat(pair.volume?.h1 || 0),
+                h6: parseFloat(pair.volume?.h6 || 0),
+                h24: parseFloat(pair.volume?.h24 || 0)
+            },
+            liquidity: {
+                usd: parseFloat(pair.liquidity?.usd || 0)
+            },
+            txns: {
+                m5: pair.txns?.m5 || { buys: 0, sells: 0 },
+                h1: pair.txns?.h1 || { buys: 0, sells: 0 },
+                h6: pair.txns?.h6 || { buys: 0, sells: 0 },
+                h24: pair.txns?.h24 || { buys: 0, sells: 0 }
+            },
+            pairAddress: pair.pairAddress,
+            dexId: pair.dexId,
+            url: pair.url,
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('❌ Token price error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch token price',
+            message: error.message
+        });
+    }
+});
+
+// Trigger manual scan (rate limited)
+app.get('/api/scan', async (req, res) => {
+    try {
+        // Run Tier 1 and 2 only (Tier 3 disabled due to high cost/low quality)
+        const results = [];
+        results.push(...await scanProjects('tier1'));
+        results.push(...await scanProjects('tier2'));
+        
+        res.json({
+            success: true,
+            message: `Scanned Tier 1 & 2, found ${results.length} new projects`,
+            projects: results
+        });
+    } catch (error) {
         res.status(500).json({
             success: false,
             error: error.message
@@ -1700,19 +891,693 @@ app.post('/api/token-prices', async (req, res) => {
     }
 });
 
+// Whale tracker search
+app.post('/api/whale/search', async (req, res) => {
+    try {
+        const { walletAddress, username, limit = 10 } = req.body;
+        
+        if (!walletAddress || !username) {
+            return res.status(400).json({
+                success: false,
+                error: 'Missing walletAddress or username'
+            });
+        }
+        
+        // Check rate limit
+        const rateLimit = await checkRateLimit(walletAddress);
+        
+        if (!rateLimit.allowed) {
+            return res.status(429).json({
+                success: false,
+                error: `Daily limit reached (${rateLimit.count}/10). Resets in ${Math.ceil((24 * 60 * 60 * 1000 - (Date.now() % (24 * 60 * 60 * 1000))) / (60 * 60 * 1000))} hours.`,
+                searchesRemaining: 0
+            });
+        }
+        
+        // Fetch following
+        const following = await fetchUserFollowing(username, limit);
+        
+        // Log search
+        await logWhaleSearch(walletAddress, username, following.length);
+        
+        res.json({
+            success: true,
+            searchesRemaining: rateLimit.remaining - 1,
+            username: username,
+            totalChecked: following.length,
+            accounts: following.map(user => ({
+                username: user.username,
+                name: user.name,
+                bio: user.description,
+                created: user.created_at,
+                followers: user.public_metrics?.followers_count || 0,
+                verified: user.verified || false,
+                url: user.url || null
+            }))
+        });
+        
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Get stats
+app.get('/api/stats', async (req, res) => {
+    try {
+        const { data: projects } = await supabase
+            .from('projects')
+            .select('*', { count: 'exact' });
+        
+        const { data: searches } = await supabase
+            .from('whale_searches')
+            .select('*', { count: 'exact' })
+            .gte('searched_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+        
+        res.json({
+            success: true,
+            stats: {
+                totalProjects: projects?.length || 0,
+                whaleSearchesToday: searches?.length || 0,
+                lastUpdate: new Date().toISOString()
+            }
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Health check
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // ==========================================
-// JUPITER PROXY (for extension trades)
+// CRON JOBS
 // ==========================================
 
-// Jupiter Quote Proxy
+let scanningEnabled = true; // Control flag
+
+// Pause auto-scanning
+app.post('/api/admin/pause', (req, res) => {
+    scanningEnabled = false;
+    console.log('⏸️ Auto-scanning paused');
+    res.json({ success: true, message: 'Auto-scanning paused' });
+});
+
+// Resume auto-scanning
+app.post('/api/admin/resume', (req, res) => {
+    scanningEnabled = true;
+    console.log('▶️ Auto-scanning resumed');
+    res.json({ success: true, message: 'Auto-scanning resumed' });
+});
+
+// Get scanning status
+app.get('/api/admin/status', (req, res) => {
+    res.json({
+        success: true,
+        scanningEnabled: scanningEnabled
+    });
+});
+
+// ==========================================
+// LIVE X TRACKER FUNCTIONS
+// ==========================================
+
+// Helper: Check if account is crypto-related (basic filter)
+function isCryptoRelated(user) {
+    const cryptoKeywords = [
+        'crypto', 'blockchain', 'defi', 'web3', 'nft', 'dao', 'token',
+        'bitcoin', 'ethereum', 'solana', 'protocol', 'dapp', 'smart contract',
+        'validator', 'staking', 'yield', 'airdrop', 'presale', 'ico', 'tge'
+    ];
+    
+    const bio = (user.description || '').toLowerCase();
+    const name = (user.name || '').toLowerCase();
+    
+    return cryptoKeywords.some(keyword => bio.includes(keyword) || name.includes(keyword));
+}
+
+// Check all tracked whales for new follows
+async function checkLiveWhales() {
+    console.log('🔴 Checking live tracked whales...');
+    
+    try {
+        // Get all unique whales being tracked
+        const { data: trackedWhales, error } = await supabase
+            .from('whale_live_tracking')
+            .select('whale_username')
+            .eq('active', true);
+        
+        if (error) throw error;
+        
+        // Get unique whale usernames
+        const uniqueWhales = [...new Set(trackedWhales.map(w => w.whale_username))];
+        console.log(`📊 Tracking ${uniqueWhales.length} unique whales`);
+        
+        for (const whaleUsername of uniqueWhales) {
+            try {
+                console.log(`🔍 Checking @${whaleUsername}...`);
+                
+                // Fetch current following list
+                const currentFollowing = await fetchUserFollowing(whaleUsername, 50);
+                const currentUsernames = currentFollowing.map(u => u.username);
+                
+                // Get previous snapshot
+                const { data: snapshot } = await supabase
+                    .from('whale_follows_snapshot')
+                    .select('following_usernames')
+                    .eq('whale_username', whaleUsername)
+                    .single();
+                
+                if (snapshot && snapshot.following_usernames) {
+                    // Compare to find new follows
+                    const previousUsernames = snapshot.following_usernames;
+                    const newFollows = currentFollowing.filter(
+                        user => !previousUsernames.includes(user.username)
+                    );
+                    
+                    console.log(`   Found ${newFollows.length} new follows`);
+                    
+                    // Store ALL new follows (crypto filter removed)
+                    console.log(`   Storing all ${newFollows.length} new follows`);
+                    
+                    // Store new follows as notifications
+                    for (const follow of newFollows) {
+                        const { error: notifError } = await supabase
+                            .from('whale_live_notifications')
+                            .insert({
+                                whale_username: whaleUsername,
+                                followed_username: follow.username,
+                                followed_user_data: {
+                                    name: follow.name,
+                                    bio: follow.description,
+                                    followers: follow.public_metrics?.followers_count || 0,
+                                    verified: follow.verified || false,
+                                    url: follow.url,
+                                    profile_image: follow.profile_image_url,
+                                    created_at: follow.created_at
+                                }
+                            })
+                            .select()
+                            .single();
+                        
+                        if (!notifError) {
+                            console.log(`   ✅ New notification: @${whaleUsername} → @${follow.username}`);
+                        }
+                    }
+                }
+                
+                // Update snapshot
+                await supabase
+                    .from('whale_follows_snapshot')
+                    .upsert({
+                        whale_username: whaleUsername,
+                        following_usernames: currentUsernames,
+                        updated_at: new Date().toISOString()
+                    }, { onConflict: 'whale_username' });
+                
+                // Update last_checked timestamp
+                await supabase
+                    .from('whale_live_tracking')
+                    .update({ last_checked: new Date().toISOString() })
+                    .eq('whale_username', whaleUsername)
+                    .eq('active', true);
+                
+            } catch (whaleError) {
+                console.error(`Error checking ${whaleUsername}:`, whaleError);
+            }
+        }
+        
+        console.log('✅ Live whale check complete');
+    } catch (error) {
+        console.error('Live whale check error:', error);
+    }
+}
+
+// ==========================================
+// LIVE X TRACKER API ENDPOINTS
+// ==========================================
+
+// Add whale to tracking list
+app.post('/api/whale/live/track', async (req, res) => {
+    try {
+        const { userWallet, whaleUsername } = req.body;
+        
+        if (!userWallet || !whaleUsername) {
+            return res.json({ 
+                success: false, 
+                error: 'Missing userWallet or whaleUsername' 
+            });
+        }
+        
+        // Check current tracking count
+        const { data: currentTracking, error: countError } = await supabase
+            .from('whale_live_tracking')
+            .select('id')
+            .eq('user_wallet', userWallet)
+            .eq('active', true);
+        
+        if (countError) throw countError;
+        
+        // Free tier limit: 2 accounts
+        const FREE_LIMIT = 2;
+        if (currentTracking.length >= FREE_LIMIT) {
+            return res.json({
+                success: false,
+                error: `Free tier limit reached. You can track up to ${FREE_LIMIT} accounts.`,
+                limit: FREE_LIMIT,
+                current: currentTracking.length
+            });
+        }
+        
+        // Add to tracking
+        const { data, error } = await supabase
+            .from('whale_live_tracking')
+            .insert({
+                user_wallet: userWallet,
+                whale_username: whaleUsername.replace('@', ''),
+                check_frequency: 15,
+                active: true
+            })
+            .select()
+            .single();
+        
+        if (error) {
+            // Check if already tracking
+            if (error.code === '23505') {
+                return res.json({
+                    success: false,
+                    error: 'Already tracking this account'
+                });
+            }
+            throw error;
+        }
+        
+        console.log(`✅ User ${userWallet} now tracking @${whaleUsername}`);
+        
+        res.json({
+            success: true,
+            data: data,
+            message: `Now tracking @${whaleUsername}`
+        });
+    } catch (error) {
+        console.error('Track whale error:', error);
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// Remove whale from tracking list
+app.post('/api/whale/live/untrack', async (req, res) => {
+    try {
+        const { userWallet, whaleUsername } = req.body;
+        
+        if (!userWallet || !whaleUsername) {
+            return res.json({ 
+                success: false, 
+                error: 'Missing userWallet or whaleUsername' 
+            });
+        }
+        
+        const { error } = await supabase
+            .from('whale_live_tracking')
+            .delete()
+            .eq('user_wallet', userWallet)
+            .eq('whale_username', whaleUsername.replace('@', ''));
+        
+        if (error) throw error;
+        
+        console.log(`🗑️ User ${userWallet} stopped tracking @${whaleUsername}`);
+        
+        res.json({
+            success: true,
+            message: `Stopped tracking @${whaleUsername}`
+        });
+    } catch (error) {
+        console.error('Untrack whale error:', error);
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// Get user's tracking list
+app.post('/api/whale/live/list', async (req, res) => {
+    try {
+        const { userWallet } = req.body;
+        
+        if (!userWallet) {
+            return res.json({ success: false, error: 'Missing userWallet' });
+        }
+        
+        const { data, error } = await supabase
+            .from('whale_live_tracking')
+            .select('*')
+            .eq('user_wallet', userWallet)
+            .eq('active', true)
+            .order('created_at', { ascending: false });
+        
+        if (error) throw error;
+        
+        res.json({
+            success: true,
+            data: data,
+            limit: 2, // Free tier limit
+            current: data.length
+        });
+    } catch (error) {
+        console.error('List tracking error:', error);
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// Get notifications for user
+app.post('/api/whale/live/notifications', async (req, res) => {
+    try {
+        const { userWallet, limit = 50 } = req.body;
+        
+        if (!userWallet) {
+            return res.json({ success: false, error: 'Missing userWallet' });
+        }
+        
+        // Get user's tracked whales
+        const { data: tracked, error: trackedError } = await supabase
+            .from('whale_live_tracking')
+            .select('whale_username')
+            .eq('user_wallet', userWallet)
+            .eq('active', true);
+        
+        if (trackedError) throw trackedError;
+        
+        const whaleUsernames = tracked.map(t => t.whale_username);
+        
+        if (whaleUsernames.length === 0) {
+            return res.json({ success: true, data: [], unreadCount: 0 });
+        }
+        
+        // Get notifications for those whales
+        const { data: notifications, error: notifError } = await supabase
+            .from('whale_live_notifications')
+            .select(`
+                *,
+                whale_user_notifications!left(read, dismissed, read_at)
+            `)
+            .in('whale_username', whaleUsernames)
+            .order('detected_at', { ascending: false })
+            .limit(limit);
+        
+        if (notifError) throw notifError;
+        
+        // Count unread
+        const unreadCount = notifications.filter(n => {
+            const userNotif = n.whale_user_notifications.find(un => un.read === false);
+            return !n.whale_user_notifications.length || userNotif;
+        }).length;
+        
+        res.json({
+            success: true,
+            data: notifications,
+            unreadCount: unreadCount
+        });
+    } catch (error) {
+        console.error('Get notifications error:', error);
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// Mark notification as read
+app.post('/api/whale/live/mark-read', async (req, res) => {
+    try {
+        const { userWallet, notificationId } = req.body;
+        
+        if (!userWallet || !notificationId) {
+            return res.json({ 
+                success: false, 
+                error: 'Missing userWallet or notificationId' 
+            });
+        }
+        
+        const { error } = await supabase
+            .from('whale_user_notifications')
+            .upsert({
+                user_wallet: userWallet,
+                notification_id: notificationId,
+                read: true,
+                read_at: new Date().toISOString()
+            }, { onConflict: 'user_wallet,notification_id' });
+        
+        if (error) throw error;
+        
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Mark read error:', error);
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// Mark all notifications as read
+app.post('/api/whale/live/mark-all-read', async (req, res) => {
+    try {
+        const { userWallet } = req.body;
+        
+        if (!userWallet) {
+            return res.json({ success: false, error: 'Missing userWallet' });
+        }
+        
+        // Get all notification IDs for user's tracked whales
+        const { data: tracked } = await supabase
+            .from('whale_live_tracking')
+            .select('whale_username')
+            .eq('user_wallet', userWallet)
+            .eq('active', true);
+        
+        const whaleUsernames = tracked.map(t => t.whale_username);
+        
+        const { data: notifications } = await supabase
+            .from('whale_live_notifications')
+            .select('id')
+            .in('whale_username', whaleUsernames);
+        
+        // Mark all as read
+        for (const notif of notifications) {
+            await supabase
+                .from('whale_user_notifications')
+                .upsert({
+                    user_wallet: userWallet,
+                    notification_id: notif.id,
+                    read: true,
+                    read_at: new Date().toISOString()
+                }, { onConflict: 'user_wallet,notification_id' });
+        }
+        
+        res.json({ success: true, marked: notifications.length });
+    } catch (error) {
+        console.error('Mark all read error:', error);
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// ============================================
+// ADMIN ENDPOINTS - Database Management
+// ============================================
+
+const ADMIN_KEY = process.env.ADMIN_KEY || 'fallback-admin-key-change-me';
+
+// Middleware to verify admin key
+function verifyAdmin(req, res, next) {
+    const adminKey = req.headers['x-admin-key'] || req.query.key;
+    if (adminKey !== ADMIN_KEY) {
+        return res.status(403).json({ 
+            success: false, 
+            error: 'Unauthorized - Invalid admin key' 
+        });
+    }
+    next();
+}
+
+// Get project count
+app.get('/api/admin/projects/count', verifyAdmin, async (req, res) => {
+    try {
+        const { count, error } = await supabase
+            .from('projects')
+            .select('*', { count: 'exact', head: true });
+        
+        if (error) throw error;
+        
+        res.json({ 
+            success: true, 
+            count: count,
+            message: `Currently ${count} projects in database`
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// Delete all projects
+app.delete('/api/admin/projects/clear-all', verifyAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('projects')
+            .delete()
+            .not('tweet_id', 'is', null);
+        
+        if (error) throw error;
+        
+        const deletedCount = data?.length || 0;
+        console.log(`🗑️ ADMIN: Deleted ${deletedCount} projects`);
+        res.json({ 
+            success: true, 
+            deleted: deletedCount,
+            message: `Successfully deleted ${deletedCount} projects`,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error('Error deleting projects:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// Delete old projects (older than X days)
+app.delete('/api/admin/projects/clear-old', verifyAdmin, async (req, res) => {
+    try {
+        const days = parseInt(req.query.days) || 7;
+        const cutoffDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+        
+        const { data, error } = await supabase
+            .from('projects')
+            .delete()
+            .lt('found_at', cutoffDate);
+        
+        if (error) throw error;
+        
+        const deletedCount = data?.length || 0;
+        console.log(`🗑️ ADMIN: Deleted ${deletedCount} projects older than ${days} days`);
+        res.json({ 
+            success: true, 
+            deleted: deletedCount,
+            message: `Deleted ${deletedCount} projects older than ${days} days`
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// Delete by filters (e.g., low followers)
+app.delete('/api/admin/projects/filter', verifyAdmin, async (req, res) => {
+    try {
+        const minFollowers = parseInt(req.query.minFollowers) || 100;
+        
+        const { data, error } = await supabase
+            .from('projects')
+            .delete()
+            .lt('followers', minFollowers);
+        
+        if (error) throw error;
+        
+        const deletedCount = data?.length || 0;
+        console.log(`🗑️ ADMIN: Deleted ${deletedCount} low-quality projects`);
+        res.json({ 
+            success: true, 
+            deleted: deletedCount,
+            message: `Deleted ${deletedCount} projects with < ${minFollowers} followers`
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// ==========================================
+// CRON JOBS
+// ==========================================
+
+// CRON JOBS - Tiered Scanning
+// ==========================================
+
+// Reset cross-tier deduplication every hour to prevent memory bloat
+cron.schedule('0 * * * *', () => {
+    if (global.currentScanProjects) {
+        const size = global.currentScanProjects.size;
+        global.currentScanProjects.clear();
+        console.log(`🔄 Reset cross-tier deduplication (was tracking ${size} projects)`);
+    }
+});
+
+// TIER 1: Every 5 minutes (high-signal)
+cron.schedule('*/5 * * * *', async () => {
+    if (!scanningEnabled) return;
+    
+    console.log('⏰ TIER 1 scan triggered (every 5 min)');
+    try {
+        await scanProjects('tier1');
+    } catch (error) {
+        console.error('Tier 1 scan error:', error);
+    }
+});
+
+// TIER 2: Every 30 minutes (builder signals) - reduced from 15 min for cost savings
+cron.schedule('*/30 * * * *', async () => {
+    if (!scanningEnabled) return;
+    
+    console.log('⏰ TIER 2 scan triggered (every 30 min)');
+    try {
+        await scanProjects('tier2');
+    } catch (error) {
+        console.error('Tier 2 scan error:', error);
+    }
+});
+
+// TIER 3: DISABLED (too expensive, low quality results)
+// Was costing ~$19/day for mostly spam/bots
+// cron.schedule('*/30 * * * *', async () => {
+//     if (!scanningEnabled) return;
+//     console.log('⏰ TIER 3 scan triggered (every 30 min)');
+//     try {
+//         await scanProjects('tier3');
+//     } catch (error) {
+//         console.error('Tier 3 scan error:', error);
+//     }
+// });
+
+// Live X Tracker - Check every 15 minutes
+cron.schedule('*/15 * * * *', async () => {
+    console.log('⏰ Live X Tracker check triggered');
+    try {
+        await checkLiveWhales();
+    } catch (error) {
+        console.error('Live X Tracker error:', error);
+    }
+});
+
+// ==========================================
+// JUPITER API PROXY (for Chrome Extension)
+// ==========================================
+
+// GET /jupiter/quote - Proxy Jupiter quote requests
 app.get('/jupiter/quote', async (req, res) => {
     try {
-        const queryString = new URLSearchParams(req.query).toString();
-        const jupiterUrl = `https://quote-api.jup.ag/v6/quote?${queryString}`;
+        const url = 'https://quote-api.jup.ag/v6/quote?' + 
+            new URLSearchParams(req.query);
         
-        console.log('🔄 Proxying Jupiter quote request...');
+        console.log('📊 Jupiter quote request:', url);
         
-        const response = await fetch(jupiterUrl, {
+        const response = await fetch(url, {
+            method: 'GET',
             headers: { 'Accept': 'application/json' }
         });
         
@@ -1739,14 +1604,17 @@ app.get('/jupiter/quote', async (req, res) => {
     }
 });
 
-// Jupiter Swap Proxy
+// POST /jupiter/swap - Proxy Jupiter swap requests
 app.post('/jupiter/swap', async (req, res) => {
     try {
-        console.log('🔄 Proxying Jupiter swap request...');
+        console.log('🔄 Jupiter swap request');
         
         const response = await fetch('https://quote-api.jup.ag/v6/swap', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
             body: JSON.stringify(req.body)
         });
         
@@ -1797,10 +1665,4 @@ app.listen(PORT, () => {
     console.log(`   DELETE /api/admin/projects/filter`);
     console.log(`   GET  /jupiter/quote (Jupiter proxy)`);
     console.log(`   POST /jupiter/swap (Jupiter proxy)`);
-    console.log(`\n⚡ GRADUATION DETECTION (Helius Webhook):`);
-    console.log(`   POST /webhooks/helius (Helius posts here)`);
-    console.log(`   GET  /api/live-launches/fast (polling endpoint)`);
-    console.log(`   GET  /api/live-launches/status (connection status)`);
-    console.log(`\n✅ Webhook ready - configure Helius webhook to POST to:`);
-    console.log(`   https://trakr-backend-0v6u.onrender.com/webhooks/helius`);
 });
