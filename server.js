@@ -609,9 +609,14 @@ app.get('/api/live-launches', async (req, res) => {
         console.log(`📊 Enriching ${newGraduations.length} NEW tokens with Helius metadata...`);
         const enrichStart = Date.now();
         
-        const HELIUS_KEY = process.env.HELIUS_API_KEY || 'b6a9d5a0-1c30-4684-939f-e3cb0f53fc1f';
+        const HELIUS_KEY = process.env.HELIUS_API_KEY;
         
-        const enrichedGraduations = await Promise.all(
+        let enrichedGraduations = newGraduations;
+        
+        if (!HELIUS_KEY) {
+            console.warn('⚠️ HELIUS_API_KEY not set - skipping metadata enrichment (tags will not work)');
+        } else {
+            enrichedGraduations = await Promise.all(
             newGraduations.map(async (token) => {
                 const address = token.address || token.mint || token.token_address || token.tokenAddress;
                 
@@ -666,6 +671,7 @@ app.get('/api/live-launches', async (req, res) => {
                 return token;
             })
         );
+        }
         
         console.log(`✅ Enrichment complete in ${Date.now() - enrichStart}ms`);
         
@@ -1639,13 +1645,17 @@ cron.schedule('*/15 * * * *', async () => {
 // GET /jupiter/quote - Proxy Jupiter quote requests
 app.get('/jupiter/quote', async (req, res) => {
     try {
-        // Jupiter API v6 with API key from environment variable
-        const jupiterBaseUrl = 'https://api.jup.ag/quote/v6/quote';
+        // Jupiter API v6 - correct path: /v6/quote (version BEFORE endpoint)
+        const jupiterBaseUrl = 'https://api.jup.ag/v6/quote';
         const url = jupiterBaseUrl + '?' + new URLSearchParams(req.query);
         
         console.log('📊 Jupiter quote request:', url);
         
-        const JUPITER_API_KEY = process.env.JUPITER_API_KEY || '7294308a-bf02-4d78-99f7-9c6d0a061a9d';
+        // Fail loudly if API key not set (don't use hardcoded fallback in production)
+        const JUPITER_API_KEY = process.env.JUPITER_API_KEY;
+        if (!JUPITER_API_KEY) {
+            throw new Error('JUPITER_API_KEY environment variable not set');
+        }
         
         const response = await fetch(url, {
             method: 'GET',
@@ -1689,10 +1699,14 @@ app.post('/jupiter/swap', async (req, res) => {
     try {
         console.log('🔄 Jupiter swap request');
         
-        const JUPITER_API_KEY = process.env.JUPITER_API_KEY || '7294308a-bf02-4d78-99f7-9c6d0a061a9d';
+        // Fail loudly if API key not set (don't use hardcoded fallback in production)
+        const JUPITER_API_KEY = process.env.JUPITER_API_KEY;
+        if (!JUPITER_API_KEY) {
+            throw new Error('JUPITER_API_KEY environment variable not set');
+        }
         
-        // Jupiter API v6 with API key from environment variable
-        const response = await fetch('https://api.jup.ag/swap/v6/swap', {
+        // Jupiter API v6 - correct path: /v6/swap (version BEFORE endpoint)
+        const response = await fetch('https://api.jup.ag/v6/swap', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -1736,36 +1750,47 @@ app.get('/test/jupiter', async (req, res) => {
     // Test 1: Can we reach Jupiter at all?
     try {
         console.log('🧪 Testing Jupiter API connection...');
-        const JUPITER_API_KEY = process.env.JUPITER_API_KEY || '7294308a-bf02-4d78-99f7-9c6d0a061a9d';
+        const JUPITER_API_KEY = process.env.JUPITER_API_KEY;
         
-        const response = await fetch('https://api.jup.ag/quote/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000000&slippageBps=50', {
-            method: 'GET',
-            headers: { 
-                'Accept': 'application/json',
-                'User-Agent': 'Trakr-Bot/1.0',
-                'x-api-key': JUPITER_API_KEY
-            }
-        });
-        
-        testResults.tests.push({
-            name: 'Jupiter API Reachability (With API Key)',
-            status: response.ok ? 'PASS' : 'FAIL',
-            statusCode: response.status,
-            message: response.ok ? 'Can reach Jupiter API with authentication' : await response.text(),
-            apiKeySet: !!process.env.JUPITER_API_KEY
-        });
-        
-        if (response.ok) {
-            const data = await response.json();
+        if (!JUPITER_API_KEY) {
             testResults.tests.push({
-                name: 'Jupiter Response Format',
-                status: 'PASS',
-                message: `Quote returned: ${data.outAmount} (${Object.keys(data).length} fields)`
+                name: 'Jupiter API v6 Reachability',
+                status: 'FAIL',
+                message: 'JUPITER_API_KEY environment variable not set',
+                apiKeySet: false
             });
+        } else {
+            // Correct Jupiter v6 path: /v6/quote (version BEFORE endpoint)
+            const response = await fetch('https://api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000000&slippageBps=50', {
+                method: 'GET',
+                headers: { 
+                    'Accept': 'application/json',
+                    'User-Agent': 'Trakr-Bot/1.0',
+                    'x-api-key': JUPITER_API_KEY
+                }
+            });
+            
+            testResults.tests.push({
+                name: 'Jupiter API v6 Reachability',
+                status: response.ok ? 'PASS' : 'FAIL',
+                statusCode: response.status,
+                message: response.ok ? 'Jupiter v6 API working with authentication' : await response.text(),
+                apiKeySet: true,
+                endpoint: 'https://api.jup.ag/v6/quote'
+            });
+            
+            if (response.ok) {
+                const data = await response.json();
+                testResults.tests.push({
+                    name: 'Jupiter Response Format',
+                    status: 'PASS',
+                    message: `Quote returned: ${data.outAmount} (${Object.keys(data).length} fields)`
+                });
+            }
         }
     } catch (error) {
         testResults.tests.push({
-            name: 'Jupiter API Reachability (With API Key)',
+            name: 'Jupiter API v6 Reachability',
             status: 'ERROR',
             message: error.message,
             stack: error.stack
