@@ -3,7 +3,7 @@
 
 const express = require('express');
 const cors = require('cors');
-const fetch = require('node-fetch');
+// Native fetch is built into Node.js 18+ - no import needed!
 
 const app = express();
 const PORT = process.env.PORT || 3000;
