@@ -643,8 +643,8 @@ app.get('/api/live-launches', async (req, res) => {
             launches: formatted,
             count: formatted.length,
             message: 'Graduated Pump.fun tokens (completed bonding curve)',
-            scamFilterRate: `${tokens.length > 0 ? ((1 - formatted.length / tokens.length) * 100).toFixed(1) : '0'}%`,
-            seenTokensCount: seenTokens.size // For debugging
+            scamFilterRate: `${tokens.length > 0 ? ((1 - formatted.length / tokens.length) * 100).toFixed(1) : '0'}%`
+            // ✅ REMOVED: seenTokensCount: seenTokens.size
         });
         
     } catch (error) {
