@@ -482,13 +482,41 @@ async function fetchRugCheckData(contract) {
         
         const data = await response.json();
         
+        // Check if creator has rugged before (look in risks array)
+        const creatorRugRisk = data.risks?.find(r => 
+            r.name?.toLowerCase().includes('creator history') || 
+            r.name?.toLowerCase().includes('rugged tokens') ||
+            r.description?.toLowerCase().includes('history of rugging')
+        );
+        
+        // Calculate creator holdings percentage
+        let creatorPercent = null;
+        if (data.token?.supply && data.creatorBalance) {
+            creatorPercent = ((data.creatorBalance / data.token.supply) * 100).toFixed(2) + '%';
+        }
+        
+        // Calculate top 10 holders percentage
+        let top10Percent = null;
+        if (data.topHolders && data.topHolders.length > 0) {
+            const top10Total = data.topHolders.slice(0, 10).reduce((sum, holder) => {
+                return sum + (holder.pct || 0);
+            }, 0);
+            top10Percent = top10Total.toFixed(2) + '%';
+        }
+        
         // Extract key metrics (convert score from 0-1000 to 0-100)
         return {
             score: Math.round((data.score || 0) / 10),  // Convert to 0-100 scale
-            topHolders: data.topHolders || null,  // e.g. "45%"
-            creator: data.creator || null,         // e.g. "15%"
+            topHolders: data.topHolders || null,  // Array of top holder objects
+            top10Percent: top10Percent,           // Top 10 holders total % (e.g. "23.52%")
+            creator: data.creator || null,         // Creator wallet address
+            creatorBalance: data.creatorBalance || null, // Creator's token balance (raw)
+            creatorPercent: creatorPercent,       // Creator's holdings as % (e.g. "1.31%")
+            creatorHasRugged: !!creatorRugRisk,   // TRUE if creator has rugged before
+            creatorRugRisk: creatorRugRisk || null, // Full risk object with details
             risks: data.risks || [],
-            rugged: data.rugged || false
+            rugged: data.rugged || false,
+            markets: data.markets || []
         };
     } catch (error) {
         console.log(`⚠️ RugCheck error for ${contract.slice(0, 8)}:`, error.message);
@@ -684,9 +712,11 @@ app.get('/api/live-launches', async (req, res) => {
                 marketCap: token.market_cap || token.marketCap || 0,
                 graduatedAt: graduatedAt, // Include timestamp
                 // RugCheck data
-                rugCheckScore: rugCheck?.score || 0,
-                topHolders: rugCheck?.topHolders || null,
-                creatorHoldings: rugCheck?.creator || null,
+                rugCheckScore: rugCheck?.score || 0,                    // 0-100 score
+                top10HoldersPercent: rugCheck?.top10Percent || null,    // e.g. "23.52%" (excludes LP)
+                creatorAddress: rugCheck?.creator || null,              // Creator wallet
+                creatorPercent: rugCheck?.creatorPercent || null,       // e.g. "1.31%"
+                creatorHasRugged: rugCheck?.creatorHasRugged || false,  // 🚨 TRUE if creator rugged before
                 rugCheckRisks: rugCheck?.risks || [],
                 isRugged: rugCheck?.rugged || false
             };
