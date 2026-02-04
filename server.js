@@ -460,6 +460,42 @@ app.get('/api/projects', async (req, res) => {
     }
 });
 
+// ==========================================
+// RUGCHECK API FUNCTION
+// ==========================================
+
+// Fetch RugCheck data for a token (holder %, creator %, score)
+async function fetchRugCheckData(contract) {
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000); // 5s timeout
+        
+        const response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`, {
+            signal: controller.signal
+        });
+        clearTimeout(timeout);
+        
+        if (!response.ok) {
+            console.log(`⚠️ RugCheck ${response.status} for ${contract.slice(0, 8)}`);
+            return null;
+        }
+        
+        const data = await response.json();
+        
+        // Extract key metrics (convert score from 0-1000 to 0-100)
+        return {
+            score: Math.round((data.score || 0) / 10),  // Convert to 0-100 scale
+            topHolders: data.topHolders || null,  // e.g. "45%"
+            creator: data.creator || null,         // e.g. "15%"
+            risks: data.risks || [],
+            rugged: data.rugged || false
+        };
+    } catch (error) {
+        console.log(`⚠️ RugCheck error for ${contract.slice(0, 8)}:`, error.message);
+        return null;
+    }
+}
+
 // Live Launches - Get graduated Pump.fun tokens (using Moralis API)
 // Track last check time to only show NEW graduations going forward
 // FIX: Start by looking back 1 hour (3600000ms) instead of starting from "now"
@@ -602,10 +638,24 @@ app.get('/api/live-launches', async (req, res) => {
         console.log(`   Skipped ${oldCount} old graduations (before last check)`);
         // ✅ REMOVED: console.log(`🗂️ Now tracking ${seenTokens.size} seen tokens`);
         
-        // Format results
+        // Fetch RugCheck data for all tokens in parallel
+        console.log(`📊 Fetching RugCheck data for ${newGraduations.length} tokens...`);
+        const rugCheckPromises = newGraduations.map(async token => {
+            const address = token.address || token.mint || token.token_address || token.tokenAddress;
+            return {
+                address,
+                rugCheckData: await fetchRugCheckData(address)
+            };
+        });
+        
+        const rugCheckResults = await Promise.all(rugCheckPromises);
+        const rugCheckMap = new Map(rugCheckResults.map(r => [r.address, r.rugCheckData]));
+        
+        // Format results with RugCheck data
         const formatted = newGraduations.map(token => {
             const address = token.address || token.mint || token.token_address || token.tokenAddress;
             const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
+            const rugCheck = rugCheckMap.get(address);
             
             const ageMinutes = graduatedAt 
                 ? Math.floor((currentCheckTime - (typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime())) / (1000 * 60))
@@ -632,7 +682,13 @@ app.get('/api/live-launches', async (req, res) => {
                 },
                 graduated: true,
                 marketCap: token.market_cap || token.marketCap || 0,
-                graduatedAt: graduatedAt // Include timestamp
+                graduatedAt: graduatedAt, // Include timestamp
+                // RugCheck data
+                rugCheckScore: rugCheck?.score || 0,
+                topHolders: rugCheck?.topHolders || null,
+                creatorHoldings: rugCheck?.creator || null,
+                rugCheckRisks: rugCheck?.risks || [],
+                isRugged: rugCheck?.rugged || false
             };
         });
         
