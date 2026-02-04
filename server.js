@@ -468,9 +468,9 @@ app.get('/api/projects', async (req, res) => {
 const rugCheckCache = new Map();
 const RUGCHECK_CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache
 
-// Rate limiting
+// Rate limiting - RugCheck has strict limits
 let lastRugCheckCall = 0;
-const RUGCHECK_DELAY = 350; // 350ms between calls (~3 per second)
+const RUGCHECK_DELAY = 1200; // 1.2s between calls to avoid 429s
 
 // Helper
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -491,7 +491,7 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 // Fetch RugCheck data for a token (holder %, creator %, score)
-async function fetchRugCheckData(contract) {
+async function fetchRugCheckData(contract, retryCount = 0) {
     try {
         // Check cache first
         const cached = rugCheckCache.get(contract);
@@ -516,11 +516,18 @@ async function fetchRugCheckData(contract) {
         });
         clearTimeout(timeout);
         
-        // Handle rate limiting (429) - retry once after delay
+        // Handle rate limiting (429) - retry with exponential backoff
         if (response.status === 429) {
-            console.log(`⚠️ RugCheck 429 for ${contract.slice(0, 8)}, retrying in 2s...`);
-            await sleep(2000);
-            response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`);
+            if (retryCount < 3) {
+                const retryDelay = Math.pow(2, retryCount + 1) * 2000; // 4s, 8s, 16s
+                console.log(`⚠️ RugCheck 429 for ${contract.slice(0, 8)}, retry ${retryCount + 1}/3 in ${retryDelay/1000}s...`);
+                await sleep(retryDelay);
+                lastRugCheckCall = Date.now(); // Reset rate limit timer
+                return fetchRugCheckData(contract, retryCount + 1);
+            } else {
+                console.log(`❌ RugCheck 429 for ${contract.slice(0, 8)} - max retries exceeded`);
+                return null;
+            }
         }
         
         if (!response.ok) {
