@@ -464,16 +464,64 @@ app.get('/api/projects', async (req, res) => {
 // RUGCHECK API FUNCTION
 // ==========================================
 
+// Cache for RugCheck data (in-memory, clears on restart)
+const rugCheckCache = new Map();
+const RUGCHECK_CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache
+
+// Rate limiting
+let lastRugCheckCall = 0;
+const RUGCHECK_DELAY = 350; // 350ms between calls (~3 per second)
+
+// Helper
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Clean up old cache entries every 10 minutes
+setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [key, value] of rugCheckCache.entries()) {
+        if (now - value.timestamp > RUGCHECK_CACHE_TTL) {
+            rugCheckCache.delete(key);
+            cleaned++;
+        }
+    }
+    if (cleaned > 0) {
+        console.log(`🧹 Cleaned ${cleaned} expired RugCheck cache entries`);
+    }
+}, 10 * 60 * 1000);
+
 // Fetch RugCheck data for a token (holder %, creator %, score)
 async function fetchRugCheckData(contract) {
     try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000); // 5s timeout
+        // Check cache first
+        const cached = rugCheckCache.get(contract);
+        if (cached && (Date.now() - cached.timestamp < RUGCHECK_CACHE_TTL)) {
+            console.log(`📦 RugCheck cache hit for ${contract.slice(0, 8)}`);
+            return cached.data;
+        }
         
-        const response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`, {
+        // Rate limiting - wait if needed
+        const now = Date.now();
+        const timeSinceLastCall = now - lastRugCheckCall;
+        if (timeSinceLastCall < RUGCHECK_DELAY) {
+            await sleep(RUGCHECK_DELAY - timeSinceLastCall);
+        }
+        lastRugCheckCall = Date.now();
+        
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
+        
+        let response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`, {
             signal: controller.signal
         });
         clearTimeout(timeout);
+        
+        // Handle rate limiting (429) - retry once after delay
+        if (response.status === 429) {
+            console.log(`⚠️ RugCheck 429 for ${contract.slice(0, 8)}, retrying in 2s...`);
+            await sleep(2000);
+            response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`);
+        }
         
         if (!response.ok) {
             console.log(`⚠️ RugCheck ${response.status} for ${contract.slice(0, 8)}`);
@@ -486,38 +534,104 @@ async function fetchRugCheckData(contract) {
         const creatorRugRisk = data.risks?.find(r => 
             r.name?.toLowerCase().includes('creator history') || 
             r.name?.toLowerCase().includes('rugged tokens') ||
-            r.description?.toLowerCase().includes('history of rugging')
+            r.description?.toLowerCase().includes('history of rugging') ||
+            r.name?.toLowerCase().includes('previous rug')
         );
         
-        // Calculate creator holdings percentage
+        // =====================================================
+        // CREATOR HOLDINGS - Try multiple possible formats
+        // =====================================================
         let creatorPercent = null;
-        if (data.token?.supply && data.creatorBalance) {
-            creatorPercent = ((data.creatorBalance / data.token.supply) * 100).toFixed(2) + '%';
+        
+        // Method 1: Check if creatorTokens has pct directly
+        if (data.creatorTokens?.pct !== undefined) {
+            const pct = data.creatorTokens.pct;
+            creatorPercent = pct > 1 ? pct.toFixed(2) + '%' : (pct * 100).toFixed(2) + '%';
+        }
+        // Method 2: Check if there's a creatorPercentage field
+        else if (data.creatorPercentage !== undefined) {
+            creatorPercent = data.creatorPercentage.toFixed(2) + '%';
+        }
+        // Method 3: Calculate from balance and supply
+        else if (data.token?.supply && data.creatorBalance) {
+            const supply = typeof data.token.supply === 'string' ? parseFloat(data.token.supply) : data.token.supply;
+            const balance = typeof data.creatorBalance === 'string' ? parseFloat(data.creatorBalance) : data.creatorBalance;
+            if (supply > 0) {
+                creatorPercent = ((balance / supply) * 100).toFixed(2) + '%';
+            }
+        }
+        // Method 4: Check creatorTokens.percentage
+        else if (data.creatorTokens?.percentage !== undefined) {
+            creatorPercent = data.creatorTokens.percentage.toFixed(2) + '%';
+        }
+        // Method 5: Look in tokenOverview
+        else if (data.tokenOverview?.creatorBalance?.percentage !== undefined) {
+            creatorPercent = data.tokenOverview.creatorBalance.percentage.toFixed(2) + '%';
         }
         
-        // Calculate top 10 holders percentage
+        // =====================================================
+        // TOP 10 HOLDERS - Try multiple possible formats  
+        // =====================================================
         let top10Percent = null;
+        
         if (data.topHolders && data.topHolders.length > 0) {
-            const top10Total = data.topHolders.slice(0, 10).reduce((sum, holder) => {
-                return sum + (holder.pct || 0);
-            }, 0);
-            top10Percent = top10Total.toFixed(2) + '%';
+            let top10Total = 0;
+            const top10 = data.topHolders.slice(0, 10);
+            
+            for (const holder of top10) {
+                // Skip LP/AMM addresses (Pump.fun, Raydium, etc.)
+                const isLP = holder.isLP || 
+                    holder.address?.includes('pump') ||
+                    holder.owner?.includes('pump') ||
+                    holder.label?.toLowerCase()?.includes('lp') ||
+                    holder.label?.toLowerCase()?.includes('amm') ||
+                    holder.label?.toLowerCase()?.includes('pump');
+                
+                if (isLP) continue;
+                
+                let holderPct = holder.pct || holder.percentage || holder.percent || holder.pctOwned || 0;
+                
+                // If it's a decimal (0.0189), convert to percentage
+                if (holderPct > 0 && holderPct < 1) {
+                    holderPct = holderPct * 100;
+                }
+                
+                top10Total += holderPct;
+            }
+            
+            if (top10Total > 0) {
+                top10Percent = top10Total.toFixed(2) + '%';
+            }
         }
         
-        // Extract key metrics (convert score from 0-1000 to 0-100)
-        return {
-            score: Math.round((data.score || 0) / 10),  // Convert to 0-100 scale
-            topHolders: data.topHolders || null,  // Array of top holder objects
-            top10Percent: top10Percent,           // Top 10 holders total % (e.g. "23.52%")
-            creator: data.creator || null,         // Creator wallet address
-            creatorBalance: data.creatorBalance || null, // Creator's token balance (raw)
-            creatorPercent: creatorPercent,       // Creator's holdings as % (e.g. "1.31%")
-            creatorHasRugged: !!creatorRugRisk,   // TRUE if creator has rugged before
-            creatorRugRisk: creatorRugRisk || null, // Full risk object with details
+        // Fallback: Check pre-calculated fields
+        if (!top10Percent && data.totalTopHoldersPercent !== undefined) {
+            top10Percent = data.totalTopHoldersPercent.toFixed(2) + '%';
+        }
+        if (!top10Percent && data.tokenMeta?.topHoldersPercent !== undefined) {
+            top10Percent = data.tokenMeta.topHoldersPercent.toFixed(2) + '%';
+        }
+        
+        console.log(`✅ RugCheck for ${contract.slice(0, 8)}: creator=${creatorPercent}, top10=${top10Percent}`);
+        
+        const result = {
+            score: Math.round((data.score || 0) / 10),
+            topHolders: data.topHolders || null,
+            top10Percent: top10Percent,
+            creator: data.creator || null,
+            creatorBalance: data.creatorBalance || null,
+            creatorPercent: creatorPercent,
+            creatorHasRugged: !!creatorRugRisk,
+            creatorRugRisk: creatorRugRisk || null,
             risks: data.risks || [],
             rugged: data.rugged || false,
             markets: data.markets || []
         };
+        
+        // Cache the result
+        rugCheckCache.set(contract, { data: result, timestamp: Date.now() });
+        
+        return result;
     } catch (error) {
         console.log(`⚠️ RugCheck error for ${contract.slice(0, 8)}:`, error.message);
         return null;
@@ -666,18 +780,22 @@ app.get('/api/live-launches', async (req, res) => {
         console.log(`   Skipped ${oldCount} old graduations (before last check)`);
         // ✅ REMOVED: console.log(`🗂️ Now tracking ${seenTokens.size} seen tokens`);
         
-        // Fetch RugCheck data for all tokens in parallel
-        console.log(`📊 Fetching RugCheck data for ${newGraduations.length} tokens...`);
-        const rugCheckPromises = newGraduations.map(async token => {
-            const address = token.address || token.mint || token.token_address || token.tokenAddress;
-            return {
-                address,
-                rugCheckData: await fetchRugCheckData(address)
-            };
-        });
+        // Fetch RugCheck data SEQUENTIALLY to avoid rate limits
+        console.log(`📊 Fetching RugCheck data for ${newGraduations.length} tokens (sequentially)...`);
+        const rugCheckMap = new Map();
         
-        const rugCheckResults = await Promise.all(rugCheckPromises);
-        const rugCheckMap = new Map(rugCheckResults.map(r => [r.address, r.rugCheckData]));
+        for (const token of newGraduations) {
+            const address = token.address || token.mint || token.token_address || token.tokenAddress;
+            try {
+                const rugCheckData = await fetchRugCheckData(address);
+                rugCheckMap.set(address, rugCheckData);
+            } catch (err) {
+                console.log(`⚠️ RugCheck failed for ${address.slice(0, 8)}: ${err.message}`);
+                rugCheckMap.set(address, null);
+            }
+        }
+        
+        console.log(`✅ RugCheck complete: ${rugCheckMap.size} tokens processed`);
         
         // Format results with RugCheck data
         const formatted = newGraduations.map(token => {
@@ -1060,6 +1178,63 @@ app.get('/api/stats', async (req, res) => {
 // Health check
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// ==========================================
+// RUGCHECK DEBUG ENDPOINT
+// ==========================================
+
+// Debug endpoint to test RugCheck API response directly
+// Usage: GET /api/debug/rugcheck/:contract
+app.get('/api/debug/rugcheck/:contract', async (req, res) => {
+    try {
+        const { contract } = req.params;
+        
+        if (!contract) {
+            return res.status(400).json({ error: 'Contract address required' });
+        }
+        
+        console.log(`🔍 Debug: Fetching raw RugCheck data for ${contract}`);
+        
+        // Fetch raw data from RugCheck
+        const response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`);
+        
+        if (!response.ok) {
+            return res.status(response.status).json({
+                error: `RugCheck API returned ${response.status}`,
+                contract: contract
+            });
+        }
+        
+        const rawData = await response.json();
+        
+        // Also run through our parser
+        const parsedData = await fetchRugCheckData(contract);
+        
+        res.json({
+            success: true,
+            contract: contract,
+            raw: rawData,  // Full raw response from RugCheck
+            parsed: parsedData,  // What our parser extracts
+            debug: {
+                rawKeys: Object.keys(rawData),
+                hasTopHolders: !!rawData.topHolders,
+                topHoldersSample: rawData.topHolders?.slice(0, 3),
+                hasCreatorTokens: !!rawData.creatorTokens,
+                creatorTokensData: rawData.creatorTokens,
+                tokenData: rawData.token,
+                creatorBalance: rawData.creatorBalance,
+                score: rawData.score
+            }
+        });
+        
+    } catch (error) {
+        console.error('Debug RugCheck error:', error);
+        res.status(500).json({
+            error: error.message,
+            contract: req.params.contract
+        });
+    }
 });
 
 // ==========================================
