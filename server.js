@@ -675,6 +675,223 @@ async function fetchRugCheckData(contract, retryCount = 0) {
     }
 }
 
+// ==========================================
+// BUNDLE DETECTION (Helius API)
+// ==========================================
+
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+const HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
+const HELIUS_API_URL = `https://api.helius.xyz/v0`;
+
+// Cache for bundle data (same TTL as RugCheck)
+const bundleCache = new Map();
+const BUNDLE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+// Clean up old bundle cache entries every 10 minutes
+setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [key, value] of bundleCache.entries()) {
+        if (now - value.timestamp > BUNDLE_CACHE_TTL) {
+            bundleCache.delete(key);
+            cleaned++;
+        }
+    }
+    if (cleaned > 0) {
+        console.log(`🧹 Cleaned ${cleaned} expired bundle cache entries`);
+    }
+}, 10 * 60 * 1000);
+
+// Pump.fun program ID
+const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+
+// Fetch bundle detection data for a token
+async function fetchBundleData(tokenMint) {
+    try {
+        if (!HELIUS_API_KEY) {
+            console.log('⚠️ HELIUS_API_KEY not set - skipping bundle detection');
+            return null;
+        }
+
+        // Check cache first
+        const cached = bundleCache.get(tokenMint);
+        if (cached && (Date.now() - cached.timestamp < BUNDLE_CACHE_TTL)) {
+            console.log(`📦 Bundle cache hit for ${tokenMint.slice(0, 8)}`);
+            return cached.data;
+        }
+
+        console.log(`🔍 Bundle check for ${tokenMint.slice(0, 8)}...`);
+
+        // Step 1: Get the earliest transactions on this token using Helius parsed transaction API
+        // This gets us the Pump.fun buys from token creation
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
+
+        const response = await fetch(
+            `${HELIUS_API_URL}/addresses/${tokenMint}/transactions?api-key=${HELIUS_API_KEY}&limit=50&type=SWAP`,
+            { signal: controller.signal }
+        );
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+            console.log(`⚠️ Helius API ${response.status} for ${tokenMint.slice(0, 8)}`);
+            return null;
+        }
+
+        const transactions = await response.json();
+
+        if (!transactions || transactions.length === 0) {
+            console.log(`   No transactions found for ${tokenMint.slice(0, 8)}`);
+            return { isBundled: false, bundledWallets: 0, riskLevel: 'NONE', reason: 'No early transactions found' };
+        }
+
+        // Step 2: Sort by slot (ascending) to get earliest transactions first
+        transactions.sort((a, b) => (a.slot || 0) - (b.slot || 0));
+
+        // Step 3: Extract early buyers - focus on first transactions (token creation phase)
+        const earlyBuyers = [];
+        const firstSlot = transactions[0]?.slot || 0;
+        
+        // Look at transactions within the first 10 slots (~4 seconds on Solana)
+        // This captures the initial creation + sniper window
+        const SLOT_WINDOW = 10;
+
+        for (const tx of transactions) {
+            if (!tx.slot) continue;
+            
+            // Only look at early transactions (within first 10 slots of token's first tx)
+            if (tx.slot > firstSlot + SLOT_WINDOW) break;
+
+            // Get the fee payer (buyer wallet)
+            const buyer = tx.feePayer;
+            if (!buyer) continue;
+
+            // Check if this is a buy (token transfer TO the buyer)
+            // Helius parsed transactions include tokenTransfers
+            const isBuy = tx.tokenTransfers?.some(transfer => 
+                transfer.mint === tokenMint && 
+                transfer.toUserAccount === buyer
+            ) || tx.description?.toLowerCase().includes('swap') || 
+               tx.type === 'SWAP';
+
+            if (isBuy) {
+                earlyBuyers.push({
+                    wallet: buyer,
+                    slot: tx.slot,
+                    signature: tx.signature,
+                    slotOffset: tx.slot - firstSlot,
+                    // Try to get token amount from transfers
+                    tokenAmount: tx.tokenTransfers?.find(t => t.mint === tokenMint)?.tokenAmount || 0
+                });
+            }
+        }
+
+        // Step 4: Group buyers by slot
+        const slotGroups = {};
+        for (const buyer of earlyBuyers) {
+            if (!slotGroups[buyer.slot]) {
+                slotGroups[buyer.slot] = [];
+            }
+            slotGroups[buyer.slot].push(buyer);
+        }
+
+        // Step 5: Detect bundles - multiple UNIQUE wallets in the same slot
+        let maxWalletsInSlot = 0;
+        let bundleSlot = null;
+        const uniqueEarlyWallets = new Set(earlyBuyers.map(b => b.wallet));
+
+        for (const [slot, buyers] of Object.entries(slotGroups)) {
+            const uniqueWallets = new Set(buyers.map(b => b.wallet));
+            if (uniqueWallets.size > maxWalletsInSlot) {
+                maxWalletsInSlot = uniqueWallets.size;
+                bundleSlot = slot;
+            }
+        }
+
+        // Step 6: Check for wallets that bought across multiple consecutive slots
+        // (sophisticated bundlers spread across 2-3 slots to avoid simple detection)
+        const walletsInEarlySlots = uniqueEarlyWallets.size;
+
+        // Step 7: Determine risk level
+        let riskLevel = 'NONE';
+        let isBundled = false;
+
+        if (maxWalletsInSlot >= 8 || walletsInEarlySlots >= 12) {
+            riskLevel = 'CRITICAL';
+            isBundled = true;
+        } else if (maxWalletsInSlot >= 5 || walletsInEarlySlots >= 8) {
+            riskLevel = 'HIGH';
+            isBundled = true;
+        } else if (maxWalletsInSlot >= 3 || walletsInEarlySlots >= 5) {
+            riskLevel = 'MEDIUM';
+            isBundled = true;
+        } else if (maxWalletsInSlot >= 2) {
+            riskLevel = 'LOW';
+            isBundled = false; // 2 wallets in same slot could be coincidence
+        }
+
+        const result = {
+            isBundled: isBundled,
+            bundledWallets: maxWalletsInSlot,           // Max wallets in a single slot
+            totalEarlyBuyers: walletsInEarlySlots,      // Unique wallets in first ~10 slots
+            bundleSlot: bundleSlot,                      // The slot with most concentrated buys
+            slotsAnalyzed: Object.keys(slotGroups).length,
+            transactionsAnalyzed: earlyBuyers.length,
+            riskLevel: riskLevel,
+            // Human-readable summary
+            summary: isBundled 
+                ? `${maxWalletsInSlot} wallets bought in same block, ${walletsInEarlySlots} total early buyers`
+                : `Organic distribution: ${walletsInEarlySlots} buyers across ${Object.keys(slotGroups).length} blocks`
+        };
+
+        console.log(`✅ Bundle check ${tokenMint.slice(0, 8)}: ${result.riskLevel} risk (${maxWalletsInSlot} same-slot, ${walletsInEarlySlots} early)`);
+
+        // Cache the result
+        bundleCache.set(tokenMint, { data: result, timestamp: Date.now() });
+
+        return result;
+
+    } catch (error) {
+        if (error.name === 'AbortError') {
+            console.log(`⚠️ Bundle check timeout for ${tokenMint.slice(0, 8)}`);
+        } else {
+            console.log(`⚠️ Bundle check error for ${tokenMint.slice(0, 8)}:`, error.message);
+        }
+        return null;
+    }
+}
+
+// ==========================================
+// BUNDLE DETECTION DEBUG ENDPOINT
+// ==========================================
+
+app.get('/api/debug/bundle/:contract', async (req, res) => {
+    try {
+        const { contract } = req.params;
+        
+        if (!contract) {
+            return res.status(400).json({ error: 'Contract address required' });
+        }
+        
+        console.log(`🔍 Debug: Fetching bundle data for ${contract}`);
+        
+        const bundleData = await fetchBundleData(contract);
+        
+        res.json({
+            success: true,
+            contract: contract,
+            bundle: bundleData
+        });
+        
+    } catch (error) {
+        console.error('Debug bundle error:', error);
+        res.status(500).json({
+            error: error.message,
+            contract: req.params.contract
+        });
+    }
+});
+
 // Live Launches - Get graduated Pump.fun tokens (using Moralis API)
 // Track last check time to only show NEW graduations going forward
 // FIX: Start by looking back 1 hour (3600000ms) instead of starting from "now"
@@ -817,28 +1034,49 @@ app.get('/api/live-launches', async (req, res) => {
         console.log(`   Skipped ${oldCount} old graduations (before last check)`);
         // ✅ REMOVED: console.log(`🗂️ Now tracking ${seenTokens.size} seen tokens`);
         
-        // Fetch RugCheck data SEQUENTIALLY to avoid rate limits
-        console.log(`📊 Fetching RugCheck data for ${newGraduations.length} tokens (sequentially)...`);
+        // Fetch RugCheck + Bundle data IN PARALLEL for each token
+        // RugCheck is sequential (rate limited), Bundle checks run in parallel alongside
+        console.log(`📊 Fetching RugCheck + Bundle data for ${newGraduations.length} tokens...`);
         const rugCheckMap = new Map();
+        const bundleMap = new Map();
         
-        for (const token of newGraduations) {
+        // Start ALL bundle checks in parallel (Helius has generous rate limits)
+        const bundlePromises = newGraduations.map(async (token) => {
             const address = token.address || token.mint || token.token_address || token.tokenAddress;
             try {
-                const rugCheckData = await fetchRugCheckData(address);
-                rugCheckMap.set(address, rugCheckData);
+                const bundleData = await fetchBundleData(address);
+                bundleMap.set(address, bundleData);
             } catch (err) {
-                console.log(`⚠️ RugCheck failed for ${address.slice(0, 8)}: ${err.message}`);
-                rugCheckMap.set(address, null);
+                console.log(`⚠️ Bundle check failed for ${address.slice(0, 8)}: ${err.message}`);
+                bundleMap.set(address, null);
             }
-        }
+        });
         
-        console.log(`✅ RugCheck complete: ${rugCheckMap.size} tokens processed`);
+        // Run RugCheck SEQUENTIALLY (rate limited) while bundles run in parallel
+        const rugCheckPromise = (async () => {
+            for (const token of newGraduations) {
+                const address = token.address || token.mint || token.token_address || token.tokenAddress;
+                try {
+                    const rugCheckData = await fetchRugCheckData(address);
+                    rugCheckMap.set(address, rugCheckData);
+                } catch (err) {
+                    console.log(`⚠️ RugCheck failed for ${address.slice(0, 8)}: ${err.message}`);
+                    rugCheckMap.set(address, null);
+                }
+            }
+        })();
         
-        // Format results with RugCheck data
+        // Wait for BOTH to complete
+        await Promise.all([rugCheckPromise, ...bundlePromises]);
+        
+        console.log(`✅ RugCheck + Bundle complete: ${rugCheckMap.size} rugchecks, ${bundleMap.size} bundle checks`);
+        
+        // Format results with RugCheck + Bundle data
         const formatted = newGraduations.map(token => {
             const address = token.address || token.mint || token.token_address || token.tokenAddress;
             const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
             const rugCheck = rugCheckMap.get(address);
+            const bundle = bundleMap.get(address);
             
             const ageMinutes = graduatedAt 
                 ? Math.floor((currentCheckTime - (typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime())) / (1000 * 60))
@@ -867,13 +1105,21 @@ app.get('/api/live-launches', async (req, res) => {
                 marketCap: token.market_cap || token.marketCap || 0,
                 graduatedAt: graduatedAt, // Include timestamp
                 // RugCheck data
-                rugCheckScore: rugCheck?.score || 0,                    // 0-100 score
-                top10HoldersPercent: rugCheck?.top10Percent || null,    // e.g. "23.52%" (excludes LP)
-                creatorAddress: rugCheck?.creator || null,              // Creator wallet
-                creatorPercent: rugCheck?.creatorPercent || null,       // e.g. "1.31%"
-                creatorHasRugged: rugCheck?.creatorHasRugged || false,  // 🚨 TRUE if creator rugged before
+                rugCheckScore: rugCheck?.score || 0,
+                top10HoldersPercent: rugCheck?.top10Percent || null,
+                creatorAddress: rugCheck?.creator || null,
+                creatorPercent: rugCheck?.creatorPercent || null,
+                creatorHasRugged: rugCheck?.creatorHasRugged || false,
                 rugCheckRisks: rugCheck?.risks || [],
-                isRugged: rugCheck?.rugged || false
+                isRugged: rugCheck?.rugged || false,
+                // Bundle Detection data
+                bundleDetection: bundle ? {
+                    isBundled: bundle.isBundled || false,
+                    bundledWallets: bundle.bundledWallets || 0,
+                    totalEarlyBuyers: bundle.totalEarlyBuyers || 0,
+                    riskLevel: bundle.riskLevel || 'NONE',
+                    summary: bundle.summary || 'No data'
+                } : null
             };
         });
         
