@@ -1122,12 +1122,31 @@ app.get('/api/live-launches', async (req, res) => {
         // ========================================
         // 2. FETCH METEORA DBC MIGRATIONS (Helius)
         // ========================================
+        // Only capture ACTUAL migrations - filter by instruction method name
         let meteoraTokens = [];
         if (HELIUS_API_KEY) {
             try {
+                // Known quote tokens to filter out (not graduated tokens)
+                const QUOTE_TOKENS = [
+                    'So11111111111111111111111111111111111111112',  // Wrapped SOL
+                    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+                    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+                    'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',  // JUP
+                    'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',  // mSOL
+                    'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn', // jitoSOL
+                ];
+                
+                // Migration method names we're looking for
+                const MIGRATION_METHODS = [
+                    'migrate_meteora_damm',
+                    'migration_damm_v2',
+                    'migrateMeteoraDamm',
+                    'migrationDammV2'
+                ];
+                
                 // Get recent transactions for Meteora DBC program
                 const response = await fetch(
-                    `${HELIUS_API_URL}/addresses/${METEORA_DBC_PROGRAM}/transactions?api-key=${HELIUS_API_KEY}&limit=30`,
+                    `${HELIUS_API_URL}/addresses/${METEORA_DBC_PROGRAM}/transactions?api-key=${HELIUS_API_KEY}&limit=50`,
                     { headers: { 'Accept': 'application/json' } }
                 );
                 
@@ -1135,26 +1154,78 @@ app.get('/api/live-launches', async (req, res) => {
                     const transactions = await response.json();
                     console.log(`📦 Helius returned ${transactions.length} Meteora DBC transactions`);
                     
-                    // Extract unique token mints from DBC transactions
+                    // Extract unique token mints from MIGRATION transactions only
                     const seenMints = new Set();
+                    let skippedNonMigration = 0;
+                    
                     for (const tx of transactions) {
                         // Skip if too old
                         if (tx.timestamp * 1000 <= lastMeteoraCheck) continue;
                         
+                        // CHECK 1: Look for migration in transaction type
+                        const txType = (tx.type || '').toLowerCase();
+                        const isMigrationByType = txType.includes('migrat');
+                        
+                        // CHECK 2: Look for migration method in instructions
+                        let isMigrationByMethod = false;
+                        if (tx.instructions && Array.isArray(tx.instructions)) {
+                            for (const ix of tx.instructions) {
+                                // Check if instruction is from DBC program and has migration method
+                                if (ix.programId === METEORA_DBC_PROGRAM) {
+                                    const methodName = ix.name || ix.method || ix.instructionName || '';
+                                    if (MIGRATION_METHODS.some(m => methodName.toLowerCase().includes(m.toLowerCase()))) {
+                                        isMigrationByMethod = true;
+                                        break;
+                                    }
+                                }
+                                // Also check inner instructions
+                                if (ix.innerInstructions && Array.isArray(ix.innerInstructions)) {
+                                    for (const inner of ix.innerInstructions) {
+                                        if (inner.programId === METEORA_DBC_PROGRAM) {
+                                            const methodName = inner.name || inner.method || inner.instructionName || '';
+                                            if (MIGRATION_METHODS.some(m => methodName.toLowerCase().includes(m.toLowerCase()))) {
+                                                isMigrationByMethod = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // CHECK 3: Look for migration in description
+                        const description = (tx.description || '').toLowerCase();
+                        const isMigrationByDesc = description.includes('migrat') && 
+                            (description.includes('damm') || description.includes('pool') || description.includes('graduated'));
+                        
+                        // CHECK 4: Look at events for migration patterns
+                        let isMigrationByEvents = false;
+                        if (tx.events && tx.events.nft === undefined) {
+                            // Migration transactions often have specific event patterns
+                            // They create new pools which involves multiple token accounts
+                        }
+                        
+                        // ONLY process if we're confident it's a migration
+                        if (!isMigrationByType && !isMigrationByMethod && !isMigrationByDesc) {
+                            skippedNonMigration++;
+                            continue; // Skip - not a migration
+                        }
+                        
                         // Get token mint from token transfers
                         let tokenMint = null;
                         if (tx.tokenTransfers && tx.tokenTransfers.length > 0) {
-                            // Find non-SOL token (not wrapped SOL)
-                            const nonSolTransfer = tx.tokenTransfers.find(t => 
-                                t.mint !== 'So11111111111111111111111111111111111111112'
+                            // Find non-quote token (not SOL, USDC, USDT, etc.)
+                            const nonQuoteTransfer = tx.tokenTransfers.find(t => 
+                                !QUOTE_TOKENS.includes(t.mint)
                             );
-                            if (nonSolTransfer) {
-                                tokenMint = nonSolTransfer.mint;
+                            if (nonQuoteTransfer) {
+                                tokenMint = nonQuoteTransfer.mint;
                             }
                         }
                         
                         if (tokenMint && !seenMints.has(tokenMint)) {
                             seenMints.add(tokenMint);
+                            console.log(`🎯 Meteora MIGRATION found: ${tokenMint.slice(0,8)}... | Type: ${txType} | Desc: ${description.slice(0,60)}`);
                             meteoraTokens.push({
                                 mint: tokenMint,
                                 timestamp: tx.timestamp * 1000,
@@ -1162,7 +1233,8 @@ app.get('/api/live-launches', async (req, res) => {
                             });
                         }
                     }
-                    console.log(`📊 Found ${meteoraTokens.length} new Meteora DBC migrations`);
+                    console.log(`📊 Found ${meteoraTokens.length} Meteora migrations (skipped ${skippedNonMigration} non-migration txs)`);
+                }
                 }
             } catch (err) {
                 console.error('⚠️ Helius Meteora fetch error:', err.message);
