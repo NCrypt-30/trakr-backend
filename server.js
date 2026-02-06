@@ -952,117 +952,6 @@ app.get('/api/debug/bundle/:contract', async (req, res) => {
 // Track last check time to only show NEW graduations going forward
 // FIX: Start by looking back 1 hour (3600000ms) instead of starting from "now"
 let lastGraduationCheck = Date.now() - (60 * 60 * 1000); // Look back 1 hour on startup
-let lastMeteoraCheck = Date.now() - (60 * 60 * 1000); // Look back 1 hour on startup for Meteora
-
-// Meteora Dynamic Bonding Curve Program ID
-const METEORA_DBC_PROGRAM = 'dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN';
-
-// Fetch Meteora DBC migrations from Helius
-async function fetchMeteoraMigrations() {
-    if (!HELIUS_API_KEY) {
-        console.log('⚠️ HELIUS_API_KEY not set - skipping Meteora DBC');
-        return [];
-    }
-    
-    try {
-        console.log('🔍 Fetching Meteora DBC migrations from Helius...');
-        
-        // Get recent transactions for the DBC program
-        const response = await fetch(
-            `${HELIUS_API_URL}/addresses/${METEORA_DBC_PROGRAM}/transactions?api-key=${HELIUS_API_KEY}&limit=50`,
-            { headers: { 'Accept': 'application/json' } }
-        );
-        
-        if (!response.ok) {
-            console.error(`Helius API error: ${response.status}`);
-            return [];
-        }
-        
-        const transactions = await response.json();
-        console.log(`📦 Helius returned ${transactions.length} DBC transactions`);
-        
-        // Filter for migration transactions only
-        const migrations = [];
-        for (const tx of transactions) {
-            // Check if this is a migration transaction
-            const isMigration = tx.type === 'UNKNOWN' && tx.instructions?.some(ix => 
-                ix.programId === METEORA_DBC_PROGRAM && 
-                (ix.data?.includes('migrate') || tx.description?.toLowerCase().includes('migrat'))
-            );
-            
-            // Also check parsed instructions for migration methods
-            const hasMigrationMethod = tx.instructions?.some(ix => {
-                const data = ix.data || '';
-                // Check for migrate_meteora_damm or migration_damm_v2 method signatures
-                return ix.programId === METEORA_DBC_PROGRAM;
-            });
-            
-            // Get token mint from accounts (usually in the transaction accounts)
-            let tokenMint = null;
-            if (tx.tokenTransfers && tx.tokenTransfers.length > 0) {
-                tokenMint = tx.tokenTransfers[0].mint;
-            } else if (tx.accountData) {
-                // Look for token mint in account data
-                for (const acc of tx.accountData) {
-                    if (acc.tokenBalanceChanges && acc.tokenBalanceChanges.length > 0) {
-                        tokenMint = acc.tokenBalanceChanges[0].mint;
-                        break;
-                    }
-                }
-            }
-            
-            // If we found a token mint and this looks like a DBC transaction, include it
-            if (tokenMint && tx.timestamp && hasMigrationMethod) {
-                migrations.push({
-                    tokenMint,
-                    timestamp: tx.timestamp * 1000, // Convert to milliseconds
-                    signature: tx.signature
-                });
-            }
-        }
-        
-        console.log(`📊 Found ${migrations.length} potential Meteora migrations`);
-        return migrations;
-        
-    } catch (error) {
-        console.error('❌ Meteora DBC fetch error:', error.message);
-        return [];
-    }
-}
-
-// Fetch token metadata from Helius DAS API
-async function fetchTokenMetadata(tokenMint) {
-    if (!HELIUS_API_KEY) return null;
-    
-    try {
-        const response = await fetch(HELIUS_RPC_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                jsonrpc: '2.0',
-                id: 'metadata',
-                method: 'getAsset',
-                params: { id: tokenMint }
-            })
-        });
-        
-        if (!response.ok) return null;
-        
-        const data = await response.json();
-        if (data.result) {
-            return {
-                name: data.result.content?.metadata?.name || 'Unknown',
-                symbol: data.result.content?.metadata?.symbol || 'UNKNOWN',
-                decimals: data.result.token_info?.decimals || 6,
-                logo: data.result.content?.links?.image || null
-            };
-        }
-        return null;
-    } catch (error) {
-        console.error(`Metadata fetch error for ${tokenMint.slice(0,8)}:`, error.message);
-        return null;
-    }
-}
 
 // ✅ REMOVED: seenTokens global dedup - let frontend handle it!
 // const seenTokens = new Set();
@@ -1080,293 +969,170 @@ setInterval(() => {
 
 app.get('/api/live-launches', async (req, res) => {
     try {
-        console.log('🔍 Fetching graduated tokens from Pump.fun + Meteora DBC...');
+        console.log('🔍 Fetching graduated Pump.fun tokens from Moralis...');
         
         const MORALIS_API_KEY = process.env.MORALIS_API_KEY;
-        const currentCheckTime = Date.now();
         
-        // ========================================
-        // 1. FETCH PUMP.FUN GRADUATIONS (Moralis)
-        // ========================================
-        let pumpTokens = [];
-        if (MORALIS_API_KEY) {
-            try {
-                const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/graduated', {
-                    headers: {
-                        'Accept': 'application/json',
-                        'X-API-Key': MORALIS_API_KEY
-                    }
-                });
-                
-                if (response.ok) {
-                    const data = await response.json();
-                    // Handle different response formats
-                    if (Array.isArray(data)) {
-                        pumpTokens = data;
-                    } else if (data.result && Array.isArray(data.result)) {
-                        pumpTokens = data.result;
-                    } else if (data.tokens && Array.isArray(data.tokens)) {
-                        pumpTokens = data.tokens;
-                    } else if (data.data && Array.isArray(data.data)) {
-                        pumpTokens = data.data;
-                    }
-                    console.log(`📊 Moralis returned ${pumpTokens.length} Pump.fun graduations`);
-                }
-            } catch (err) {
-                console.error('⚠️ Moralis fetch error:', err.message);
-            }
-        } else {
-            console.log('⚠️ MORALIS_API_KEY not set - skipping Pump.fun');
+        if (!MORALIS_API_KEY) {
+            console.error('❌ MORALIS_API_KEY not set in environment variables');
+            return res.json({
+                success: false,
+                error: 'Moralis API key not configured',
+                launches: [],
+                totalScanned: 0,
+                count: 0
+            });
         }
         
-        // ========================================
-        // 2. FETCH METEORA DBC MIGRATIONS (Helius)
-        // ========================================
-        // Only capture ACTUAL migrations - filter by instruction method name
-        let meteoraTokens = [];
-        if (HELIUS_API_KEY) {
-            try {
-                // Known quote tokens to filter out (not graduated tokens)
-                const QUOTE_TOKENS = [
-                    'So11111111111111111111111111111111111111112',  // Wrapped SOL
-                    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
-                    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
-                    'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',  // JUP
-                    'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',  // mSOL
-                    'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn', // jitoSOL
-                ];
-                
-                // Migration method names we're looking for
-                const MIGRATION_METHODS = [
-                    'migrate_meteora_damm',
-                    'migration_damm_v2',
-                    'migrateMeteoraDamm',
-                    'migrationDammV2'
-                ];
-                
-                // Get recent transactions for Meteora DBC program
-                const response = await fetch(
-                    `${HELIUS_API_URL}/addresses/${METEORA_DBC_PROGRAM}/transactions?api-key=${HELIUS_API_KEY}&limit=50`,
-                    { headers: { 'Accept': 'application/json' } }
-                );
-                
-                if (response.ok) {
-                    const transactions = await response.json();
-                    console.log(`📦 Helius returned ${transactions.length} Meteora DBC transactions`);
-                    
-                    // Extract unique token mints from MIGRATION transactions only
-                    const seenMints = new Set();
-                    let skippedNonMigration = 0;
-                    
-                    for (const tx of transactions) {
-                        // Skip if too old
-                        if (tx.timestamp * 1000 <= lastMeteoraCheck) continue;
-                        
-                        // CHECK 1: Look for migration in transaction type
-                        const txType = (tx.type || '').toLowerCase();
-                        const isMigrationByType = txType.includes('migrat');
-                        
-                        // CHECK 2: Look for migration method in instructions
-                        let isMigrationByMethod = false;
-                        if (tx.instructions && Array.isArray(tx.instructions)) {
-                            for (const ix of tx.instructions) {
-                                // Check if instruction is from DBC program and has migration method
-                                if (ix.programId === METEORA_DBC_PROGRAM) {
-                                    const methodName = ix.name || ix.method || ix.instructionName || '';
-                                    if (MIGRATION_METHODS.some(m => methodName.toLowerCase().includes(m.toLowerCase()))) {
-                                        isMigrationByMethod = true;
-                                        break;
-                                    }
-                                }
-                                // Also check inner instructions
-                                if (ix.innerInstructions && Array.isArray(ix.innerInstructions)) {
-                                    for (const inner of ix.innerInstructions) {
-                                        if (inner.programId === METEORA_DBC_PROGRAM) {
-                                            const methodName = inner.name || inner.method || inner.instructionName || '';
-                                            if (MIGRATION_METHODS.some(m => methodName.toLowerCase().includes(m.toLowerCase()))) {
-                                                isMigrationByMethod = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        
-                        // CHECK 3: Look for migration in description
-                        const description = (tx.description || '').toLowerCase();
-                        const isMigrationByDesc = description.includes('migrat') && 
-                            (description.includes('damm') || description.includes('pool') || description.includes('graduated'));
-                        
-                        // CHECK 4: Look at events for migration patterns
-                        let isMigrationByEvents = false;
-                        if (tx.events && tx.events.nft === undefined) {
-                            // Migration transactions often have specific event patterns
-                            // They create new pools which involves multiple token accounts
-                        }
-                        
-                        // ONLY process if we're confident it's a migration
-                        if (!isMigrationByType && !isMigrationByMethod && !isMigrationByDesc) {
-                            skippedNonMigration++;
-                            continue; // Skip - not a migration
-                        }
-                        
-                        // Get token mint from token transfers
-                        let tokenMint = null;
-                        if (tx.tokenTransfers && tx.tokenTransfers.length > 0) {
-                            // Find non-quote token (not SOL, USDC, USDT, etc.)
-                            const nonQuoteTransfer = tx.tokenTransfers.find(t => 
-                                !QUOTE_TOKENS.includes(t.mint)
-                            );
-                            if (nonQuoteTransfer) {
-                                tokenMint = nonQuoteTransfer.mint;
-                            }
-                        }
-                        
-                        if (tokenMint && !seenMints.has(tokenMint)) {
-                            seenMints.add(tokenMint);
-                            console.log(`🎯 Meteora MIGRATION found: ${tokenMint.slice(0,8)}... | Type: ${txType} | Desc: ${description.slice(0,60)}`);
-                            meteoraTokens.push({
-                                mint: tokenMint,
-                                timestamp: tx.timestamp * 1000,
-                                signature: tx.signature
-                            });
-                        }
-                    }
-                    console.log(`📊 Found ${meteoraTokens.length} Meteora migrations (skipped ${skippedNonMigration} non-migration txs)`);
-                }
-                }
-            } catch (err) {
-                console.error('⚠️ Helius Meteora fetch error:', err.message);
+        // Moralis Solana API - Get graduated tokens
+        // Docs: https://docs.moralis.com/web3-data-api/solana/reference/token-api#get-graduated-tokens-by-exchange
+        // Use "pumpfun" as the exchange identifier (Pump.fun tokens that completed bonding curve)
+        const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/graduated', {
+            headers: {
+                'Accept': 'application/json',
+                'X-API-Key': MORALIS_API_KEY
             }
-        } else {
-            console.log('⚠️ HELIUS_API_KEY not set - skipping Meteora DBC');
-        }
-        
-        // ========================================
-        // 3. FILTER PUMP.FUN BY TIME
-        // ========================================
-        console.log(`⏰ Pump.fun last check: ${new Date(lastGraduationCheck).toISOString()}`);
-        console.log(`⏰ Meteora last check: ${new Date(lastMeteoraCheck).toISOString()}`);
-        
-        let pumpOldCount = 0;
-        const newPumpGraduations = pumpTokens.filter(token => {
-            const address = token.address || token.mint || token.token_address || token.tokenAddress;
-            if (!address) return false;
-            
-            const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
-            if (!graduatedAt) return false;
-            
-            const graduatedTime = typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime();
-            
-            if (graduatedTime <= lastGraduationCheck) {
-                pumpOldCount++;
-                return false;
-            }
-            return true;
         });
         
-        // Update check times
-        lastGraduationCheck = currentCheckTime;
-        lastMeteoraCheck = currentCheckTime;
-        
-        console.log(`✅ Found ${newPumpGraduations.length} NEW Pump.fun graduations (skipped ${pumpOldCount} old)`);
-        console.log(`✅ Found ${meteoraTokens.length} NEW Meteora DBC migrations`);
-        
-        // ========================================
-        // 4. FETCH METADATA FOR METEORA TOKENS
-        // ========================================
-        const meteoraMetadata = new Map();
-        for (const token of meteoraTokens) {
-            try {
-                const metadata = await fetchTokenMetadata(token.mint);
-                meteoraMetadata.set(token.mint, metadata);
-            } catch (err) {
-                console.log(`⚠️ Metadata fetch failed for ${token.mint.slice(0,8)}`);
-                meteoraMetadata.set(token.mint, null);
-            }
-        }
-        
-        // ========================================
-        // 5. COMBINE ALL TOKENS
-        // ========================================
-        const allNewTokens = [
-            // Pump.fun tokens with source tag
-            ...newPumpGraduations.map(token => ({
-                ...token,
-                _source: 'Pump',
-                _address: token.address || token.mint || token.token_address || token.tokenAddress,
-                _graduatedAt: token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp
-            })),
-            // Meteora tokens with source tag
-            ...meteoraTokens.map(token => {
-                const meta = meteoraMetadata.get(token.mint);
-                return {
-                    _source: 'Meteora',
-                    _address: token.mint,
-                    _graduatedAt: token.timestamp,
-                    symbol: meta?.symbol || 'UNKNOWN',
-                    name: meta?.name || 'Unknown Token',
-                    logo: meta?.logo || null
-                };
-            })
-        ];
-        
-        console.log(`📊 Total new tokens to process: ${allNewTokens.length}`);
-        
-        if (allNewTokens.length === 0) {
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error(`Moralis API returned ${response.status}: ${errorText}`);
             return res.json({
                 success: true,
                 launches: [],
-                totalScanned: pumpTokens.length + meteoraTokens.length,
+                totalScanned: 0,
                 count: 0,
                 timestamp: new Date().toISOString(),
-                message: 'No new graduated tokens found',
+                message: `API error: ${response.status}`,
                 scamFilterRate: '0%'
             });
         }
         
-        // ========================================
-        // 6. FETCH RUGCHECK + BUNDLE DATA
-        // ========================================
-        console.log(`📊 Fetching RugCheck + Bundle data for ${allNewTokens.length} tokens...`);
+        const data = await response.json();
+        console.log('📦 Moralis response structure:', Object.keys(data));
+        
+        // Handle different possible response formats
+        let tokens = [];
+        if (Array.isArray(data)) {
+            tokens = data;
+        } else if (data.tokens && Array.isArray(data.tokens)) {
+            tokens = data.tokens;
+        } else if (data.result && Array.isArray(data.result)) {
+            tokens = data.result;
+        } else if (data.data && Array.isArray(data.data)) {
+            tokens = data.data;
+        }
+        
+        console.log(`📊 Moralis returned ${tokens.length} graduated tokens`);
+        
+        if (tokens.length === 0) {
+            return res.json({
+                success: true,
+                launches: [],
+                totalScanned: 0,
+                count: 0,
+                timestamp: new Date().toISOString(),
+                message: 'No graduated tokens found',
+                scamFilterRate: '0%'
+            });
+        }
+        
+        // ONLY show graduations AFTER last check (going forward only, ignore past)
+        const currentCheckTime = Date.now();
+        
+        // Better logging to debug the filtering
+        console.log(`⏰ Last check was at: ${new Date(lastGraduationCheck).toISOString()}`);
+        console.log(`⏰ Current check is at: ${new Date(currentCheckTime).toISOString()}`);
+        console.log(`⏰ Time window: ${Math.floor((currentCheckTime - lastGraduationCheck) / 1000 / 60)} minutes`);
+        // ✅ REMOVED: console.log(`🗂️ Currently tracking ${seenTokens.size} seen tokens`);
+        
+        let oldCount = 0;
+        let newCount = 0;
+        
+        const newGraduations = tokens.filter(token => {
+            // Must have address
+            const address = token.address || token.mint || token.token_address || token.tokenAddress;
+            if (!address) {
+                return false;
+            }
+            
+            // ✅ REMOVED: DEDUPLICATION CHECK #1 - Let frontend handle it!
+            // if (seenTokens.has(address)) {
+            //     console.log(`⏭️ Skipping ${token.symbol}: already seen (dedup)`);
+            //     return false;
+            // }
+            
+            // Get graduation timestamp
+            const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
+            if (!graduatedAt) {
+                return false; // Skip if no timestamp
+            }
+            
+            const graduatedTime = typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime();
+            
+            // DEDUPLICATION CHECK #2: Time-based filter
+            if (graduatedTime <= lastGraduationCheck) {
+                oldCount++; // Count old tokens
+                return false; // Skip - graduated before last check
+            }
+            
+            // ✅ REMOVED: Mark as seen
+            // seenTokens.add(address);
+            
+            newCount++; // Count new tokens
+            return true;
+        });
+        
+        // Update last check time for next request
+        lastGraduationCheck = currentCheckTime;
+        
+        console.log(`✅ Found ${newGraduations.length} NEW graduations since last check`);
+        console.log(`   Skipped ${oldCount} old graduations (before last check)`);
+        // ✅ REMOVED: console.log(`🗂️ Now tracking ${seenTokens.size} seen tokens`);
+        
+        // Fetch RugCheck + Bundle data IN PARALLEL for each token
+        // RugCheck is sequential (rate limited), Bundle checks run in parallel alongside
+        console.log(`📊 Fetching RugCheck + Bundle data for ${newGraduations.length} tokens...`);
         const rugCheckMap = new Map();
         const bundleMap = new Map();
         
-        // Bundle checks in parallel
-        const bundlePromises = allNewTokens.map(async (token) => {
+        // Start ALL bundle checks in parallel (Helius has generous rate limits)
+        const bundlePromises = newGraduations.map(async (token) => {
+            const address = token.address || token.mint || token.token_address || token.tokenAddress;
             try {
-                const bundleData = await fetchBundleData(token._address);
-                bundleMap.set(token._address, bundleData);
+                const bundleData = await fetchBundleData(address);
+                bundleMap.set(address, bundleData);
             } catch (err) {
-                bundleMap.set(token._address, null);
+                console.log(`⚠️ Bundle check failed for ${address.slice(0, 8)}: ${err.message}`);
+                bundleMap.set(address, null);
             }
         });
         
-        // RugCheck sequential
+        // Run RugCheck SEQUENTIALLY (rate limited) while bundles run in parallel
         const rugCheckPromise = (async () => {
-            for (const token of allNewTokens) {
+            for (const token of newGraduations) {
+                const address = token.address || token.mint || token.token_address || token.tokenAddress;
                 try {
-                    const rugCheckData = await fetchRugCheckData(token._address);
-                    rugCheckMap.set(token._address, rugCheckData);
+                    const rugCheckData = await fetchRugCheckData(address);
+                    rugCheckMap.set(address, rugCheckData);
                 } catch (err) {
-                    rugCheckMap.set(token._address, null);
+                    console.log(`⚠️ RugCheck failed for ${address.slice(0, 8)}: ${err.message}`);
+                    rugCheckMap.set(address, null);
                 }
             }
         })();
         
+        // Wait for BOTH to complete
         await Promise.all([rugCheckPromise, ...bundlePromises]);
-        console.log(`✅ RugCheck + Bundle complete`);
         
-        // ========================================
-        // 7. FORMAT FINAL RESULTS
-        // ========================================
-        const formatted = allNewTokens.map(token => {
-            const address = token._address;
-            const graduatedAt = token._graduatedAt;
+        console.log(`✅ RugCheck + Bundle complete: ${rugCheckMap.size} rugchecks, ${bundleMap.size} bundle checks`);
+        
+        // Format results with RugCheck + Bundle data
+        const formatted = newGraduations.map(token => {
+            const address = token.address || token.mint || token.token_address || token.tokenAddress;
+            const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
             const rugCheck = rugCheckMap.get(address);
             const bundle = bundleMap.get(address);
-            const source = token._source;
             
             const ageMinutes = graduatedAt 
                 ? Math.floor((currentCheckTime - (typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime())) / (1000 * 60))
@@ -1376,27 +1142,24 @@ app.get('/api/live-launches', async (req, res) => {
                 symbol: token.symbol || 'UNKNOWN',
                 name: token.name || 'Unknown Token',
                 contract: address,
-                source: source, // 'Pump' or 'Meteora'
                 ageMinutes: ageMinutes,
                 liquidity: token.liquidity || token.reserve_in_usd || token.raydium_liquidity || 0,
                 price: token.priceUsd || token.price_usd || token.price || token.priceNative || 0,
-                dex: source === 'Pump' ? 'raydium' : 'meteora',
+                dex: 'raydium',
                 hasLogo: !!token.logo || !!token.image_uri || !!token.logoURI,
                 hasWebsite: !!token.website,
                 hasSocials: !!(token.twitter || token.telegram),
                 website: token.website || null,
                 dexscreenerUrl: `https://dexscreener.com/solana/${address}`,
                 jupiterUrl: `https://jup.ag/?sell=So11111111111111111111111111111111111111112&buy=${address}`,
-                raydiumUrl: source === 'Pump' 
-                    ? `https://raydium.io/swap/?inputCurrency=sol&outputCurrency=${address}`
-                    : `https://app.meteora.ag/pools?token=${address}`,
+                raydiumUrl: `https://raydium.io/swap/?inputCurrency=sol&outputCurrency=${address}`,
                 priceChange: {
                     m5: token.priceChange5m || token.price_change_5m || token.priceChange?.['5m'] || 0,
                     h1: token.priceChange1h || token.price_change_1h || token.priceChange?.['1h'] || 0
                 },
                 graduated: true,
                 marketCap: token.market_cap || token.marketCap || 0,
-                graduatedAt: graduatedAt,
+                graduatedAt: graduatedAt, // Include timestamp
                 // RugCheck data
                 rugCheckScore: rugCheck?.score || 0,
                 top10HoldersPercent: rugCheck?.top10Percent || null,
@@ -1409,9 +1172,9 @@ app.get('/api/live-launches', async (req, res) => {
                 bundleDetection: bundle ? {
                     isBundled: bundle.isBundled || false,
                     bundledWallets: bundle.bundledWallets || 0,
-                    bundledPercent: bundle.bundledPercent || null,
+                    bundledPercent: bundle.bundledPercent || null,        // NEW: e.g. "34.2%"
                     totalEarlyBuyers: bundle.totalEarlyBuyers || 0,
-                    earlyBuyersPercent: bundle.earlyBuyersPercent || null,
+                    earlyBuyersPercent: bundle.earlyBuyersPercent || null, // NEW: e.g. "52.1%"
                     riskLevel: bundle.riskLevel || 'NONE',
                     summary: bundle.summary || 'No data'
                 } : null
@@ -1421,11 +1184,12 @@ app.get('/api/live-launches', async (req, res) => {
         res.json({
             success: true,
             timestamp: new Date().toISOString(),
-            totalScanned: pumpTokens.length + meteoraTokens.length,
+            totalScanned: tokens.length,
             launches: formatted,
             count: formatted.length,
-            message: `Graduated tokens: ${newPumpGraduations.length} Pump.fun + ${meteoraTokens.length} Meteora DBC`,
-            scamFilterRate: '0%'
+            message: 'Graduated Pump.fun tokens (completed bonding curve)',
+            scamFilterRate: `${tokens.length > 0 ? ((1 - formatted.length / tokens.length) * 100).toFixed(1) : '0'}%`
+            // ✅ REMOVED: seenTokensCount: seenTokens.size
         });
         
     } catch (error) {
@@ -1471,87 +1235,64 @@ app.post('/api/token-prices', async (req, res) => {
         // Fetch all prices in PARALLEL for speed
         const pricePromises = contracts.map(async (contract) => {
             try {
-                // Try DexScreener first (best for graduated tokens)
-                const dexUrl = `https://api.dexscreener.com/latest/dex/tokens/${contract}`;
-                const dexController = new AbortController();
-                const dexTimeout = setTimeout(() => dexController.abort(), 3000); // 3s timeout
+                // DexScreener API - free, reliable, real-time
+                const url = `https://api.dexscreener.com/latest/dex/tokens/${contract}`;
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 3000); // 3s timeout
                 
-                const dexResponse = await fetch(dexUrl, {
-                    signal: dexController.signal
+                const response = await fetch(url, {
+                    signal: controller.signal
                 });
-                clearTimeout(dexTimeout);
+                clearTimeout(timeout);
                 
-                if (dexResponse.ok) {
-                    const dexData = await dexResponse.json();
-                    
-                    if (dexData.pairs && dexData.pairs.length > 0) {
-                        const pair = dexData.pairs[0];
-                        return {
-                            contract: contract,
-                            success: true,
-                            price: pair.priceUsd || '0',
-                            priceNative: pair.priceNative || '0',
-                            priceChange: {
-                                m5: parseFloat(pair.priceChange?.m5 || 0),
-                                h1: parseFloat(pair.priceChange?.h1 || 0),
-                                h6: parseFloat(pair.priceChange?.h6 || 0),
-                                h24: parseFloat(pair.priceChange?.h24 || 0)
-                            },
-                            volume: {
-                                m5: parseFloat(pair.volume?.m5 || 0),
-                                h1: parseFloat(pair.volume?.h1 || 0),
-                                h6: parseFloat(pair.volume?.h6 || 0),
-                                h24: parseFloat(pair.volume?.h24 || 0)
-                            },
-                            liquidity: {
-                                usd: parseFloat(pair.liquidity?.usd || 0),
-                                base: parseFloat(pair.liquidity?.base || 0),
-                                quote: parseFloat(pair.liquidity?.quote || 0)
-                            },
-                            pairAddress: pair.pairAddress,
-                            dexId: pair.dexId,
-                            url: pair.url,
-                            source: 'dexscreener'
-                        };
-                    }
+                if (!response.ok) {
+                    console.error(`DexScreener error for ${contract.slice(0, 8)}: ${response.status}`);
+                    return {
+                        contract: contract,
+                        success: false,
+                        error: `API returned ${response.status}`
+                    };
                 }
                 
-                // DexScreener failed or no pairs - try Jupiter Price API (works for Pump.fun tokens)
-                console.log(`   DexScreener no data for ${contract.slice(0, 8)}, trying Jupiter...`);
-                const jupUrl = `https://price.jup.ag/v6/price?ids=${contract}`;
-                const jupController = new AbortController();
-                const jupTimeout = setTimeout(() => jupController.abort(), 3000);
+                const data = await response.json();
                 
-                const jupResponse = await fetch(jupUrl, {
-                    signal: jupController.signal
-                });
-                clearTimeout(jupTimeout);
-                
-                if (jupResponse.ok) {
-                    const jupData = await jupResponse.json();
-                    const priceData = jupData.data?.[contract];
-                    
-                    if (priceData && priceData.price) {
-                        console.log(`   ✅ Jupiter got price for ${contract.slice(0, 8)}: $${priceData.price}`);
-                        return {
-                            contract: contract,
-                            success: true,
-                            price: priceData.price.toString(),
-                            priceNative: '0', // Jupiter doesn't provide native price easily
-                            priceChange: { m5: 0, h1: 0, h6: 0, h24: 0 },
-                            volume: { m5: 0, h1: 0, h6: 0, h24: 0 },
-                            liquidity: { usd: 0, base: 0, quote: 0 },
-                            source: 'jupiter'
-                        };
-                    }
+                // Check if token has trading pairs
+                if (!data.pairs || data.pairs.length === 0) {
+                    return {
+                        contract: contract,
+                        success: false,
+                        error: 'No trading pairs found'
+                    };
                 }
                 
-                // Both APIs failed
-                console.log(`   ❌ No price found for ${contract.slice(0, 8)} (DexScreener + Jupiter failed)`);
+                // Get most liquid pair (usually first)
+                const pair = data.pairs[0];
+                
                 return {
                     contract: contract,
-                    success: false,
-                    error: 'No trading pairs found (tried DexScreener + Jupiter)'
+                    success: true,
+                    price: pair.priceUsd || '0',
+                    priceNative: pair.priceNative || '0',
+                    priceChange: {
+                        m5: parseFloat(pair.priceChange?.m5 || 0),
+                        h1: parseFloat(pair.priceChange?.h1 || 0),
+                        h6: parseFloat(pair.priceChange?.h6 || 0),
+                        h24: parseFloat(pair.priceChange?.h24 || 0)
+                    },
+                    volume: {
+                        m5: parseFloat(pair.volume?.m5 || 0),
+                        h1: parseFloat(pair.volume?.h1 || 0),
+                        h6: parseFloat(pair.volume?.h6 || 0),
+                        h24: parseFloat(pair.volume?.h24 || 0)
+                    },
+                    liquidity: {
+                        usd: parseFloat(pair.liquidity?.usd || 0),
+                        base: parseFloat(pair.liquidity?.base || 0),
+                        quote: parseFloat(pair.liquidity?.quote || 0)
+                    },
+                    pairAddress: pair.pairAddress,
+                    dexId: pair.dexId,
+                    url: pair.url
                 };
                 
             } catch (error) {
