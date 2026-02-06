@@ -954,6 +954,54 @@ app.get('/api/debug/bundle/:contract', async (req, res) => {
 let lastGraduationCheck = Date.now() - (60 * 60 * 1000); // Look back 1 hour on startup
 let lastMeteoraCheck = Date.now() - (60 * 60 * 1000); // Look back 1 hour on startup for Meteora
 
+// Rolling cache - keeps tokens for 1 hour so all users can see them
+// Frontend handles dismissals per-user
+const TOKEN_CACHE_DURATION = 60 * 60 * 1000; // 1 hour in ms
+let rollingTokenCache = []; // Array of {token, addedAt}
+
+function cleanupTokenCache() {
+    const cutoff = Date.now() - TOKEN_CACHE_DURATION;
+    const before = rollingTokenCache.length;
+    rollingTokenCache = rollingTokenCache.filter(item => item.addedAt > cutoff);
+    const removed = before - rollingTokenCache.length;
+    if (removed > 0) {
+        console.log(`🧹 Cleaned ${removed} expired tokens from cache (${rollingTokenCache.length} remaining)`);
+    }
+}
+
+function addTokensToCache(tokens) {
+    const now = Date.now();
+    const existingContracts = new Set(rollingTokenCache.map(item => item.token.contract));
+    
+    let added = 0;
+    for (const token of tokens) {
+        if (!existingContracts.has(token.contract)) {
+            rollingTokenCache.push({ token, addedAt: now });
+            added++;
+        }
+    }
+    if (added > 0) {
+        console.log(`📥 Added ${added} new tokens to rolling cache (${rollingTokenCache.length} total)`);
+    }
+}
+
+function getCachedTokens() {
+    cleanupTokenCache();
+    const now = Date.now();
+    
+    // Recalculate ageMinutes for each cached token
+    return rollingTokenCache.map(item => {
+        const token = { ...item.token };
+        if (token.graduatedAt) {
+            const gradTime = typeof token.graduatedAt === 'number' 
+                ? token.graduatedAt 
+                : new Date(token.graduatedAt).getTime();
+            token.ageMinutes = Math.floor((now - gradTime) / (1000 * 60));
+        }
+        return token;
+    });
+}
+
 // Meteora Dynamic Bonding Curve Program ID
 const METEORA_DBC_PROGRAM = 'dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN';
 
@@ -1156,10 +1204,14 @@ app.get('/api/live-launches', async (req, res) => {
                     
                     const seenMints = new Set();
                     let skippedSwaps = 0;
+                    let skippedOld = 0;
                     
                     for (const tx of transactions) {
                         // Skip if too old
-                        if (tx.timestamp * 1000 <= lastMeteoraCheck) continue;
+                        if (tx.timestamp * 1000 <= lastMeteoraCheck) {
+                            skippedOld++;
+                            continue;
+                        }
                         
                         // KEY CHECK: Migration transactions involve DAMM v1 or v2
                         // Check if any instruction or account references DAMM programs
@@ -1225,7 +1277,7 @@ app.get('/api/live-launches', async (req, res) => {
                             });
                         }
                     }
-                    console.log(`📊 Found ${meteoraTokens.length} potential Meteora migrations (skipped ${skippedSwaps} swaps)`);
+                    console.log(`📊 Found ${meteoraTokens.length} potential Meteora migrations (skipped ${skippedOld} old, ${skippedSwaps} swaps)`);
                     
                     // ========================================
                     // VALIDATION: Verify tokens actually graduated
@@ -1358,13 +1410,15 @@ app.get('/api/live-launches', async (req, res) => {
         console.log(`📊 Total new tokens to process: ${allNewTokens.length}`);
         
         if (allNewTokens.length === 0) {
+            // No new tokens, but return cached tokens from last hour
+            const cachedTokens = getCachedTokens();
             return res.json({
                 success: true,
-                launches: [],
+                launches: cachedTokens,
                 totalScanned: pumpTokens.length + meteoraTokens.length,
-                count: 0,
+                count: cachedTokens.length,
                 timestamp: new Date().toISOString(),
-                message: 'No new graduated tokens found',
+                message: `No new tokens (returning ${cachedTokens.length} from cache)`,
                 scamFilterRate: '0%'
             });
         }
@@ -1461,13 +1515,20 @@ app.get('/api/live-launches', async (req, res) => {
             };
         });
         
+        // Add newly formatted tokens to rolling cache
+        addTokensToCache(formatted);
+        
+        // Return ALL cached tokens (includes new ones + previous hour)
+        const allCachedTokens = getCachedTokens();
+        
         res.json({
             success: true,
             timestamp: new Date().toISOString(),
             totalScanned: pumpTokens.length + meteoraTokens.length,
-            launches: formatted,
-            count: formatted.length,
-            message: `Graduated tokens: ${newPumpGraduations.length} Pump.fun + ${meteoraTokens.length} Meteora DBC`,
+            launches: allCachedTokens,
+            count: allCachedTokens.length,
+            newThisPoll: formatted.length,
+            message: `New: ${formatted.length} | Cached: ${allCachedTokens.length} (Pump: ${newPumpGraduations.length}, Meteora: ${meteoraTokens.length})`,
             scamFilterRate: '0%'
         });
         
