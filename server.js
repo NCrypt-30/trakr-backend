@@ -877,11 +877,55 @@ async function fetchBundleData(tokenMint) {
             }
         }
 
-        // Step 8: Calculate total tokens held by ALL bundled wallets
-        let totalBundledTokens = 0;
+        // Step 8: Get CURRENT holdings of bundled wallets (Padre-style)
+        // This is the key difference - Padre shows what they HOLD NOW, not what they BOUGHT
+        let currentBundledHoldings = 0;
+        
+        if (bundledWallets.size > 0) {
+            console.log(`   Checking current holdings of ${bundledWallets.size} bundled wallets...`);
+            
+            // Get current token accounts for each bundled wallet
+            const TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+            
+            for (const wallet of bundledWallets) {
+                try {
+                    const tokenAccountsResponse = await fetch(HELIUS_RPC_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            jsonrpc: '2.0',
+                            id: 1,
+                            method: 'getTokenAccountsByOwner',
+                            params: [
+                                wallet,
+                                { mint: tokenMint },
+                                { encoding: 'jsonParsed' }
+                            ]
+                        })
+                    });
+                    
+                    const tokenData = await tokenAccountsResponse.json();
+                    
+                    if (tokenData.result?.value?.length > 0) {
+                        for (const account of tokenData.result.value) {
+                            const balance = account.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0;
+                            currentBundledHoldings += balance;
+                        }
+                    }
+                } catch (err) {
+                    // Skip wallet if we can't fetch balance
+                    console.log(`   Could not fetch balance for ${wallet.slice(0, 8)}`);
+                }
+            }
+            
+            console.log(`   Bundled wallets currently hold: ${currentBundledHoldings.toLocaleString()} tokens`);
+        }
+
+        // Calculate what they originally bought (for comparison)
+        let totalBundledBought = 0;
         for (const buyer of preMigrationBuyers) {
             if (bundledWallets.has(buyer.wallet)) {
-                totalBundledTokens += buyer.tokenAmount || 0;
+                totalBundledBought += buyer.tokenAmount || 0;
             }
         }
 
@@ -889,37 +933,42 @@ async function fetchBundleData(tokenMint) {
         const uniqueEarlyWallets = new Set(preMigrationBuyers.map(b => b.wallet));
         const totalEarlyTokenAmount = preMigrationBuyers.reduce((sum, b) => sum + (b.tokenAmount || 0), 0);
 
-        // Step 9: Calculate percentages
-        let bundledPercent = null;
+        // Step 9: Calculate percentages - use CURRENT holdings like Padre
+        let bundledHoldingPercent = null;  // What they HOLD NOW (Padre-style)
+        let bundledBoughtPercent = null;   // What they BOUGHT (for reference)
         let earlyBuyersPercent = null;
         
         if (totalSupply > 0) {
-            if (totalBundledTokens > 0) {
-                bundledPercent = ((totalBundledTokens / totalSupply) * 100).toFixed(1) + '%';
+            if (currentBundledHoldings > 0) {
+                bundledHoldingPercent = ((currentBundledHoldings / totalSupply) * 100).toFixed(1) + '%';
+            }
+            if (totalBundledBought > 0) {
+                bundledBoughtPercent = ((totalBundledBought / totalSupply) * 100).toFixed(1) + '%';
             }
             if (totalEarlyTokenAmount > 0) {
                 earlyBuyersPercent = ((totalEarlyTokenAmount / totalSupply) * 100).toFixed(1) + '%';
             }
         }
 
-        // Step 10: Determine risk level
+        // Step 10: Determine risk level based on CURRENT holdings (Padre-style)
         let riskLevel = 'NONE';
         let isBundled = false;
         
-        const bundlePct = bundledPercent ? parseFloat(bundledPercent) : 0;
+        // Use current holdings for risk assessment
+        const holdingPct = bundledHoldingPercent ? parseFloat(bundledHoldingPercent) : 0;
         const earlyPct = earlyBuyersPercent ? parseFloat(earlyBuyersPercent) : 0;
 
-        // Risk based on bundled wallet holdings (Padre-style)
-        if (bundlePct >= 30 || earlyPct >= 50) {
+        // Risk based on bundled wallet CURRENT holdings (Padre-style)
+        if (holdingPct >= 30 || earlyPct >= 50) {
             riskLevel = 'CRITICAL';
             isBundled = true;
-        } else if (bundlePct >= 20 || earlyPct >= 40) {
+        } else if (holdingPct >= 20 || earlyPct >= 40) {
             riskLevel = 'HIGH';
             isBundled = true;
-        } else if (bundlePct >= 10 || earlyPct >= 25) {
+        } else if (holdingPct >= 10 || earlyPct >= 25) {
             riskLevel = 'MEDIUM';
             isBundled = true;
-        } else if (bundlePct >= 5 || bundledWallets.size >= 3) {
+        } else if (holdingPct >= 5 || bundledWallets.size >= 3) {
             riskLevel = 'LOW';
             isBundled = true;
         } else if (bundledWallets.size >= 2) {
@@ -929,22 +978,24 @@ async function fetchBundleData(tokenMint) {
 
         const result = {
             isBundled: isBundled,
-            bundledWallets: bundledWallets.size,         // Total wallets in ALL bundles
-            bundledPercent: bundledPercent,              // % of supply held by bundled wallets
+            bundledWallets: bundledWallets.size,              // Total wallets in ALL bundles
+            bundledHoldingPercent: bundledHoldingPercent,     // CURRENT holdings (Padre-style)
+            bundledBoughtPercent: bundledBoughtPercent,       // What they originally bought
             totalEarlyBuyers: uniqueEarlyWallets.size,
             earlyBuyersPercent: earlyBuyersPercent,
             bundleSlot: bundleSlot,
-            maxWalletsInSingleBundle: maxWalletsInSlot,  // Largest single bundle
+            maxWalletsInSingleBundle: maxWalletsInSlot,
             slotsAnalyzed: Object.keys(slotGroups).length,
             transactionsAnalyzed: preMigrationBuyers.length,
             riskLevel: riskLevel,
-            preMigration: true,                          // Flag that this is Padre-style
+            preMigration: true,
+            // Summary shows CURRENT holdings like Padre
             summary: isBundled 
-                ? `${bundledWallets.size} bundled wallets${bundledPercent ? ` hold ${bundledPercent}` : ''} (pre-migration)`
+                ? `${bundledWallets.size} bundled wallets${bundledHoldingPercent ? ` holding ${bundledHoldingPercent}` : ''}${bundledBoughtPercent ? ` (bought ${bundledBoughtPercent})` : ''}`
                 : `Organic: ${uniqueEarlyWallets.size} buyers, no same-slot bundles detected`
         };
 
-        console.log(`✅ Bundle (Padre-style) ${tokenMint.slice(0, 8)}: ${result.riskLevel} risk | ${bundledWallets.size} bundled wallets${bundledPercent ? ` = ${bundledPercent}` : ''}`);
+        console.log(`✅ Bundle (Padre-style) ${tokenMint.slice(0, 8)}: ${result.riskLevel} risk | ${bundledWallets.size} bundled wallets holding ${bundledHoldingPercent || '0%'} (bought ${bundledBoughtPercent || '0%'})`);
 
         // Cache the result
         bundleCache.set(tokenMint, { data: result, timestamp: Date.now() });
@@ -1377,15 +1428,18 @@ app.get('/api/live-launches', async (req, res) => {
                 creatorHasRugged: rugCheck?.creatorHasRugged || false,
                 rugCheckRisks: rugCheck?.risks || [],
                 isRugged: rugCheck?.rugged || false,
-                // Bundle Detection data
+                // Bundle Detection data (Padre-style: shows CURRENT holdings)
                 bundleDetection: bundle ? {
                     isBundled: bundle.isBundled || false,
                     bundledWallets: bundle.bundledWallets || 0,
-                    bundledPercent: bundle.bundledPercent || null,
+                    bundledHoldingPercent: bundle.bundledHoldingPercent || null,  // CURRENT holdings (Padre-style)
+                    bundledBoughtPercent: bundle.bundledBoughtPercent || null,    // What they originally bought
+                    bundledPercent: bundle.bundledHoldingPercent || bundle.bundledPercent || null, // Backward compat
                     totalEarlyBuyers: bundle.totalEarlyBuyers || 0,
                     earlyBuyersPercent: bundle.earlyBuyersPercent || null,
                     riskLevel: bundle.riskLevel || 'NONE',
-                    summary: bundle.summary || 'No data'
+                    summary: bundle.summary || 'No data',
+                    preMigration: bundle.preMigration || false
                 } : null
             };
         });
