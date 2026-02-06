@@ -720,10 +720,13 @@ async function fetchBundleData(tokenMint) {
             return cached.data;
         }
 
-        console.log(`🔍 Bundle check for ${tokenMint.slice(0, 8)}...`);
+        console.log(`🔍 Bundle check (Padre-style) for ${tokenMint.slice(0, 8)}...`);
 
+        // Pump.fun program ID - this is where bonding curve buys happen
+        const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+        
         // Step 1: Get token supply using Helius RPC
-        let totalSupply = 0;
+        let totalSupply = 1000000000; // Pump.fun tokens are always 1B supply
         try {
             const supplyResponse = await fetch(HELIUS_RPC_URL, {
                 method: 'POST',
@@ -738,18 +741,18 @@ async function fetchBundleData(tokenMint) {
             const supplyData = await supplyResponse.json();
             if (supplyData.result?.value?.uiAmount) {
                 totalSupply = supplyData.result.value.uiAmount;
-                console.log(`   Token supply: ${totalSupply.toLocaleString()}`);
             }
         } catch (err) {
-            console.log(`   Could not fetch token supply: ${err.message}`);
+            console.log(`   Using default 1B supply`);
         }
 
-        // Step 2: Get the earliest transactions on this token using Helius parsed transaction API
+        // Step 2: Get ALL transactions for this token (not just SWAP)
+        // This gets us the bonding curve buys from Pump.fun BEFORE migration
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
+        const timeout = setTimeout(() => controller.abort(), 15000);
 
         const response = await fetch(
-            `${HELIUS_API_URL}/addresses/${tokenMint}/transactions?api-key=${HELIUS_API_KEY}&limit=50&type=SWAP`,
+            `${HELIUS_API_URL}/addresses/${tokenMint}/transactions?api-key=${HELIUS_API_KEY}&limit=100`,
             { signal: controller.signal }
         );
         clearTimeout(timeout);
@@ -763,108 +766,150 @@ async function fetchBundleData(tokenMint) {
 
         if (!transactions || transactions.length === 0) {
             console.log(`   No transactions found for ${tokenMint.slice(0, 8)}`);
-            return { isBundled: false, bundledWallets: 0, riskLevel: 'NONE', reason: 'No early transactions found' };
+            return { isBundled: false, bundledWallets: 0, riskLevel: 'NONE', reason: 'No transactions found' };
         }
 
         // Step 3: Sort by slot (ascending) to get earliest transactions first
         transactions.sort((a, b) => (a.slot || 0) - (b.slot || 0));
 
-        // Step 4: Extract early buyers - focus on first transactions (token creation phase)
-        const earlyBuyers = [];
-        const firstSlot = transactions[0]?.slot || 0;
+        // Step 4: Find the migration slot (when token left Pump.fun)
+        // Migration is indicated by interaction with Raydium or large liquidity add
+        let migrationSlot = Infinity;
+        const RAYDIUM_PROGRAMS = [
+            '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium AMM
+            'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', // Raydium CLMM
+        ];
         
-        // Look at transactions within the first 10 slots (~4 seconds on Solana)
-        const SLOT_WINDOW = 10;
+        for (const tx of transactions) {
+            // Check if this transaction involves Raydium (migration)
+            const involvesRaydium = tx.accountData?.some(acc => RAYDIUM_PROGRAMS.includes(acc.account)) ||
+                                   tx.instructions?.some(ix => RAYDIUM_PROGRAMS.includes(ix.programId));
+            if (involvesRaydium && tx.slot) {
+                migrationSlot = tx.slot;
+                console.log(`   Found migration at slot ${migrationSlot}`);
+                break;
+            }
+        }
+
+        // Step 5: Extract PRE-MIGRATION buys (Padre-style)
+        // Only look at Pump.fun bonding curve buys BEFORE the Raydium migration
+        const preMigrationBuyers = [];
+        const firstSlot = transactions[0]?.slot || 0;
 
         for (const tx of transactions) {
             if (!tx.slot) continue;
             
-            // Only look at early transactions (within first 10 slots of token's first tx)
-            if (tx.slot > firstSlot + SLOT_WINDOW) break;
+            // CRITICAL: Only look at transactions BEFORE migration
+            // This is the key difference from our old approach
+            if (tx.slot >= migrationSlot) continue;
+
+            // Check if this involves Pump.fun program (bonding curve)
+            const involvesPumpFun = tx.accountData?.some(acc => acc.account === PUMP_FUN_PROGRAM) ||
+                                   tx.instructions?.some(ix => ix.programId === PUMP_FUN_PROGRAM) ||
+                                   tx.source === 'PUMP_FUN';
 
             // Get the fee payer (buyer wallet)
             const buyer = tx.feePayer;
             if (!buyer) continue;
 
-            // Find the token transfer for this mint
+            // Find token transfer for this mint
             const tokenTransfer = tx.tokenTransfers?.find(t => t.mint === tokenMint);
             
-            // Check if this is a buy (token transfer TO the buyer)
-            const isBuy = (tokenTransfer && tokenTransfer.toUserAccount === buyer) || 
-                          tx.description?.toLowerCase().includes('swap') || 
-                          tx.type === 'SWAP';
+            // Check if this is a buy (token going TO the buyer)
+            const isBuy = tokenTransfer && (
+                tokenTransfer.toUserAccount === buyer ||
+                tx.description?.toLowerCase().includes('buy') ||
+                tx.type === 'SWAP' ||
+                involvesPumpFun
+            );
 
-            if (isBuy) {
-                // Get token amount - try multiple possible fields
-                let tokenAmount = 0;
-                if (tokenTransfer) {
-                    tokenAmount = tokenTransfer.tokenAmount || 
+            if (isBuy && tokenTransfer) {
+                // Get token amount
+                let tokenAmount = tokenTransfer.tokenAmount || 
                                   tokenTransfer.amount || 
                                   (tokenTransfer.rawTokenAmount?.tokenAmount ? 
                                    parseFloat(tokenTransfer.rawTokenAmount.tokenAmount) / Math.pow(10, tokenTransfer.rawTokenAmount.decimals || 6) : 0);
-                }
                 
-                earlyBuyers.push({
-                    wallet: buyer,
-                    slot: tx.slot,
-                    signature: tx.signature,
-                    slotOffset: tx.slot - firstSlot,
-                    tokenAmount: tokenAmount
-                });
+                if (tokenAmount > 0) {
+                    preMigrationBuyers.push({
+                        wallet: buyer,
+                        slot: tx.slot,
+                        signature: tx.signature,
+                        slotOffset: tx.slot - firstSlot,
+                        tokenAmount: tokenAmount,
+                        isPumpFun: involvesPumpFun
+                    });
+                }
             }
         }
 
-        // Step 5: Group buyers by slot
+        console.log(`   Found ${preMigrationBuyers.length} pre-migration buys (before slot ${migrationSlot})`);
+
+        // Step 6: Group buyers by slot (same-slot = bundled)
         const slotGroups = {};
-        for (const buyer of earlyBuyers) {
+        for (const buyer of preMigrationBuyers) {
             if (!slotGroups[buyer.slot]) {
                 slotGroups[buyer.slot] = [];
             }
             slotGroups[buyer.slot].push(buyer);
         }
 
-        // Step 6: Detect bundles and calculate amounts
+        // Step 7: Detect bundles - find slots with multiple unique wallets
         let maxWalletsInSlot = 0;
         let bundleSlot = null;
-        let bundleTokenAmount = 0; // Total tokens bought by bundled wallets (same slot)
-        const uniqueEarlyWallets = new Set(earlyBuyers.map(b => b.wallet));
+        let bundleTokenAmount = 0;
+        let bundledWallets = new Set(); // Track ALL wallets that participated in bundles
 
         for (const [slot, buyers] of Object.entries(slotGroups)) {
             const uniqueWallets = new Set(buyers.map(b => b.wallet));
-            if (uniqueWallets.size > maxWalletsInSlot) {
-                maxWalletsInSlot = uniqueWallets.size;
-                bundleSlot = slot;
-                // Sum token amounts for this bundle slot
-                bundleTokenAmount = buyers.reduce((sum, b) => sum + (b.tokenAmount || 0), 0);
+            
+            // 2+ wallets in same slot = bundle (Padre's definition)
+            if (uniqueWallets.size >= 2) {
+                // Add these wallets to bundled set
+                uniqueWallets.forEach(w => bundledWallets.add(w));
+                
+                // Track the largest bundle
+                if (uniqueWallets.size > maxWalletsInSlot) {
+                    maxWalletsInSlot = uniqueWallets.size;
+                    bundleSlot = slot;
+                    bundleTokenAmount = buyers.reduce((sum, b) => sum + (b.tokenAmount || 0), 0);
+                }
             }
         }
 
-        // Calculate total early buyer token amount
-        const totalEarlyTokenAmount = earlyBuyers.reduce((sum, b) => sum + (b.tokenAmount || 0), 0);
-        const walletsInEarlySlots = uniqueEarlyWallets.size;
+        // Step 8: Calculate total tokens held by ALL bundled wallets
+        let totalBundledTokens = 0;
+        for (const buyer of preMigrationBuyers) {
+            if (bundledWallets.has(buyer.wallet)) {
+                totalBundledTokens += buyer.tokenAmount || 0;
+            }
+        }
 
-        // Step 7: Calculate percentages
+        // Also calculate total from early buyers
+        const uniqueEarlyWallets = new Set(preMigrationBuyers.map(b => b.wallet));
+        const totalEarlyTokenAmount = preMigrationBuyers.reduce((sum, b) => sum + (b.tokenAmount || 0), 0);
+
+        // Step 9: Calculate percentages
         let bundledPercent = null;
         let earlyBuyersPercent = null;
         
         if (totalSupply > 0) {
-            if (bundleTokenAmount > 0) {
-                bundledPercent = ((bundleTokenAmount / totalSupply) * 100).toFixed(1) + '%';
+            if (totalBundledTokens > 0) {
+                bundledPercent = ((totalBundledTokens / totalSupply) * 100).toFixed(1) + '%';
             }
             if (totalEarlyTokenAmount > 0) {
                 earlyBuyersPercent = ((totalEarlyTokenAmount / totalSupply) * 100).toFixed(1) + '%';
             }
         }
 
-        // Step 8: Determine risk level based on PERCENTAGE of supply owned
+        // Step 10: Determine risk level
         let riskLevel = 'NONE';
         let isBundled = false;
         
-        // Parse the percentage for comparison
         const bundlePct = bundledPercent ? parseFloat(bundledPercent) : 0;
         const earlyPct = earlyBuyersPercent ? parseFloat(earlyBuyersPercent) : 0;
 
-        // Risk based on how much supply the bundle/early buyers control
+        // Risk based on bundled wallet holdings (Padre-style)
         if (bundlePct >= 30 || earlyPct >= 50) {
             riskLevel = 'CRITICAL';
             isBundled = true;
@@ -874,33 +919,32 @@ async function fetchBundleData(tokenMint) {
         } else if (bundlePct >= 10 || earlyPct >= 25) {
             riskLevel = 'MEDIUM';
             isBundled = true;
-        } else if (bundlePct >= 5 || maxWalletsInSlot >= 3) {
+        } else if (bundlePct >= 5 || bundledWallets.size >= 3) {
             riskLevel = 'LOW';
             isBundled = true;
-        }
-        // If we couldn't get percentages, fall back to wallet count
-        else if (totalSupply === 0 && maxWalletsInSlot >= 5) {
-            riskLevel = 'HIGH';
+        } else if (bundledWallets.size >= 2) {
+            riskLevel = 'LOW';
             isBundled = true;
         }
 
         const result = {
             isBundled: isBundled,
-            bundledWallets: maxWalletsInSlot,
-            bundledPercent: bundledPercent,              // NEW: e.g. "34.2%"
-            totalEarlyBuyers: walletsInEarlySlots,
-            earlyBuyersPercent: earlyBuyersPercent,      // NEW: e.g. "52.1%"
+            bundledWallets: bundledWallets.size,         // Total wallets in ALL bundles
+            bundledPercent: bundledPercent,              // % of supply held by bundled wallets
+            totalEarlyBuyers: uniqueEarlyWallets.size,
+            earlyBuyersPercent: earlyBuyersPercent,
             bundleSlot: bundleSlot,
+            maxWalletsInSingleBundle: maxWalletsInSlot,  // Largest single bundle
             slotsAnalyzed: Object.keys(slotGroups).length,
-            transactionsAnalyzed: earlyBuyers.length,
+            transactionsAnalyzed: preMigrationBuyers.length,
             riskLevel: riskLevel,
-            // Human-readable summary
+            preMigration: true,                          // Flag that this is Padre-style
             summary: isBundled 
-                ? `${maxWalletsInSlot} wallets${bundledPercent ? ` (${bundledPercent})` : ''} bought in same block`
-                : `Organic distribution: ${walletsInEarlySlots} buyers across ${Object.keys(slotGroups).length} blocks`
+                ? `${bundledWallets.size} bundled wallets${bundledPercent ? ` hold ${bundledPercent}` : ''} (pre-migration)`
+                : `Organic: ${uniqueEarlyWallets.size} buyers, no same-slot bundles detected`
         };
 
-        console.log(`✅ Bundle check ${tokenMint.slice(0, 8)}: ${result.riskLevel} risk (${maxWalletsInSlot} same-slot${bundledPercent ? ` = ${bundledPercent}` : ''}, ${walletsInEarlySlots} early${earlyBuyersPercent ? ` = ${earlyBuyersPercent}` : ''})`);
+        console.log(`✅ Bundle (Padre-style) ${tokenMint.slice(0, 8)}: ${result.riskLevel} risk | ${bundledWallets.size} bundled wallets${bundledPercent ? ` = ${bundledPercent}` : ''}`);
 
         // Cache the result
         bundleCache.set(tokenMint, { data: result, timestamp: Date.now() });
