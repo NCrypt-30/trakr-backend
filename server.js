@@ -1043,6 +1043,50 @@ app.get('/api/debug/bundle/:contract', async (req, res) => {
     }
 });
 
+// Refresh bundle data for a single token (clears cache first)
+app.get('/api/refresh-bundle/:contract', async (req, res) => {
+    try {
+        const { contract } = req.params;
+        
+        if (!contract) {
+            return res.status(400).json({ error: 'Contract address required' });
+        }
+        
+        console.log(`🔄 Refreshing bundle data for ${contract}`);
+        
+        // Clear cache for this token to force fresh fetch
+        bundleCache.delete(contract);
+        
+        // Fetch fresh data
+        const bundleData = await fetchBundleData(contract);
+        
+        res.json({
+            success: true,
+            contract: contract,
+            bundleDetection: bundleData ? {
+                isBundled: bundleData.isBundled || false,
+                bundledWallets: bundleData.bundledWallets || 0,
+                bundledHoldingPercent: bundleData.bundledHoldingPercent || null,
+                bundledBoughtPercent: bundleData.bundledBoughtPercent || null,
+                bundledPercent: bundleData.bundledHoldingPercent || bundleData.bundledPercent || null,
+                totalEarlyBuyers: bundleData.totalEarlyBuyers || 0,
+                earlyBuyersPercent: bundleData.earlyBuyersPercent || null,
+                riskLevel: bundleData.riskLevel || 'NONE',
+                summary: bundleData.summary || 'No data',
+                preMigration: bundleData.preMigration || false
+            } : null
+        });
+        
+    } catch (error) {
+        console.error('Refresh bundle error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            contract: req.params.contract
+        });
+    }
+});
+
 // Live Launches - Get graduated Pump.fun tokens (using Moralis API)
 // Track last check time to only show NEW graduations going forward
 // FIX: Start by looking back 1 hour (3600000ms) instead of starting from "now"
