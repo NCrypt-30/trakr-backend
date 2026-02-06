@@ -722,8 +722,29 @@ async function fetchBundleData(tokenMint) {
 
         console.log(`🔍 Bundle check for ${tokenMint.slice(0, 8)}...`);
 
-        // Step 1: Get the earliest transactions on this token using Helius parsed transaction API
-        // This gets us the Pump.fun buys from token creation
+        // Step 1: Get token supply using Helius RPC
+        let totalSupply = 0;
+        try {
+            const supplyResponse = await fetch(HELIUS_RPC_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    method: 'getTokenSupply',
+                    params: [tokenMint]
+                })
+            });
+            const supplyData = await supplyResponse.json();
+            if (supplyData.result?.value?.uiAmount) {
+                totalSupply = supplyData.result.value.uiAmount;
+                console.log(`   Token supply: ${totalSupply.toLocaleString()}`);
+            }
+        } catch (err) {
+            console.log(`   Could not fetch token supply: ${err.message}`);
+        }
+
+        // Step 2: Get the earliest transactions on this token using Helius parsed transaction API
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
 
@@ -745,15 +766,14 @@ async function fetchBundleData(tokenMint) {
             return { isBundled: false, bundledWallets: 0, riskLevel: 'NONE', reason: 'No early transactions found' };
         }
 
-        // Step 2: Sort by slot (ascending) to get earliest transactions first
+        // Step 3: Sort by slot (ascending) to get earliest transactions first
         transactions.sort((a, b) => (a.slot || 0) - (b.slot || 0));
 
-        // Step 3: Extract early buyers - focus on first transactions (token creation phase)
+        // Step 4: Extract early buyers - focus on first transactions (token creation phase)
         const earlyBuyers = [];
         const firstSlot = transactions[0]?.slot || 0;
         
         // Look at transactions within the first 10 slots (~4 seconds on Solana)
-        // This captures the initial creation + sniper window
         const SLOT_WINDOW = 10;
 
         for (const tx of transactions) {
@@ -766,27 +786,35 @@ async function fetchBundleData(tokenMint) {
             const buyer = tx.feePayer;
             if (!buyer) continue;
 
+            // Find the token transfer for this mint
+            const tokenTransfer = tx.tokenTransfers?.find(t => t.mint === tokenMint);
+            
             // Check if this is a buy (token transfer TO the buyer)
-            // Helius parsed transactions include tokenTransfers
-            const isBuy = tx.tokenTransfers?.some(transfer => 
-                transfer.mint === tokenMint && 
-                transfer.toUserAccount === buyer
-            ) || tx.description?.toLowerCase().includes('swap') || 
-               tx.type === 'SWAP';
+            const isBuy = (tokenTransfer && tokenTransfer.toUserAccount === buyer) || 
+                          tx.description?.toLowerCase().includes('swap') || 
+                          tx.type === 'SWAP';
 
             if (isBuy) {
+                // Get token amount - try multiple possible fields
+                let tokenAmount = 0;
+                if (tokenTransfer) {
+                    tokenAmount = tokenTransfer.tokenAmount || 
+                                  tokenTransfer.amount || 
+                                  (tokenTransfer.rawTokenAmount?.tokenAmount ? 
+                                   parseFloat(tokenTransfer.rawTokenAmount.tokenAmount) / Math.pow(10, tokenTransfer.rawTokenAmount.decimals || 6) : 0);
+                }
+                
                 earlyBuyers.push({
                     wallet: buyer,
                     slot: tx.slot,
                     signature: tx.signature,
                     slotOffset: tx.slot - firstSlot,
-                    // Try to get token amount from transfers
-                    tokenAmount: tx.tokenTransfers?.find(t => t.mint === tokenMint)?.tokenAmount || 0
+                    tokenAmount: tokenAmount
                 });
             }
         }
 
-        // Step 4: Group buyers by slot
+        // Step 5: Group buyers by slot
         const slotGroups = {};
         for (const buyer of earlyBuyers) {
             if (!slotGroups[buyer.slot]) {
@@ -795,9 +823,10 @@ async function fetchBundleData(tokenMint) {
             slotGroups[buyer.slot].push(buyer);
         }
 
-        // Step 5: Detect bundles - multiple UNIQUE wallets in the same slot
+        // Step 6: Detect bundles and calculate amounts
         let maxWalletsInSlot = 0;
         let bundleSlot = null;
+        let bundleTokenAmount = 0; // Total tokens bought by bundled wallets (same slot)
         const uniqueEarlyWallets = new Set(earlyBuyers.map(b => b.wallet));
 
         for (const [slot, buyers] of Object.entries(slotGroups)) {
@@ -805,46 +834,73 @@ async function fetchBundleData(tokenMint) {
             if (uniqueWallets.size > maxWalletsInSlot) {
                 maxWalletsInSlot = uniqueWallets.size;
                 bundleSlot = slot;
+                // Sum token amounts for this bundle slot
+                bundleTokenAmount = buyers.reduce((sum, b) => sum + (b.tokenAmount || 0), 0);
             }
         }
 
-        // Step 6: Check for wallets that bought across multiple consecutive slots
-        // (sophisticated bundlers spread across 2-3 slots to avoid simple detection)
+        // Calculate total early buyer token amount
+        const totalEarlyTokenAmount = earlyBuyers.reduce((sum, b) => sum + (b.tokenAmount || 0), 0);
         const walletsInEarlySlots = uniqueEarlyWallets.size;
 
-        // Step 7: Determine risk level
+        // Step 7: Calculate percentages
+        let bundledPercent = null;
+        let earlyBuyersPercent = null;
+        
+        if (totalSupply > 0) {
+            if (bundleTokenAmount > 0) {
+                bundledPercent = ((bundleTokenAmount / totalSupply) * 100).toFixed(1) + '%';
+            }
+            if (totalEarlyTokenAmount > 0) {
+                earlyBuyersPercent = ((totalEarlyTokenAmount / totalSupply) * 100).toFixed(1) + '%';
+            }
+        }
+
+        // Step 8: Determine risk level based on PERCENTAGE of supply owned
         let riskLevel = 'NONE';
         let isBundled = false;
+        
+        // Parse the percentage for comparison
+        const bundlePct = bundledPercent ? parseFloat(bundledPercent) : 0;
+        const earlyPct = earlyBuyersPercent ? parseFloat(earlyBuyersPercent) : 0;
 
-        if (maxWalletsInSlot >= 8 || walletsInEarlySlots >= 12) {
+        // Risk based on how much supply the bundle/early buyers control
+        if (bundlePct >= 30 || earlyPct >= 50) {
             riskLevel = 'CRITICAL';
             isBundled = true;
-        } else if (maxWalletsInSlot >= 5 || walletsInEarlySlots >= 8) {
+        } else if (bundlePct >= 20 || earlyPct >= 40) {
             riskLevel = 'HIGH';
             isBundled = true;
-        } else if (maxWalletsInSlot >= 3 || walletsInEarlySlots >= 5) {
+        } else if (bundlePct >= 10 || earlyPct >= 25) {
             riskLevel = 'MEDIUM';
             isBundled = true;
-        } else if (maxWalletsInSlot >= 2) {
+        } else if (bundlePct >= 5 || maxWalletsInSlot >= 3) {
             riskLevel = 'LOW';
-            isBundled = false; // 2 wallets in same slot could be coincidence
+            isBundled = true;
+        }
+        // If we couldn't get percentages, fall back to wallet count
+        else if (totalSupply === 0 && maxWalletsInSlot >= 5) {
+            riskLevel = 'HIGH';
+            isBundled = true;
         }
 
         const result = {
             isBundled: isBundled,
-            bundledWallets: maxWalletsInSlot,           // Max wallets in a single slot
-            totalEarlyBuyers: walletsInEarlySlots,      // Unique wallets in first ~10 slots
-            bundleSlot: bundleSlot,                      // The slot with most concentrated buys
+            bundledWallets: maxWalletsInSlot,
+            bundledPercent: bundledPercent,              // NEW: e.g. "34.2%"
+            totalEarlyBuyers: walletsInEarlySlots,
+            earlyBuyersPercent: earlyBuyersPercent,      // NEW: e.g. "52.1%"
+            bundleSlot: bundleSlot,
             slotsAnalyzed: Object.keys(slotGroups).length,
             transactionsAnalyzed: earlyBuyers.length,
             riskLevel: riskLevel,
             // Human-readable summary
             summary: isBundled 
-                ? `${maxWalletsInSlot} wallets bought in same block, ${walletsInEarlySlots} total early buyers`
+                ? `${maxWalletsInSlot} wallets${bundledPercent ? ` (${bundledPercent})` : ''} bought in same block`
                 : `Organic distribution: ${walletsInEarlySlots} buyers across ${Object.keys(slotGroups).length} blocks`
         };
 
-        console.log(`✅ Bundle check ${tokenMint.slice(0, 8)}: ${result.riskLevel} risk (${maxWalletsInSlot} same-slot, ${walletsInEarlySlots} early)`);
+        console.log(`✅ Bundle check ${tokenMint.slice(0, 8)}: ${result.riskLevel} risk (${maxWalletsInSlot} same-slot${bundledPercent ? ` = ${bundledPercent}` : ''}, ${walletsInEarlySlots} early${earlyBuyersPercent ? ` = ${earlyBuyersPercent}` : ''})`);
 
         // Cache the result
         bundleCache.set(tokenMint, { data: result, timestamp: Date.now() });
@@ -1116,7 +1172,9 @@ app.get('/api/live-launches', async (req, res) => {
                 bundleDetection: bundle ? {
                     isBundled: bundle.isBundled || false,
                     bundledWallets: bundle.bundledWallets || 0,
+                    bundledPercent: bundle.bundledPercent || null,        // NEW: e.g. "34.2%"
                     totalEarlyBuyers: bundle.totalEarlyBuyers || 0,
+                    earlyBuyersPercent: bundle.earlyBuyersPercent || null, // NEW: e.g. "52.1%"
                     riskLevel: bundle.riskLevel || 'NONE',
                     summary: bundle.summary || 'No data'
                 } : null
