@@ -584,9 +584,12 @@ async function fetchRugCheckData(contract, retryCount = 0) {
         if (data.topHolders && data.topHolders.length > 0) {
             let top10Total = 0;
             let holdersIncluded = 0;
-            const top10 = data.topHolders.slice(0, 10);
+            const TARGET_HOLDERS = 10;
             
-            for (const holder of top10) {
+            // Iterate through ALL holders until we have 10 non-LP holders
+            for (const holder of data.topHolders) {
+                if (holdersIncluded >= TARGET_HOLDERS) break;
+                
                 // Get holder percentage
                 let holderPct = holder.pct || holder.percentage || holder.percent || holder.pctOwned || 0;
                 
@@ -684,10 +687,10 @@ const HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY
 const HELIUS_API_URL = `https://api.helius.xyz/v0`;
 
 // ==========================================
-// REFRESH ENDPOINT (Top 10 holders only)
+// REFRESH ENDPOINT (Holders + Price + Liquidity)
 // ==========================================
 
-// Refresh holder data for a single token (clears cache first)
+// Refresh all data for a single token
 app.get('/api/refresh/:contract', async (req, res) => {
     try {
         const { contract } = req.params;
@@ -696,19 +699,24 @@ app.get('/api/refresh/:contract', async (req, res) => {
             return res.status(400).json({ error: 'Contract address required' });
         }
         
-        console.log(`🔄 Refreshing holder data for ${contract}`);
+        console.log(`🔄 Refreshing all data for ${contract}`);
         
         // Clear cache for this token to force fresh fetch
         rugCheckCache.delete(contract);
         
-        // Fetch fresh data
-        const rugCheckData = await fetchRugCheckData(contract);
+        // Fetch holder data and price/liquidity in parallel
+        const [rugCheckData, priceData] = await Promise.all([
+            fetchRugCheckData(contract),
+            fetchPriceAndLiquidity(contract)
+        ]);
         
         res.json({
             success: true,
             contract: contract,
             creatorPercent: rugCheckData?.creatorPercent || null,
-            top10HoldersPercent: rugCheckData?.top10Percent || null
+            top10HoldersPercent: rugCheckData?.top10Percent || null,
+            price: priceData?.price || null,
+            liquidity: priceData?.liquidity || null
         });
         
     } catch (error) {
@@ -720,6 +728,40 @@ app.get('/api/refresh/:contract', async (req, res) => {
         });
     }
 });
+
+// Helper function to fetch price and liquidity from DexScreener
+async function fetchPriceAndLiquidity(contract) {
+    try {
+        const dexUrl = `https://api.dexscreener.com/latest/dex/tokens/${contract}`;
+        const response = await fetch(dexUrl);
+        
+        if (!response.ok) {
+            console.log(`   DexScreener API error: ${response.status}`);
+            return null;
+        }
+        
+        const data = await response.json();
+        
+        if (data.pairs && data.pairs.length > 0) {
+            // Find the pair with highest liquidity
+            const bestPair = data.pairs.reduce((best, pair) => {
+                const pairLiq = pair.liquidity?.usd || 0;
+                const bestLiq = best?.liquidity?.usd || 0;
+                return pairLiq > bestLiq ? pair : best;
+            }, data.pairs[0]);
+            
+            return {
+                price: parseFloat(bestPair.priceUsd) || 0,
+                liquidity: bestPair.liquidity?.usd || 0
+            };
+        }
+        
+        return null;
+    } catch (error) {
+        console.log(`   Price fetch error: ${error.message}`);
+        return null;
+    }
+}
 
 // Live Launches - Get graduated Pump.fun tokens (using Moralis API)
 // Track last check time to only show NEW graduations going forward
