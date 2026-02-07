@@ -577,16 +577,17 @@ async function fetchRugCheckData(contract, retryCount = 0) {
         }
         
         // =====================================================
-        // TOP 10 HOLDERS - Try multiple possible formats  
+        // TOP 20 HOLDERS - Try multiple possible formats  
         // =====================================================
-        let top10Percent = null;
+        let top20Percent = null;
+        let top20Addresses = []; // Store addresses for fresh wallet check
         
         if (data.topHolders && data.topHolders.length > 0) {
-            let top10Total = 0;
+            let top20Total = 0;
             let holdersIncluded = 0;
-            const TARGET_HOLDERS = 10;
+            const TARGET_HOLDERS = 20;
             
-            // Iterate through ALL holders until we have 10 non-LP holders
+            // Iterate through ALL holders until we have 20 non-LP holders
             for (const holder of data.topHolders) {
                 if (holdersIncluded >= TARGET_HOLDERS) break;
                 
@@ -628,36 +629,43 @@ async function fetchRugCheckData(contract, retryCount = 0) {
                     continue;
                 }
                 
-                top10Total += holderPct;
+                top20Total += holderPct;
                 holdersIncluded++;
+                
+                // Store address AND percentage for fresh wallet check
+                const addr = holder.address || holder.owner;
+                if (addr) {
+                    top20Addresses.push({ address: addr, percent: holderPct });
+                }
             }
             
             // Sanity check: cap at 100%
-            if (top10Total > 100) {
-                console.warn(`   ⚠️ Top 10 total was ${top10Total.toFixed(2)}% - capping at 100%`);
-                top10Total = 100;
+            if (top20Total > 100) {
+                console.warn(`   ⚠️ Top 20 total was ${top20Total.toFixed(2)}% - capping at 100%`);
+                top20Total = 100;
             }
             
-            if (top10Total > 0) {
-                top10Percent = top10Total.toFixed(2) + '%';
-                console.log(`   ↳ Top ${holdersIncluded} holders (excl. LP): ${top10Percent}`);
+            if (top20Total > 0) {
+                top20Percent = top20Total.toFixed(2) + '%';
+                console.log(`   ↳ Top ${holdersIncluded} holders (excl. LP): ${top20Percent}`);
             }
         }
         
         // Fallback: Check pre-calculated fields
-        if (!top10Percent && data.totalTopHoldersPercent !== undefined) {
-            top10Percent = data.totalTopHoldersPercent.toFixed(2) + '%';
+        if (!top20Percent && data.totalTopHoldersPercent !== undefined) {
+            top20Percent = data.totalTopHoldersPercent.toFixed(2) + '%';
         }
-        if (!top10Percent && data.tokenMeta?.topHoldersPercent !== undefined) {
-            top10Percent = data.tokenMeta.topHoldersPercent.toFixed(2) + '%';
+        if (!top20Percent && data.tokenMeta?.topHoldersPercent !== undefined) {
+            top20Percent = data.tokenMeta.topHoldersPercent.toFixed(2) + '%';
         }
         
-        console.log(`✅ RugCheck for ${contract.slice(0, 8)}: creator=${creatorPercent}, top10=${top10Percent}`);
+        console.log(`✅ RugCheck for ${contract.slice(0, 8)}: creator=${creatorPercent}, top20=${top20Percent}`);
         
         const result = {
             score: Math.round((data.score || 0) / 10),
             topHolders: data.topHolders || null,
-            top10Percent: top10Percent,
+            top20Percent: top20Percent,
+            top20Addresses: top20Addresses,
             creator: data.creator || null,
             creatorBalance: data.creatorBalance || null,
             creatorPercent: creatorPercent,
@@ -679,15 +687,126 @@ async function fetchRugCheckData(contract, retryCount = 0) {
 }
 
 // ==========================================
-// BUNDLE DETECTION (Helius API)
+// FRESH WALLET DETECTION (Helius API)
 // ==========================================
 
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const HELIUS_API_URL = `https://api.helius.xyz/v0`;
 
+// Check if a wallet is "fresh" (< 24 hours old AND < 10 transactions)
+async function checkWalletFreshness(walletAddress) {
+    try {
+        // Get transaction signatures for this wallet (limit 10 to check count)
+        const response = await fetch(HELIUS_RPC_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'getSignaturesForAddress',
+                params: [
+                    walletAddress,
+                    { limit: 10 }
+                ]
+            })
+        });
+        
+        if (!response.ok) {
+            return { fresh: false, error: 'API error' };
+        }
+        
+        const data = await response.json();
+        const signatures = data.result || [];
+        
+        if (signatures.length === 0) {
+            // No transactions = very fresh
+            return { fresh: true, txCount: 0, ageHours: 0 };
+        }
+        
+        const txCount = signatures.length;
+        
+        // Get the oldest transaction timestamp (last in array since it's newest first)
+        // We need to make another call to get older transactions if there are exactly 10
+        let oldestTimestamp;
+        
+        if (txCount < 10) {
+            // Less than 10 transactions, oldest is last in this array
+            oldestTimestamp = signatures[signatures.length - 1]?.blockTime;
+        } else {
+            // Has 10+ transactions - not fresh by tx count
+            return { fresh: false, txCount: '10+', reason: 'too many transactions' };
+        }
+        
+        if (!oldestTimestamp) {
+            return { fresh: false, error: 'no timestamp' };
+        }
+        
+        // Calculate wallet age in hours
+        const ageMs = Date.now() - (oldestTimestamp * 1000);
+        const ageHours = ageMs / (1000 * 60 * 60);
+        
+        // Fresh = less than 24 hours old AND less than 10 transactions
+        const isFresh = ageHours < 24 && txCount < 10;
+        
+        return {
+            fresh: isFresh,
+            txCount: txCount,
+            ageHours: Math.round(ageHours * 10) / 10
+        };
+        
+    } catch (error) {
+        console.log(`   ⚠️ Fresh check error for ${walletAddress.slice(0, 8)}: ${error.message}`);
+        return { fresh: false, error: error.message };
+    }
+}
+
+// Check freshness for multiple wallets (top 20 holders)
+// walletData is array of { address, percent }
+async function checkFreshWallets(walletData) {
+    if (!walletData || walletData.length === 0) {
+        return { freshCount: 0, totalChecked: 0, freshHoldingsPercent: '0%', display: '0/0 (0%)' };
+    }
+    
+    console.log(`   🔍 Checking freshness for ${walletData.length} wallets...`);
+    
+    // Check all wallets in parallel
+    const results = await Promise.all(
+        walletData.map(async (holder) => {
+            const freshResult = await checkWalletFreshness(holder.address);
+            return {
+                ...freshResult,
+                percent: holder.percent
+            };
+        })
+    );
+    
+    // Count fresh wallets and sum their holdings
+    let freshCount = 0;
+    let freshHoldings = 0;
+    
+    for (const result of results) {
+        if (result.fresh) {
+            freshCount++;
+            freshHoldings += result.percent || 0;
+        }
+    }
+    
+    const totalChecked = walletData.length;
+    const freshHoldingsPercent = freshHoldings.toFixed(1) + '%';
+    
+    console.log(`   ✅ Fresh wallets: ${freshCount}/${totalChecked} holding ${freshHoldingsPercent}`);
+    
+    return {
+        freshCount,
+        totalChecked,
+        freshHoldingsPercent,
+        display: `${freshCount}/${totalChecked} (${freshHoldingsPercent})`
+    };
+}
+
 // ==========================================
-// REFRESH ENDPOINT (Holders + Price + Liquidity)
+// REFRESH ENDPOINT (Holders + Price + Liquidity + Fresh)
 // ==========================================
 
 // Refresh all data for a single token
@@ -710,11 +829,15 @@ app.get('/api/refresh/:contract', async (req, res) => {
             fetchPriceAndLiquidity(contract)
         ]);
         
+        // Now check fresh wallets using the top 20 addresses
+        const freshData = await checkFreshWallets(rugCheckData?.top20Addresses || []);
+        
         const response_data = {
             success: true,
             contract: contract,
             creatorPercent: rugCheckData?.creatorPercent || null,
-            top10HoldersPercent: rugCheckData?.top10Percent || null,
+            top20HoldersPercent: rugCheckData?.top20Percent || null,
+            freshWallets: freshData,
             price: priceData?.price || null,
             liquidity: priceData?.liquidity || null
         };
@@ -1171,12 +1294,14 @@ app.get('/api/live-launches', async (req, res) => {
                 graduatedAt: graduatedAt,
                 // RugCheck data
                 rugCheckScore: rugCheck?.score || 0,
-                top10HoldersPercent: rugCheck?.top10Percent || null,
+                top20HoldersPercent: rugCheck?.top20Percent || null,
+                top20Addresses: rugCheck?.top20Addresses || [],
                 creatorAddress: rugCheck?.creator || null,
                 creatorPercent: rugCheck?.creatorPercent || null,
                 creatorHasRugged: rugCheck?.creatorHasRugged || false,
                 rugCheckRisks: rugCheck?.risks || [],
-                isRugged: rugCheck?.rugged || false
+                isRugged: rugCheck?.rugged || false,
+                freshWallets: null // Populated on refresh
             };
         });
         
