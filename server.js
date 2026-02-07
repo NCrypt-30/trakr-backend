@@ -733,16 +733,22 @@ app.get('/api/refresh/:contract', async (req, res) => {
     }
 });
 
-// Helper function to fetch price and liquidity from DexScreener
+// Helper function to fetch price and liquidity from DexScreener (with Jupiter fallback)
 async function fetchPriceAndLiquidity(contract) {
+    // Try DexScreener first
     try {
         console.log(`   💰 Fetching price/liquidity for ${contract.slice(0, 8)}...`);
         const dexUrl = `https://api.dexscreener.com/latest/dex/tokens/${contract}`;
         const response = await fetch(dexUrl);
         
+        if (response.status === 429) {
+            console.log(`   ⚠️ DexScreener rate limited, trying Jupiter...`);
+            return await fetchPriceFromJupiter(contract);
+        }
+        
         if (!response.ok) {
-            console.log(`   ❌ DexScreener API error: ${response.status}`);
-            return null;
+            console.log(`   ❌ DexScreener API error: ${response.status}, trying Jupiter...`);
+            return await fetchPriceFromJupiter(contract);
         }
         
         const data = await response.json();
@@ -759,14 +765,44 @@ async function fetchPriceAndLiquidity(contract) {
                 price: parseFloat(bestPair.priceUsd) || 0,
                 liquidity: bestPair.liquidity?.usd || 0
             };
-            console.log(`   ✅ Price: $${result.price}, Liquidity: $${result.liquidity}`);
+            console.log(`   ✅ DexScreener: Price $${result.price}, Liq $${result.liquidity}`);
             return result;
         }
         
-        console.log(`   ⚠️ No pairs found for ${contract.slice(0, 8)}`);
+        console.log(`   ⚠️ No DexScreener pairs, trying Jupiter...`);
+        return await fetchPriceFromJupiter(contract);
+    } catch (error) {
+        console.log(`   ❌ DexScreener error: ${error.message}, trying Jupiter...`);
+        return await fetchPriceFromJupiter(contract);
+    }
+}
+
+// Fallback: Jupiter Price API
+async function fetchPriceFromJupiter(contract) {
+    try {
+        const jupiterUrl = `https://api.jup.ag/price/v2?ids=${contract}`;
+        const response = await fetch(jupiterUrl);
+        
+        if (!response.ok) {
+            console.log(`   ❌ Jupiter API error: ${response.status}`);
+            return null;
+        }
+        
+        const data = await response.json();
+        
+        if (data.data && data.data[contract]) {
+            const price = parseFloat(data.data[contract].price) || 0;
+            console.log(`   ✅ Jupiter: Price $${price} (no liquidity data)`);
+            return {
+                price: price,
+                liquidity: null  // Jupiter doesn't provide liquidity
+            };
+        }
+        
+        console.log(`   ⚠️ No Jupiter price data`);
         return null;
     } catch (error) {
-        console.log(`   Price fetch error: ${error.message}`);
+        console.log(`   ❌ Jupiter error: ${error.message}`);
         return null;
     }
 }
