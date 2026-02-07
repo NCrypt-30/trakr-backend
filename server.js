@@ -587,26 +587,19 @@ async function fetchRugCheckData(contract, retryCount = 0) {
         }
         
         // =====================================================
-        // TOP HOLDERS - Use RugCheck's pre-calculated value
+        // TOP HOLDERS - Sum pct values from topHolders array
         // =====================================================
         let topHoldersPercent = null;
         
-        // Use RugCheck's totalTopHoldersPercent directly
-        if (data.totalTopHoldersPercent !== undefined && data.totalTopHoldersPercent !== null) {
-            topHoldersPercent = data.totalTopHoldersPercent.toFixed(2) + '%';
-            console.log(`   ↳ Using RugCheck totalTopHoldersPercent: ${topHoldersPercent}`);
-        }
-        // Fallback to topHoldersHoldingPercentage
-        else if (data.topHoldersHoldingPercentage !== undefined) {
-            topHoldersPercent = data.topHoldersHoldingPercentage.toFixed(2) + '%';
-            console.log(`   ↳ Using RugCheck topHoldersHoldingPercentage: ${topHoldersPercent}`);
-        }
-        // Log what fields exist if we can't find it
-        else {
-            console.log(`   ⚠️ No pre-calculated top holders % found. Available fields:`);
-            console.log(`      - totalTopHoldersPercent: ${data.totalTopHoldersPercent}`);
-            console.log(`      - topHoldersHoldingPercentage: ${data.topHoldersHoldingPercentage}`);
-            console.log(`      - topHolders count: ${data.topHolders?.length}`);
+        if (data.topHolders && Array.isArray(data.topHolders) && data.topHolders.length > 0) {
+            let total = 0;
+            for (const holder of data.topHolders) {
+                // pct is already a percentage (e.g., 20.30 means 20.30%)
+                const pct = holder.pct || 0;
+                total += pct;
+            }
+            topHoldersPercent = total.toFixed(2) + '%';
+            console.log(`   ↳ Top ${data.topHolders.length} holders: ${topHoldersPercent}`);
         }
         
         console.log(`✅ RugCheck for ${contract.slice(0, 8)}: creator=${creatorPercent}, topHolders=${topHoldersPercent}`);
@@ -653,28 +646,8 @@ app.get('/api/debug/rugcheck/:contract', async (req, res) => {
         const response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`);
         const data = await response.json();
         
-        // Show raw topHolders data
-        const holders = data.topHolders || [];
-        const holdersSummary = holders.map((h, i) => ({
-            index: i,
-            address: h.address?.slice(0, 8) + '...',
-            pct: h.pct,
-            percentage: h.percentage,
-            percent: h.percent,
-            label: h.label || h.name || h.tag || 'none',
-            isLP: h.isLP,
-            isLiquidity: h.isLiquidity,
-            isAMM: h.isAMM
-        }));
-        
-        res.json({
-            totalHolders: holders.length,
-            holders: holdersSummary,
-            totalTopHoldersPercent: data.totalTopHoldersPercent,
-            topHoldersHoldingPercentage: data.topHoldersHoldingPercentage,
-            allTopLevelKeys: Object.keys(data),
-            rawFirstHolder: holders[0] // Full raw data of first holder
-        });
+        // Return the FULL raw response so we can see all fields
+        res.json(data);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
