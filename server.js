@@ -710,14 +710,18 @@ app.get('/api/refresh/:contract', async (req, res) => {
             fetchPriceAndLiquidity(contract)
         ]);
         
-        res.json({
+        const response_data = {
             success: true,
             contract: contract,
             creatorPercent: rugCheckData?.creatorPercent || null,
             top10HoldersPercent: rugCheckData?.top10Percent || null,
             price: priceData?.price || null,
             liquidity: priceData?.liquidity || null
-        });
+        };
+        
+        console.log(`🔄 Refresh response for ${contract.slice(0, 8)}:`, JSON.stringify(response_data));
+        
+        res.json(response_data);
         
     } catch (error) {
         console.error('Refresh error:', error);
@@ -732,11 +736,12 @@ app.get('/api/refresh/:contract', async (req, res) => {
 // Helper function to fetch price and liquidity from DexScreener
 async function fetchPriceAndLiquidity(contract) {
     try {
+        console.log(`   💰 Fetching price/liquidity for ${contract.slice(0, 8)}...`);
         const dexUrl = `https://api.dexscreener.com/latest/dex/tokens/${contract}`;
         const response = await fetch(dexUrl);
         
         if (!response.ok) {
-            console.log(`   DexScreener API error: ${response.status}`);
+            console.log(`   ❌ DexScreener API error: ${response.status}`);
             return null;
         }
         
@@ -750,12 +755,15 @@ async function fetchPriceAndLiquidity(contract) {
                 return pairLiq > bestLiq ? pair : best;
             }, data.pairs[0]);
             
-            return {
+            const result = {
                 price: parseFloat(bestPair.priceUsd) || 0,
                 liquidity: bestPair.liquidity?.usd || 0
             };
+            console.log(`   ✅ Price: $${result.price}, Liquidity: $${result.liquidity}`);
+            return result;
         }
         
+        console.log(`   ⚠️ No pairs found for ${contract.slice(0, 8)}`);
         return null;
     } catch (error) {
         console.log(`   Price fetch error: ${error.message}`);
