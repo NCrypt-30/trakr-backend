@@ -683,340 +683,12 @@ const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const HELIUS_API_URL = `https://api.helius.xyz/v0`;
 
-// Cache for bundle data (same TTL as RugCheck)
-const bundleCache = new Map();
-const BUNDLE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-
-// Clean up old bundle cache entries every 10 minutes
-setInterval(() => {
-    const now = Date.now();
-    let cleaned = 0;
-    for (const [key, value] of bundleCache.entries()) {
-        if (now - value.timestamp > BUNDLE_CACHE_TTL) {
-            bundleCache.delete(key);
-            cleaned++;
-        }
-    }
-    if (cleaned > 0) {
-        console.log(`🧹 Cleaned ${cleaned} expired bundle cache entries`);
-    }
-}, 10 * 60 * 1000);
-
-// Pump.fun program ID
-const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
-
-// Fetch bundle detection data for a token
-async function fetchBundleData(tokenMint) {
-    try {
-        if (!HELIUS_API_KEY) {
-            console.log('⚠️ HELIUS_API_KEY not set - skipping bundle detection');
-            return null;
-        }
-
-        // Check cache first
-        const cached = bundleCache.get(tokenMint);
-        if (cached && (Date.now() - cached.timestamp < BUNDLE_CACHE_TTL)) {
-            console.log(`📦 Bundle cache hit for ${tokenMint.slice(0, 8)}`);
-            return cached.data;
-        }
-
-        console.log(`🔍 Bundle check (Padre-style) for ${tokenMint.slice(0, 8)}...`);
-
-        // Pump.fun program ID - this is where bonding curve buys happen
-        const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
-        
-        // Step 1: Get token supply using Helius RPC
-        let totalSupply = 1000000000; // Pump.fun tokens are always 1B supply
-        try {
-            const supplyResponse = await fetch(HELIUS_RPC_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    jsonrpc: '2.0',
-                    id: 1,
-                    method: 'getTokenSupply',
-                    params: [tokenMint]
-                })
-            });
-            const supplyData = await supplyResponse.json();
-            if (supplyData.result?.value?.uiAmount) {
-                totalSupply = supplyData.result.value.uiAmount;
-            }
-        } catch (err) {
-            console.log(`   Using default 1B supply`);
-        }
-
-        // Step 2: Get ALL transactions for this token (not just SWAP)
-        // This gets us the bonding curve buys from Pump.fun BEFORE migration
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15000);
-
-        const response = await fetch(
-            `${HELIUS_API_URL}/addresses/${tokenMint}/transactions?api-key=${HELIUS_API_KEY}&limit=100`,
-            { signal: controller.signal }
-        );
-        clearTimeout(timeout);
-
-        if (!response.ok) {
-            console.log(`⚠️ Helius API ${response.status} for ${tokenMint.slice(0, 8)}`);
-            return null;
-        }
-
-        const transactions = await response.json();
-
-        if (!transactions || transactions.length === 0) {
-            console.log(`   No transactions found for ${tokenMint.slice(0, 8)}`);
-            return { isBundled: false, bundledWallets: 0, riskLevel: 'NONE', reason: 'No transactions found' };
-        }
-
-        // Step 3: Sort by slot (ascending) to get earliest transactions first
-        transactions.sort((a, b) => (a.slot || 0) - (b.slot || 0));
-
-        // Step 4: Find the migration slot (when token left Pump.fun)
-        // Migration is indicated by interaction with Raydium or large liquidity add
-        let migrationSlot = Infinity;
-        const RAYDIUM_PROGRAMS = [
-            '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium AMM
-            'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', // Raydium CLMM
-        ];
-        
-        for (const tx of transactions) {
-            // Check if this transaction involves Raydium (migration)
-            const involvesRaydium = tx.accountData?.some(acc => RAYDIUM_PROGRAMS.includes(acc.account)) ||
-                                   tx.instructions?.some(ix => RAYDIUM_PROGRAMS.includes(ix.programId));
-            if (involvesRaydium && tx.slot) {
-                migrationSlot = tx.slot;
-                console.log(`   Found migration at slot ${migrationSlot}`);
-                break;
-            }
-        }
-
-        // Step 5: Extract PRE-MIGRATION buys (Padre-style)
-        // Only look at Pump.fun bonding curve buys BEFORE the Raydium migration
-        const preMigrationBuyers = [];
-        const firstSlot = transactions[0]?.slot || 0;
-
-        for (const tx of transactions) {
-            if (!tx.slot) continue;
-            
-            // CRITICAL: Only look at transactions BEFORE migration
-            // This is the key difference from our old approach
-            if (tx.slot >= migrationSlot) continue;
-
-            // Check if this involves Pump.fun program (bonding curve)
-            const involvesPumpFun = tx.accountData?.some(acc => acc.account === PUMP_FUN_PROGRAM) ||
-                                   tx.instructions?.some(ix => ix.programId === PUMP_FUN_PROGRAM) ||
-                                   tx.source === 'PUMP_FUN';
-
-            // Get the fee payer (buyer wallet)
-            const buyer = tx.feePayer;
-            if (!buyer) continue;
-
-            // Find token transfer for this mint
-            const tokenTransfer = tx.tokenTransfers?.find(t => t.mint === tokenMint);
-            
-            // Check if this is a buy (token going TO the buyer)
-            const isBuy = tokenTransfer && (
-                tokenTransfer.toUserAccount === buyer ||
-                tx.description?.toLowerCase().includes('buy') ||
-                tx.type === 'SWAP' ||
-                involvesPumpFun
-            );
-
-            if (isBuy && tokenTransfer) {
-                // Get token amount
-                let tokenAmount = tokenTransfer.tokenAmount || 
-                                  tokenTransfer.amount || 
-                                  (tokenTransfer.rawTokenAmount?.tokenAmount ? 
-                                   parseFloat(tokenTransfer.rawTokenAmount.tokenAmount) / Math.pow(10, tokenTransfer.rawTokenAmount.decimals || 6) : 0);
-                
-                if (tokenAmount > 0) {
-                    preMigrationBuyers.push({
-                        wallet: buyer,
-                        slot: tx.slot,
-                        signature: tx.signature,
-                        slotOffset: tx.slot - firstSlot,
-                        tokenAmount: tokenAmount,
-                        isPumpFun: involvesPumpFun
-                    });
-                }
-            }
-        }
-
-        console.log(`   Found ${preMigrationBuyers.length} pre-migration buys (before slot ${migrationSlot})`);
-
-        // Step 6: Group buyers by slot (same-slot = bundled)
-        const slotGroups = {};
-        for (const buyer of preMigrationBuyers) {
-            if (!slotGroups[buyer.slot]) {
-                slotGroups[buyer.slot] = [];
-            }
-            slotGroups[buyer.slot].push(buyer);
-        }
-
-        // Step 7: Detect bundles - find slots with multiple unique wallets
-        let maxWalletsInSlot = 0;
-        let bundleSlot = null;
-        let bundleTokenAmount = 0;
-        let bundledWallets = new Set(); // Track ALL wallets that participated in bundles
-
-        for (const [slot, buyers] of Object.entries(slotGroups)) {
-            const uniqueWallets = new Set(buyers.map(b => b.wallet));
-            
-            // 2+ wallets in same slot = bundle (Padre's definition)
-            if (uniqueWallets.size >= 2) {
-                // Add these wallets to bundled set
-                uniqueWallets.forEach(w => bundledWallets.add(w));
-                
-                // Track the largest bundle
-                if (uniqueWallets.size > maxWalletsInSlot) {
-                    maxWalletsInSlot = uniqueWallets.size;
-                    bundleSlot = slot;
-                    bundleTokenAmount = buyers.reduce((sum, b) => sum + (b.tokenAmount || 0), 0);
-                }
-            }
-        }
-
-        // Step 8: Get CURRENT holdings of bundled wallets (Padre-style)
-        // This is the key difference - Padre shows what they HOLD NOW, not what they BOUGHT
-        let currentBundledHoldings = 0;
-        
-        if (bundledWallets.size > 0) {
-            console.log(`   Checking current holdings of ${bundledWallets.size} bundled wallets...`);
-            
-            // Get current token accounts for each bundled wallet
-            const TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
-            
-            for (const wallet of bundledWallets) {
-                try {
-                    const tokenAccountsResponse = await fetch(HELIUS_RPC_URL, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            jsonrpc: '2.0',
-                            id: 1,
-                            method: 'getTokenAccountsByOwner',
-                            params: [
-                                wallet,
-                                { mint: tokenMint },
-                                { encoding: 'jsonParsed' }
-                            ]
-                        })
-                    });
-                    
-                    const tokenData = await tokenAccountsResponse.json();
-                    
-                    if (tokenData.result?.value?.length > 0) {
-                        for (const account of tokenData.result.value) {
-                            const balance = account.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0;
-                            currentBundledHoldings += balance;
-                        }
-                    }
-                } catch (err) {
-                    // Skip wallet if we can't fetch balance
-                    console.log(`   Could not fetch balance for ${wallet.slice(0, 8)}`);
-                }
-            }
-            
-            console.log(`   Bundled wallets currently hold: ${currentBundledHoldings.toLocaleString()} tokens`);
-        }
-
-        // Calculate what they originally bought (for comparison)
-        let totalBundledBought = 0;
-        for (const buyer of preMigrationBuyers) {
-            if (bundledWallets.has(buyer.wallet)) {
-                totalBundledBought += buyer.tokenAmount || 0;
-            }
-        }
-
-        // Also calculate total from early buyers
-        const uniqueEarlyWallets = new Set(preMigrationBuyers.map(b => b.wallet));
-        const totalEarlyTokenAmount = preMigrationBuyers.reduce((sum, b) => sum + (b.tokenAmount || 0), 0);
-
-        // Step 9: Calculate percentages - use CURRENT holdings like Padre
-        let bundledHoldingPercent = null;  // What they HOLD NOW (Padre-style)
-        let bundledBoughtPercent = null;   // What they BOUGHT (for reference)
-        let earlyBuyersPercent = null;
-        
-        if (totalSupply > 0) {
-            if (currentBundledHoldings > 0) {
-                bundledHoldingPercent = ((currentBundledHoldings / totalSupply) * 100).toFixed(1) + '%';
-            }
-            if (totalBundledBought > 0) {
-                bundledBoughtPercent = ((totalBundledBought / totalSupply) * 100).toFixed(1) + '%';
-            }
-            if (totalEarlyTokenAmount > 0) {
-                earlyBuyersPercent = ((totalEarlyTokenAmount / totalSupply) * 100).toFixed(1) + '%';
-            }
-        }
-
-        // Step 10: Determine risk level based on CURRENT holdings (Padre-style)
-        let riskLevel = 'NONE';
-        let isBundled = false;
-        
-        // Use current holdings for risk assessment
-        const holdingPct = bundledHoldingPercent ? parseFloat(bundledHoldingPercent) : 0;
-        const earlyPct = earlyBuyersPercent ? parseFloat(earlyBuyersPercent) : 0;
-
-        // Risk based on bundled wallet CURRENT holdings (Padre-style)
-        if (holdingPct >= 30 || earlyPct >= 50) {
-            riskLevel = 'CRITICAL';
-            isBundled = true;
-        } else if (holdingPct >= 20 || earlyPct >= 40) {
-            riskLevel = 'HIGH';
-            isBundled = true;
-        } else if (holdingPct >= 10 || earlyPct >= 25) {
-            riskLevel = 'MEDIUM';
-            isBundled = true;
-        } else if (holdingPct >= 5 || bundledWallets.size >= 3) {
-            riskLevel = 'LOW';
-            isBundled = true;
-        } else if (bundledWallets.size >= 2) {
-            riskLevel = 'LOW';
-            isBundled = true;
-        }
-
-        const result = {
-            isBundled: isBundled,
-            bundledWallets: bundledWallets.size,              // Total wallets in ALL bundles
-            bundledHoldingPercent: bundledHoldingPercent,     // CURRENT holdings (Padre-style)
-            bundledBoughtPercent: bundledBoughtPercent,       // What they originally bought
-            totalEarlyBuyers: uniqueEarlyWallets.size,
-            earlyBuyersPercent: earlyBuyersPercent,
-            bundleSlot: bundleSlot,
-            maxWalletsInSingleBundle: maxWalletsInSlot,
-            slotsAnalyzed: Object.keys(slotGroups).length,
-            transactionsAnalyzed: preMigrationBuyers.length,
-            riskLevel: riskLevel,
-            preMigration: true,
-            // Summary shows CURRENT holdings like Padre
-            summary: isBundled 
-                ? `${bundledWallets.size} bundled wallets${bundledHoldingPercent ? ` holding ${bundledHoldingPercent}` : ''}${bundledBoughtPercent ? ` (bought ${bundledBoughtPercent})` : ''}`
-                : `Organic: ${uniqueEarlyWallets.size} buyers, no same-slot bundles detected`
-        };
-
-        console.log(`✅ Bundle (Padre-style) ${tokenMint.slice(0, 8)}: ${result.riskLevel} risk | ${bundledWallets.size} bundled wallets holding ${bundledHoldingPercent || '0%'} (bought ${bundledBoughtPercent || '0%'})`);
-
-        // Cache the result
-        bundleCache.set(tokenMint, { data: result, timestamp: Date.now() });
-
-        return result;
-
-    } catch (error) {
-        if (error.name === 'AbortError') {
-            console.log(`⚠️ Bundle check timeout for ${tokenMint.slice(0, 8)}`);
-        } else {
-            console.log(`⚠️ Bundle check error for ${tokenMint.slice(0, 8)}:`, error.message);
-        }
-        return null;
-    }
-}
-
 // ==========================================
-// BUNDLE DETECTION DEBUG ENDPOINT
+// REFRESH ENDPOINT (Top 10 holders only)
 // ==========================================
 
-app.get('/api/debug/bundle/:contract', async (req, res) => {
+// Refresh holder data for a single token (clears cache first)
+app.get('/api/refresh/:contract', async (req, res) => {
     try {
         const { contract } = req.params;
         
@@ -1024,61 +696,23 @@ app.get('/api/debug/bundle/:contract', async (req, res) => {
             return res.status(400).json({ error: 'Contract address required' });
         }
         
-        console.log(`🔍 Debug: Fetching bundle data for ${contract}`);
-        
-        const bundleData = await fetchBundleData(contract);
-        
-        res.json({
-            success: true,
-            contract: contract,
-            bundle: bundleData
-        });
-        
-    } catch (error) {
-        console.error('Debug bundle error:', error);
-        res.status(500).json({
-            error: error.message,
-            contract: req.params.contract
-        });
-    }
-});
-
-// Refresh bundle data for a single token (clears cache first)
-app.get('/api/refresh-bundle/:contract', async (req, res) => {
-    try {
-        const { contract } = req.params;
-        
-        if (!contract) {
-            return res.status(400).json({ error: 'Contract address required' });
-        }
-        
-        console.log(`🔄 Refreshing bundle data for ${contract}`);
+        console.log(`🔄 Refreshing holder data for ${contract}`);
         
         // Clear cache for this token to force fresh fetch
-        bundleCache.delete(contract);
+        rugCheckCache.delete(contract);
         
         // Fetch fresh data
-        const bundleData = await fetchBundleData(contract);
+        const rugCheckData = await fetchRugCheckData(contract);
         
         res.json({
             success: true,
             contract: contract,
-            bundleDetection: bundleData ? {
-                isBundled: bundleData.isBundled || false,
-                bundledWallets: bundleData.bundledWallets || 0,
-                bundledHoldingPercent: bundleData.bundledHoldingPercent || null,
-                bundledBoughtPercent: bundleData.bundledBoughtPercent || null,
-                bundledPercent: bundleData.bundledHoldingPercent || bundleData.bundledPercent || null,
-                totalEarlyBuyers: bundleData.totalEarlyBuyers || 0,
-                earlyBuyersPercent: bundleData.earlyBuyersPercent || null,
-                riskLevel: bundleData.riskLevel || 'NONE',
-                summary: bundleData.summary || 'No data',
-                preMigration: bundleData.preMigration || false
-            } : null
+            creatorPercent: rugCheckData?.creatorPercent || null,
+            top10HoldersPercent: rugCheckData?.top10Percent || null
         });
         
     } catch (error) {
-        console.error('Refresh bundle error:', error);
+        console.error('Refresh error:', error);
         res.status(500).json({
             success: false,
             error: error.message,
@@ -1394,36 +1028,22 @@ app.get('/api/live-launches', async (req, res) => {
         }
         
         // ========================================
-        // 6. FETCH RUGCHECK + BUNDLE DATA
+        // 6. FETCH RUGCHECK DATA
         // ========================================
-        console.log(`📊 Fetching RugCheck + Bundle data for ${allNewTokens.length} tokens...`);
+        console.log(`📊 Fetching RugCheck data for ${allNewTokens.length} tokens...`);
         const rugCheckMap = new Map();
-        const bundleMap = new Map();
-        
-        // Bundle checks in parallel
-        const bundlePromises = allNewTokens.map(async (token) => {
-            try {
-                const bundleData = await fetchBundleData(token._address);
-                bundleMap.set(token._address, bundleData);
-            } catch (err) {
-                bundleMap.set(token._address, null);
-            }
-        });
         
         // RugCheck sequential
-        const rugCheckPromise = (async () => {
-            for (const token of allNewTokens) {
-                try {
-                    const rugCheckData = await fetchRugCheckData(token._address);
-                    rugCheckMap.set(token._address, rugCheckData);
-                } catch (err) {
-                    rugCheckMap.set(token._address, null);
-                }
+        for (const token of allNewTokens) {
+            try {
+                const rugCheckData = await fetchRugCheckData(token._address);
+                rugCheckMap.set(token._address, rugCheckData);
+            } catch (err) {
+                rugCheckMap.set(token._address, null);
             }
-        })();
+        }
         
-        await Promise.all([rugCheckPromise, ...bundlePromises]);
-        console.log(`✅ RugCheck + Bundle complete`);
+        console.log(`✅ RugCheck complete`);
         
         // ========================================
         // 7. FORMAT FINAL RESULTS
@@ -1432,7 +1052,6 @@ app.get('/api/live-launches', async (req, res) => {
             const address = token._address;
             const graduatedAt = token._graduatedAt;
             const rugCheck = rugCheckMap.get(address);
-            const bundle = bundleMap.get(address);
             const source = token._source;
             
             const ageMinutes = graduatedAt 
@@ -1471,20 +1090,7 @@ app.get('/api/live-launches', async (req, res) => {
                 creatorPercent: rugCheck?.creatorPercent || null,
                 creatorHasRugged: rugCheck?.creatorHasRugged || false,
                 rugCheckRisks: rugCheck?.risks || [],
-                isRugged: rugCheck?.rugged || false,
-                // Bundle Detection data (Padre-style: shows CURRENT holdings)
-                bundleDetection: bundle ? {
-                    isBundled: bundle.isBundled || false,
-                    bundledWallets: bundle.bundledWallets || 0,
-                    bundledHoldingPercent: bundle.bundledHoldingPercent || null,  // CURRENT holdings (Padre-style)
-                    bundledBoughtPercent: bundle.bundledBoughtPercent || null,    // What they originally bought
-                    bundledPercent: bundle.bundledHoldingPercent || bundle.bundledPercent || null, // Backward compat
-                    totalEarlyBuyers: bundle.totalEarlyBuyers || 0,
-                    earlyBuyersPercent: bundle.earlyBuyersPercent || null,
-                    riskLevel: bundle.riskLevel || 'NONE',
-                    summary: bundle.summary || 'No data',
-                    preMigration: bundle.preMigration || false
-                } : null
+                isRugged: rugCheck?.rugged || false
             };
         });
         
