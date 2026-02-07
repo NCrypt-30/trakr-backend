@@ -583,6 +583,7 @@ async function fetchRugCheckData(contract, retryCount = 0) {
         let top20Addresses = []; // Store addresses for fresh wallet check
         
         if (data.topHolders && data.topHolders.length > 0) {
+            console.log(`   ↳ RugCheck returned ${data.topHolders.length} holders`);
             let top20Total = 0;
             let holdersIncluded = 0;
             const TARGET_HOLDERS = 20;
@@ -647,7 +648,7 @@ async function fetchRugCheckData(contract, retryCount = 0) {
             
             if (top20Total > 0) {
                 top20Percent = top20Total.toFixed(2) + '%';
-                console.log(`   ↳ Top ${holdersIncluded} holders (excl. LP): ${top20Percent}`);
+                console.log(`   ↳ Got ${holdersIncluded} holders (excl. LP), addresses: ${top20Addresses.length}`);
             }
         }
         
@@ -1255,12 +1256,37 @@ app.get('/api/live-launches', async (req, res) => {
         console.log(`✅ RugCheck complete`);
         
         // ========================================
+        // 6b. FETCH FRESH WALLET DATA
+        // ========================================
+        console.log(`🔍 Checking fresh wallets for ${allNewTokens.length} tokens...`);
+        const freshWalletMap = new Map();
+        
+        // Check fresh wallets in parallel for all tokens
+        await Promise.all(allNewTokens.map(async (token) => {
+            try {
+                const rugCheck = rugCheckMap.get(token._address);
+                if (rugCheck?.top20Addresses && rugCheck.top20Addresses.length > 0) {
+                    const freshData = await checkFreshWallets(rugCheck.top20Addresses);
+                    freshWalletMap.set(token._address, freshData);
+                } else {
+                    freshWalletMap.set(token._address, null);
+                }
+            } catch (err) {
+                console.log(`   ⚠️ Fresh check failed for ${token._address.slice(0, 8)}: ${err.message}`);
+                freshWalletMap.set(token._address, null);
+            }
+        }));
+        
+        console.log(`✅ Fresh wallet check complete`);
+        
+        // ========================================
         // 7. FORMAT FINAL RESULTS
         // ========================================
         const formatted = allNewTokens.map(token => {
             const address = token._address;
             const graduatedAt = token._graduatedAt;
             const rugCheck = rugCheckMap.get(address);
+            const freshWallets = freshWalletMap.get(address);
             const source = token._source;
             
             const ageMinutes = graduatedAt 
@@ -1301,7 +1327,7 @@ app.get('/api/live-launches', async (req, res) => {
                 creatorHasRugged: rugCheck?.creatorHasRugged || false,
                 rugCheckRisks: rugCheck?.risks || [],
                 isRugged: rugCheck?.rugged || false,
-                freshWallets: null // Populated on refresh
+                freshWallets: freshWallets || null
             };
         });
         
