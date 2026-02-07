@@ -511,9 +511,11 @@ async function fetchRugCheckData(contract, retryCount = 0) {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
         
+        console.log(`🔍 CALLING RUGCHECK API for ${contract}`);
         let response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`, {
             signal: controller.signal
         });
+        console.log(`🔍 RUGCHECK RESPONSE: ${response.status} for ${contract.slice(0, 8)}`);
         clearTimeout(timeout);
         
         // Handle rate limiting (429) - retry with exponential backoff
@@ -536,6 +538,14 @@ async function fetchRugCheckData(contract, retryCount = 0) {
         }
         
         const data = await response.json();
+        
+        // DEBUG: Log raw holder data
+        console.log(`📊 RugCheck raw data for ${contract.slice(0, 8)}:`);
+        console.log(`   - topHolders count: ${data.topHolders?.length || 0}`);
+        console.log(`   - totalTopHoldersPercent: ${data.totalTopHoldersPercent}`);
+        if (data.topHolders && data.topHolders.length > 0) {
+            console.log(`   - First holder: pct=${data.topHolders[0].pct}, label=${data.topHolders[0].label || 'none'}`);
+        }
         
         // Check if creator has rugged before (look in risks array)
         const creatorRugRisk = data.risks?.find(r => 
@@ -577,21 +587,15 @@ async function fetchRugCheckData(contract, retryCount = 0) {
         }
         
         // =====================================================
-        // TOP 20 HOLDERS - Try multiple possible formats  
+        // TOP HOLDERS - Sum of top 20 holders excluding LP
         // =====================================================
-        let top20Percent = null;
-        let top20Addresses = []; // Store addresses for fresh wallet check
+        let topHoldersPercent = null;
         
-        if (data.topHolders && data.topHolders.length > 0) {
-            console.log(`   ↳ RugCheck returned ${data.topHolders.length} holders`);
-            let top20Total = 0;
-            let holdersIncluded = 0;
-            const TARGET_HOLDERS = 20;
+        if (data.topHolders && Array.isArray(data.topHolders)) {
+            let total = 0;
+            let count = 0;
             
-            // Iterate through ALL holders until we have 20 non-LP holders
             for (const holder of data.topHolders) {
-                if (holdersIncluded >= TARGET_HOLDERS) break;
-                
                 // Get holder percentage
                 let holderPct = holder.pct || holder.percentage || holder.percent || holder.pctOwned || 0;
                 
@@ -600,73 +604,46 @@ async function fetchRugCheckData(contract, retryCount = 0) {
                     holderPct = holderPct * 100;
                 }
                 
-                // Build searchable string from all possible fields
-                const searchStr = [
-                    holder.address,
-                    holder.owner,
-                    holder.label,
-                    holder.name,
-                    holder.tag,
-                    holder.type
-                ].filter(Boolean).join(' ').toLowerCase();
-                
-                // Skip LP/AMM addresses (Pump.fun, Raydium, Orca, Meteora, etc.)
-                const isLP = holder.isLP || 
-                    holder.isLiquidity ||
-                    holder.isAMM ||
-                    searchStr.includes('pump') ||
-                    searchStr.includes('amm') ||
-                    searchStr.includes('lp') ||
-                    searchStr.includes('liquidity') ||
-                    searchStr.includes('raydium') ||
-                    searchStr.includes('orca') ||
-                    searchStr.includes('meteora') ||
-                    searchStr.includes('bonding') ||
-                    // Skip if holder has >50% (almost certainly LP/AMM)
-                    holderPct > 50;
+                // Skip if this looks like LP (RugCheck usually labels these)
+                const isInsider = holder.insider === true;
+                const label = (holder.label || holder.name || holder.tag || '').toLowerCase();
+                const isLP = label.includes('raydium') || 
+                             label.includes('amm') || 
+                             label.includes('liquidity') ||
+                             label.includes('pool') ||
+                             label.includes('bonding');
                 
                 if (isLP) {
-                    console.log(`   ↳ Skipping LP/AMM: ${holder.address?.slice(0, 8) || 'unknown'} (${holderPct.toFixed(2)}%)`);
+                    console.log(`   ↳ Skipping LP: ${holder.address?.slice(0, 8) || 'unknown'} (${holderPct.toFixed(2)}%) - ${label}`);
                     continue;
                 }
                 
-                top20Total += holderPct;
-                holdersIncluded++;
+                console.log(`   ↳ Counting #${count + 1}: ${holder.address?.slice(0, 8) || 'unknown'} = ${holderPct.toFixed(2)}%`);
+                total += holderPct;
+                count++;
                 
-                // Store address AND percentage for fresh wallet check
-                const addr = holder.address || holder.owner;
-                if (addr) {
-                    top20Addresses.push({ address: addr, percent: holderPct });
-                }
+                // Count up to 20 non-LP holders to match RugCheck
+                if (count >= 20) break;
             }
             
-            // Sanity check: cap at 100%
-            if (top20Total > 100) {
-                console.warn(`   ⚠️ Top 20 total was ${top20Total.toFixed(2)}% - capping at 100%`);
-                top20Total = 100;
-            }
-            
-            if (top20Total > 0) {
-                top20Percent = top20Total.toFixed(2) + '%';
-                console.log(`   ↳ Got ${holdersIncluded} holders (excl. LP), addresses: ${top20Addresses.length}`);
+            if (total > 0) {
+                topHoldersPercent = total.toFixed(2) + '%';
+                console.log(`   ↳ Top ${count} holders (excl. LP): ${topHoldersPercent}`);
             }
         }
         
-        // Fallback: Check pre-calculated fields
-        if (!top20Percent && data.totalTopHoldersPercent !== undefined) {
-            top20Percent = data.totalTopHoldersPercent.toFixed(2) + '%';
-        }
-        if (!top20Percent && data.tokenMeta?.topHoldersPercent !== undefined) {
-            top20Percent = data.tokenMeta.topHoldersPercent.toFixed(2) + '%';
+        // Fallback: Check pre-calculated fields from RugCheck API
+        if (!topHoldersPercent && data.totalTopHoldersPercent !== undefined) {
+            topHoldersPercent = data.totalTopHoldersPercent.toFixed(2) + '%';
+            console.log(`   ↳ Using RugCheck pre-calculated: ${topHoldersPercent}`);
         }
         
-        console.log(`✅ RugCheck for ${contract.slice(0, 8)}: creator=${creatorPercent}, top20=${top20Percent}`);
+        console.log(`✅ RugCheck for ${contract.slice(0, 8)}: creator=${creatorPercent}, topHolders=${topHoldersPercent}`);
         
         const result = {
             score: Math.round((data.score || 0) / 10),
             topHolders: data.topHolders || null,
-            top20Percent: top20Percent,
-            top20Addresses: top20Addresses,
+            topHoldersPercent: topHoldersPercent,
             creator: data.creator || null,
             creatorBalance: data.creatorBalance || null,
             creatorPercent: creatorPercent,
@@ -695,119 +672,43 @@ const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const HELIUS_API_URL = `https://api.helius.xyz/v0`;
 
-// Check if a wallet is "fresh" (< 24 hours old AND < 10 transactions)
-async function checkWalletFreshness(walletAddress) {
+// ==========================================
+// DEBUG ENDPOINT - See raw RugCheck data
+// ==========================================
+app.get('/api/debug/rugcheck/:contract', async (req, res) => {
     try {
-        // Get transaction signatures for this wallet (limit 10 to check count)
-        const response = await fetch(HELIUS_RPC_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                jsonrpc: '2.0',
-                id: 1,
-                method: 'getSignaturesForAddress',
-                params: [
-                    walletAddress,
-                    { limit: 10 }
-                ]
-            })
-        });
+        const { contract } = req.params;
         
-        if (!response.ok) {
-            return { fresh: false, error: 'API error' };
-        }
-        
+        const response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`);
         const data = await response.json();
-        const signatures = data.result || [];
         
-        if (signatures.length === 0) {
-            // No transactions = very fresh
-            return { fresh: true, txCount: 0, ageHours: 0 };
-        }
+        // Show raw topHolders data
+        const holders = data.topHolders || [];
+        const holdersSummary = holders.map((h, i) => ({
+            index: i,
+            address: h.address?.slice(0, 8) + '...',
+            pct: h.pct,
+            percentage: h.percentage,
+            percent: h.percent,
+            label: h.label || h.name || h.tag || 'none',
+            isLP: h.isLP,
+            isLiquidity: h.isLiquidity,
+            isAMM: h.isAMM
+        }));
         
-        const txCount = signatures.length;
-        
-        // Get the oldest transaction timestamp (last in array since it's newest first)
-        // We need to make another call to get older transactions if there are exactly 10
-        let oldestTimestamp;
-        
-        if (txCount < 10) {
-            // Less than 10 transactions, oldest is last in this array
-            oldestTimestamp = signatures[signatures.length - 1]?.blockTime;
-        } else {
-            // Has 10+ transactions - not fresh by tx count
-            return { fresh: false, txCount: '10+', reason: 'too many transactions' };
-        }
-        
-        if (!oldestTimestamp) {
-            return { fresh: false, error: 'no timestamp' };
-        }
-        
-        // Calculate wallet age in hours
-        const ageMs = Date.now() - (oldestTimestamp * 1000);
-        const ageHours = ageMs / (1000 * 60 * 60);
-        
-        // Fresh = less than 24 hours old AND less than 10 transactions
-        const isFresh = ageHours < 24 && txCount < 10;
-        
-        return {
-            fresh: isFresh,
-            txCount: txCount,
-            ageHours: Math.round(ageHours * 10) / 10
-        };
-        
+        res.json({
+            totalHolders: holders.length,
+            holders: holdersSummary,
+            totalTopHoldersPercent: data.totalTopHoldersPercent,
+            rawFirstHolder: holders[0] // Full raw data of first holder
+        });
     } catch (error) {
-        console.log(`   ⚠️ Fresh check error for ${walletAddress.slice(0, 8)}: ${error.message}`);
-        return { fresh: false, error: error.message };
+        res.status(500).json({ error: error.message });
     }
-}
-
-// Check freshness for multiple wallets (top 20 holders)
-// walletData is array of { address, percent }
-async function checkFreshWallets(walletData) {
-    if (!walletData || walletData.length === 0) {
-        return { freshCount: 0, totalChecked: 0, freshHoldingsPercent: '0%', display: '0/0 (0%)' };
-    }
-    
-    console.log(`   🔍 Checking freshness for ${walletData.length} wallets...`);
-    
-    // Check all wallets in parallel
-    const results = await Promise.all(
-        walletData.map(async (holder) => {
-            const freshResult = await checkWalletFreshness(holder.address);
-            return {
-                ...freshResult,
-                percent: holder.percent
-            };
-        })
-    );
-    
-    // Count fresh wallets and sum their holdings
-    let freshCount = 0;
-    let freshHoldings = 0;
-    
-    for (const result of results) {
-        if (result.fresh) {
-            freshCount++;
-            freshHoldings += result.percent || 0;
-        }
-    }
-    
-    const totalChecked = walletData.length;
-    const freshHoldingsPercent = freshHoldings.toFixed(1) + '%';
-    
-    console.log(`   ✅ Fresh wallets: ${freshCount}/${totalChecked} holding ${freshHoldingsPercent}`);
-    
-    return {
-        freshCount,
-        totalChecked,
-        freshHoldingsPercent,
-        display: `${freshCount}/${totalChecked} (${freshHoldingsPercent})`
-    };
-}
+});
 
 // ==========================================
-// REFRESH ENDPOINT (Holders + Price + Liquidity + Fresh)
+// REFRESH ENDPOINT (Holders + Price + Liquidity)
 // ==========================================
 
 // Refresh all data for a single token
@@ -830,15 +731,11 @@ app.get('/api/refresh/:contract', async (req, res) => {
             fetchPriceAndLiquidity(contract)
         ]);
         
-        // Now check fresh wallets using the top 20 addresses
-        const freshData = await checkFreshWallets(rugCheckData?.top20Addresses || []);
-        
         const response_data = {
             success: true,
             contract: contract,
             creatorPercent: rugCheckData?.creatorPercent || null,
-            top20HoldersPercent: rugCheckData?.top20Percent || null,
-            freshWallets: freshData,
+            topHoldersPercent: rugCheckData?.topHoldersPercent || null,
             price: priceData?.price || null,
             liquidity: priceData?.liquidity || null
         };
@@ -1256,37 +1153,12 @@ app.get('/api/live-launches', async (req, res) => {
         console.log(`✅ RugCheck complete`);
         
         // ========================================
-        // 6b. FETCH FRESH WALLET DATA
-        // ========================================
-        console.log(`🔍 Checking fresh wallets for ${allNewTokens.length} tokens...`);
-        const freshWalletMap = new Map();
-        
-        // Check fresh wallets in parallel for all tokens
-        await Promise.all(allNewTokens.map(async (token) => {
-            try {
-                const rugCheck = rugCheckMap.get(token._address);
-                if (rugCheck?.top20Addresses && rugCheck.top20Addresses.length > 0) {
-                    const freshData = await checkFreshWallets(rugCheck.top20Addresses);
-                    freshWalletMap.set(token._address, freshData);
-                } else {
-                    freshWalletMap.set(token._address, null);
-                }
-            } catch (err) {
-                console.log(`   ⚠️ Fresh check failed for ${token._address.slice(0, 8)}: ${err.message}`);
-                freshWalletMap.set(token._address, null);
-            }
-        }));
-        
-        console.log(`✅ Fresh wallet check complete`);
-        
-        // ========================================
         // 7. FORMAT FINAL RESULTS
         // ========================================
         const formatted = allNewTokens.map(token => {
             const address = token._address;
             const graduatedAt = token._graduatedAt;
             const rugCheck = rugCheckMap.get(address);
-            const freshWallets = freshWalletMap.get(address);
             const source = token._source;
             
             const ageMinutes = graduatedAt 
@@ -1320,14 +1192,12 @@ app.get('/api/live-launches', async (req, res) => {
                 graduatedAt: graduatedAt,
                 // RugCheck data
                 rugCheckScore: rugCheck?.score || 0,
-                top20HoldersPercent: rugCheck?.top20Percent || null,
-                top20Addresses: rugCheck?.top20Addresses || [],
+                topHoldersPercent: rugCheck?.topHoldersPercent || null,
                 creatorAddress: rugCheck?.creator || null,
                 creatorPercent: rugCheck?.creatorPercent || null,
                 creatorHasRugged: rugCheck?.creatorHasRugged || false,
                 rugCheckRisks: rugCheck?.risks || [],
-                isRugged: rugCheck?.rugged || false,
-                freshWallets: freshWallets || null
+                isRugged: rugCheck?.rugged || false
             };
         });
         
