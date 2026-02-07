@@ -587,55 +587,26 @@ async function fetchRugCheckData(contract, retryCount = 0) {
         }
         
         // =====================================================
-        // TOP HOLDERS - Sum of top 20 holders excluding LP
+        // TOP HOLDERS - Use RugCheck's pre-calculated value
         // =====================================================
         let topHoldersPercent = null;
         
-        if (data.topHolders && Array.isArray(data.topHolders)) {
-            let total = 0;
-            let count = 0;
-            
-            for (const holder of data.topHolders) {
-                // Get holder percentage
-                let holderPct = holder.pct || holder.percentage || holder.percent || holder.pctOwned || 0;
-                
-                // If it's a decimal (0.0189), convert to percentage
-                if (holderPct > 0 && holderPct < 1) {
-                    holderPct = holderPct * 100;
-                }
-                
-                // Skip if this looks like LP (RugCheck usually labels these)
-                const isInsider = holder.insider === true;
-                const label = (holder.label || holder.name || holder.tag || '').toLowerCase();
-                const isLP = label.includes('raydium') || 
-                             label.includes('amm') || 
-                             label.includes('liquidity') ||
-                             label.includes('pool') ||
-                             label.includes('bonding');
-                
-                if (isLP) {
-                    console.log(`   ↳ Skipping LP: ${holder.address?.slice(0, 8) || 'unknown'} (${holderPct.toFixed(2)}%) - ${label}`);
-                    continue;
-                }
-                
-                console.log(`   ↳ Counting #${count + 1}: ${holder.address?.slice(0, 8) || 'unknown'} = ${holderPct.toFixed(2)}%`);
-                total += holderPct;
-                count++;
-                
-                // Count up to 20 non-LP holders to match RugCheck
-                if (count >= 20) break;
-            }
-            
-            if (total > 0) {
-                topHoldersPercent = total.toFixed(2) + '%';
-                console.log(`   ↳ Top ${count} holders (excl. LP): ${topHoldersPercent}`);
-            }
-        }
-        
-        // Fallback: Check pre-calculated fields from RugCheck API
-        if (!topHoldersPercent && data.totalTopHoldersPercent !== undefined) {
+        // Use RugCheck's totalTopHoldersPercent directly
+        if (data.totalTopHoldersPercent !== undefined && data.totalTopHoldersPercent !== null) {
             topHoldersPercent = data.totalTopHoldersPercent.toFixed(2) + '%';
-            console.log(`   ↳ Using RugCheck pre-calculated: ${topHoldersPercent}`);
+            console.log(`   ↳ Using RugCheck totalTopHoldersPercent: ${topHoldersPercent}`);
+        }
+        // Fallback to topHoldersHoldingPercentage
+        else if (data.topHoldersHoldingPercentage !== undefined) {
+            topHoldersPercent = data.topHoldersHoldingPercentage.toFixed(2) + '%';
+            console.log(`   ↳ Using RugCheck topHoldersHoldingPercentage: ${topHoldersPercent}`);
+        }
+        // Log what fields exist if we can't find it
+        else {
+            console.log(`   ⚠️ No pre-calculated top holders % found. Available fields:`);
+            console.log(`      - totalTopHoldersPercent: ${data.totalTopHoldersPercent}`);
+            console.log(`      - topHoldersHoldingPercentage: ${data.topHoldersHoldingPercentage}`);
+            console.log(`      - topHolders count: ${data.topHolders?.length}`);
         }
         
         console.log(`✅ RugCheck for ${contract.slice(0, 8)}: creator=${creatorPercent}, topHolders=${topHoldersPercent}`);
@@ -700,6 +671,8 @@ app.get('/api/debug/rugcheck/:contract', async (req, res) => {
             totalHolders: holders.length,
             holders: holdersSummary,
             totalTopHoldersPercent: data.totalTopHoldersPercent,
+            topHoldersHoldingPercentage: data.topHoldersHoldingPercentage,
+            allTopLevelKeys: Object.keys(data),
             rawFirstHolder: holders[0] // Full raw data of first holder
         });
     } catch (error) {
