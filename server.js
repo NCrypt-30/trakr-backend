@@ -587,19 +587,44 @@ async function fetchRugCheckData(contract, retryCount = 0) {
         }
         
         // =====================================================
-        // TOP HOLDERS - Sum pct values from topHolders array
+        // TOP HOLDERS - Sum pct values, excluding LP/AMM
         // =====================================================
         let topHoldersPercent = null;
         
+        // Get LP addresses from markets data
+        const lpAddresses = new Set();
+        if (data.markets && Array.isArray(data.markets)) {
+            for (const market of data.markets) {
+                // Add any address fields that might be LP
+                if (market.lp) lpAddresses.add(market.lp);
+                if (market.lpAddress) lpAddresses.add(market.lpAddress);
+                if (market.liquidityA) lpAddresses.add(market.liquidityA);
+                if (market.liquidityB) lpAddresses.add(market.liquidityB);
+                if (market.pubkey) lpAddresses.add(market.pubkey);
+            }
+        }
+        console.log(`   ↳ Found ${lpAddresses.size} LP addresses from markets`);
+        
         if (data.topHolders && Array.isArray(data.topHolders) && data.topHolders.length > 0) {
             let total = 0;
+            let count = 0;
+            
             for (const holder of data.topHolders) {
-                // pct is already a percentage (e.g., 20.30 means 20.30%)
                 const pct = holder.pct || 0;
+                const address = holder.address || '';
+                const owner = holder.owner || '';
+                
+                // Skip if address or owner is in LP addresses
+                if (lpAddresses.has(address) || lpAddresses.has(owner)) {
+                    console.log(`   ↳ Skipping LP: ${address.slice(0, 8)} (${pct.toFixed(2)}%)`);
+                    continue;
+                }
+                
                 total += pct;
+                count++;
             }
             topHoldersPercent = total.toFixed(2) + '%';
-            console.log(`   ↳ Top ${data.topHolders.length} holders: ${topHoldersPercent}`);
+            console.log(`   ↳ Top ${count} holders (excl. LP): ${topHoldersPercent}`);
         }
         
         console.log(`✅ RugCheck for ${contract.slice(0, 8)}: creator=${creatorPercent}, topHolders=${topHoldersPercent}`);
