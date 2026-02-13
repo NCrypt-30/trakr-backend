@@ -585,6 +585,14 @@ async function fetchRugCheckData(contract, retryCount = 0, bypassCache = false) 
         // =====================================================
         let top10Percent = null;
         
+        // Known LP/AMM addresses (hardcoded fallback when knownAccounts doesn't label them)
+        const KNOWN_LP_ADDRESSES = new Set([
+            'FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM', // Meteora DBC Authority
+            'AFMn7kGXvUJ3H69UkmFzqUR3VwzexbXqHswYaEPhzq8L', // Pump Fun AMM
+            '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1', // Raydium AMM
+            'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', // Raydium CPMM
+        ]);
+        
         if (data.topHolders && data.topHolders.length > 0) {
             let top20Total = 0;
             let holdersIncluded = 0;
@@ -597,7 +605,12 @@ async function fetchRugCheckData(contract, retryCount = 0, bypassCache = false) 
                 // Check if this holder's address OR owner is an AMM/LP using knownAccounts
                 const addressInfo = data.knownAccounts?.[holder.address];
                 const ownerInfo = data.knownAccounts?.[holder.owner];
-                const isLP = addressInfo?.type === 'AMM' || 
+                
+                // Check against hardcoded known LP addresses
+                const isKnownLP = KNOWN_LP_ADDRESSES.has(holder.address) || KNOWN_LP_ADDRESSES.has(holder.owner);
+                
+                const isLP = isKnownLP ||
+                    addressInfo?.type === 'AMM' || 
                     addressInfo?.type === 'LP' ||
                     addressInfo?.name?.toLowerCase().includes('amm') ||
                     addressInfo?.name?.toLowerCase().includes('liquidity') ||
@@ -609,7 +622,7 @@ async function fetchRugCheckData(contract, retryCount = 0, bypassCache = false) 
                     ownerInfo?.name?.toLowerCase().includes('pool');
                 
                 if (isLP) {
-                    console.log(`   ↳ Skipping LP/AMM: ${holder.address?.slice(0, 8) || 'unknown'} (${holderPct.toFixed(2)}%) - ${addressInfo?.name || ownerInfo?.name || 'unknown'}`);
+                    console.log(`   ↳ Skipping LP/AMM: ${holder.address?.slice(0, 8) || 'unknown'} (${holderPct.toFixed(2)}%) - ${addressInfo?.name || ownerInfo?.name || (isKnownLP ? 'Known LP' : 'unknown')}`);
                     continue;
                 }
                 
