@@ -982,7 +982,7 @@ async function fetchBagsTokenMetadata(tokenMint) {
         }
 
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
+        const timeout = setTimeout(() => controller.abort(), 3000); // 3s timeout for speed
 
         const response = await fetch(
             `https://api.dexscreener.com/latest/dex/tokens/${tokenMint}`,
@@ -1039,10 +1039,10 @@ async function fetchBagsLaunches() {
 
         // Get recent transactions on the Meteora DBC program
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15000);
+        const timeout = setTimeout(() => controller.abort(), 8000); // 8s timeout
 
         const response = await fetch(
-            `${HELIUS_API_URL}/addresses/${METEORA_DBC_PROGRAM}/transactions?api-key=${HELIUS_API_KEY}&limit=50`,
+            `${HELIUS_API_URL}/addresses/${METEORA_DBC_PROGRAM}/transactions?api-key=${HELIUS_API_KEY}&limit=20`,
             { signal: controller.signal }
         );
         clearTimeout(timeout);
@@ -1098,14 +1098,20 @@ async function fetchBagsLaunches() {
 
         console.log(`🛍️ Found ${potentialTokens.size} potential Bags tokens`);
 
-        // Fetch metadata for each Bags token and filter by CREATION TIME
+        // Fetch metadata for each Bags token IN PARALLEL and filter by CREATION TIME
         const bagsLaunches = [];
         const maxAgeMinutes = 60; // Only show tokens created in last 60 minutes
         const now = Date.now();
         
-        for (const tokenMint of potentialTokens) {
+        // Fetch all metadata in parallel for speed
+        const metadataPromises = Array.from(potentialTokens).map(async (tokenMint) => {
             const metadata = await fetchBagsTokenMetadata(tokenMint);
-            
+            return { tokenMint, metadata };
+        });
+        
+        const metadataResults = await Promise.all(metadataPromises);
+        
+        for (const { tokenMint, metadata } of metadataResults) {
             if (metadata) {
                 // Check token age - filter out old tokens
                 const createdTime = metadata.createdAt ? new Date(metadata.createdAt).getTime() : 0;
@@ -1387,48 +1393,56 @@ app.get('/api/live-launches', async (req, res) => {
             const bagsLaunches = await fetchBagsLaunches();
             console.log(`🛍️ Found ${bagsLaunches.length} Bags.fm launches`);
             
-            // Fetch RugCheck for Bags tokens (in parallel, but limited)
-            for (const token of bagsLaunches.slice(0, 10)) { // Limit to 10 for performance
+            // Fetch RugCheck for Bags tokens IN PARALLEL (limit to 10)
+            const bagsToProcess = bagsLaunches.slice(0, 10);
+            const rugCheckPromises = bagsToProcess.map(async (token) => {
                 try {
                     const rugCheck = await fetchRugCheckData(token.contract);
-                    const createdTime = token.createdAt ? new Date(token.createdAt).getTime() : currentCheckTime;
-                    const ageMinutes = Math.floor((currentCheckTime - createdTime) / (1000 * 60));
-                    
-                    bagsFormatted.push({
-                        symbol: token.symbol,
-                        name: token.name,
-                        contract: token.contract,
-                        ageMinutes: ageMinutes,
-                        liquidity: token.liquidity || 0,
-                        price: token.price || 0,
-                        dex: token.dex || 'meteora',
-                        hasLogo: true,
-                        hasWebsite: false,
-                        hasSocials: false,
-                        website: null,
-                        dexscreenerUrl: token.dexscreenerUrl,
-                        jupiterUrl: token.jupiterUrl,
-                        bagsUrl: token.bagsUrl,
-                        priceChange: token.priceChange || { m5: 0, h1: 0 },
-                        graduated: false, // Still on bonding curve
-                        marketCap: token.marketCap || 0,
-                        graduatedAt: token.createdAt,
-                        // RugCheck data
-                        rugCheckScore: rugCheck?.score || 0,
-                        topHoldersPercent: rugCheck?.top10Percent || null,
-                        creatorAddress: rugCheck?.creator || null,
-                        creatorPercent: rugCheck?.creatorPercent || null,
-                        creatorHasRugged: rugCheck?.creatorHasRugged || false,
-                        rugCheckRisks: rugCheck?.risks || [],
-                        isRugged: rugCheck?.rugged || false,
-                        // No bundle detection for Bags (they're on bonding curve)
-                        bundleDetection: null,
-                        // Source identifier
-                        source: 'Bags'
-                    });
+                    return { token, rugCheck };
                 } catch (err) {
                     console.log(`⚠️ RugCheck failed for Bags token ${token.contract.slice(0,8)}`);
+                    return { token, rugCheck: null };
                 }
+            });
+            
+            const rugCheckResults = await Promise.all(rugCheckPromises);
+            
+            for (const { token, rugCheck } of rugCheckResults) {
+                const createdTime = token.createdAt ? new Date(token.createdAt).getTime() : currentCheckTime;
+                const ageMinutes = Math.floor((currentCheckTime - createdTime) / (1000 * 60));
+                
+                bagsFormatted.push({
+                    symbol: token.symbol,
+                    name: token.name,
+                    contract: token.contract,
+                    ageMinutes: token.ageMinutes || ageMinutes,
+                    liquidity: token.liquidity || 0,
+                    price: token.price || 0,
+                    dex: token.dex || 'meteora',
+                    hasLogo: true,
+                    hasWebsite: false,
+                    hasSocials: false,
+                    website: null,
+                    dexscreenerUrl: token.dexscreenerUrl,
+                    jupiterUrl: token.jupiterUrl,
+                    bagsUrl: token.bagsUrl,
+                    priceChange: token.priceChange || { m5: 0, h1: 0 },
+                    graduated: false, // Still on bonding curve
+                    marketCap: token.marketCap || 0,
+                    graduatedAt: token.createdAt,
+                    // RugCheck data
+                    rugCheckScore: rugCheck?.score || 0,
+                    topHoldersPercent: rugCheck?.top10Percent || null,
+                    creatorAddress: rugCheck?.creator || null,
+                    creatorPercent: rugCheck?.creatorPercent || null,
+                    creatorHasRugged: rugCheck?.creatorHasRugged || false,
+                    rugCheckRisks: rugCheck?.risks || [],
+                    isRugged: rugCheck?.rugged || false,
+                    // No bundle detection for Bags (they're on bonding curve)
+                    bundleDetection: null,
+                    // Source identifier
+                    source: 'Bags'
+                });
             }
         } catch (bagsError) {
             console.log(`⚠️ Bags fetch error (continuing without): ${bagsError.message}`);
