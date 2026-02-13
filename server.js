@@ -953,6 +953,194 @@ app.get('/api/debug/bundle/:contract', async (req, res) => {
 // FIX: Start by looking back 1 hour (3600000ms) instead of starting from "now"
 let lastGraduationCheck = Date.now() - (60 * 60 * 1000); // Look back 1 hour on startup
 
+// ==========================================
+// BAGS.FM DBC LAUNCH TRACKING (Helper Functions)
+// ==========================================
+
+// Meteora DBC Program ID (where Bags.fm tokens launch)
+const METEORA_DBC_PROGRAM = 'dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN';
+
+// Track last check time for Bags launches
+let lastBagsCheck = Date.now() - (60 * 60 * 1000); // Look back 1 hour on startup
+
+// Cache for Bags token metadata (from DexScreener)
+const bagsMetadataCache = new Map();
+const BAGS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+// Check if a token address is a Bags.fm token (ends in BAGS)
+function isBagsToken(address) {
+    return address && address.toUpperCase().endsWith('BAGS');
+}
+
+// Fetch token metadata from DexScreener (free)
+async function fetchBagsTokenMetadata(tokenMint) {
+    try {
+        // Check cache first
+        const cached = bagsMetadataCache.get(tokenMint);
+        if (cached && (Date.now() - cached.timestamp < BAGS_CACHE_TTL)) {
+            return cached.data;
+        }
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+
+        const response = await fetch(
+            `https://api.dexscreener.com/latest/dex/tokens/${tokenMint}`,
+            { signal: controller.signal }
+        );
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+            console.log(`⚠️ DexScreener ${response.status} for ${tokenMint.slice(0, 8)}`);
+            return null;
+        }
+
+        const data = await response.json();
+        
+        // Get the first pair (most liquid)
+        const pair = data.pairs?.[0];
+        if (!pair) {
+            console.log(`⚠️ No pairs found on DexScreener for ${tokenMint.slice(0, 8)}`);
+            return null;
+        }
+
+        const metadata = {
+            symbol: pair.baseToken?.symbol || 'UNKNOWN',
+            name: pair.baseToken?.name || 'Unknown Token',
+            price: parseFloat(pair.priceUsd) || 0,
+            liquidity: pair.liquidity?.usd || 0,
+            marketCap: pair.marketCap || pair.fdv || 0,
+            priceChange5m: pair.priceChange?.m5 || 0,
+            priceChange1h: pair.priceChange?.h1 || 0,
+            pairAddress: pair.pairAddress,
+            dexId: pair.dexId,
+            createdAt: pair.pairCreatedAt
+        };
+
+        // Cache the result
+        bagsMetadataCache.set(tokenMint, { data: metadata, timestamp: Date.now() });
+
+        return metadata;
+    } catch (error) {
+        console.log(`⚠️ Metadata fetch error for ${tokenMint.slice(0, 8)}:`, error.message);
+        return null;
+    }
+}
+
+// Fetch new Bags.fm launches from Meteora DBC
+async function fetchBagsLaunches() {
+    if (!HELIUS_API_KEY) {
+        console.log('⚠️ HELIUS_API_KEY not set - skipping Bags DBC check');
+        return [];
+    }
+
+    try {
+        console.log('🛍️ Fetching Bags.fm DBC launches from Helius...');
+
+        // Get recent transactions on the Meteora DBC program
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+
+        const response = await fetch(
+            `${HELIUS_API_URL}/addresses/${METEORA_DBC_PROGRAM}/transactions?api-key=${HELIUS_API_KEY}&limit=50`,
+            { signal: controller.signal }
+        );
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+            console.log(`⚠️ Helius DBC API ${response.status}`);
+            return [];
+        }
+
+        const transactions = await response.json();
+        console.log(`📊 Helius returned ${transactions.length} DBC transactions`);
+
+        if (!transactions || transactions.length === 0) {
+            return [];
+        }
+
+        // Extract unique token mints from transactions
+        const potentialTokens = new Set();
+
+        for (const tx of transactions) {
+            // Skip if older than last check
+            const txTime = tx.timestamp ? tx.timestamp * 1000 : Date.now();
+            if (txTime <= lastBagsCheck) continue;
+
+            // Look for token mints in the transaction
+            // Check tokenTransfers
+            if (tx.tokenTransfers) {
+                for (const transfer of tx.tokenTransfers) {
+                    if (transfer.mint && isBagsToken(transfer.mint)) {
+                        potentialTokens.add(transfer.mint);
+                    }
+                }
+            }
+
+            // Check account data
+            if (tx.accountData) {
+                for (const account of tx.accountData) {
+                    if (account.account && isBagsToken(account.account)) {
+                        potentialTokens.add(account.account);
+                    }
+                }
+            }
+
+            // Check instructions for any addresses ending in BAGS
+            if (tx.instructions) {
+                for (const ix of tx.instructions) {
+                    if (ix.accounts) {
+                        for (const acc of ix.accounts) {
+                            if (isBagsToken(acc)) {
+                                potentialTokens.add(acc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        console.log(`🛍️ Found ${potentialTokens.size} potential Bags tokens`);
+
+        // Update last check time
+        lastBagsCheck = Date.now();
+
+        // Fetch metadata for each Bags token
+        const bagsLaunches = [];
+        
+        for (const tokenMint of potentialTokens) {
+            const metadata = await fetchBagsTokenMetadata(tokenMint);
+            
+            if (metadata) {
+                bagsLaunches.push({
+                    symbol: metadata.symbol,
+                    name: metadata.name,
+                    contract: tokenMint,
+                    price: metadata.price,
+                    liquidity: metadata.liquidity,
+                    marketCap: metadata.marketCap,
+                    priceChange: {
+                        m5: metadata.priceChange5m,
+                        h1: metadata.priceChange1h
+                    },
+                    source: 'Bags',
+                    dex: metadata.dexId || 'meteora',
+                    createdAt: metadata.createdAt,
+                    dexscreenerUrl: `https://dexscreener.com/solana/${tokenMint}`,
+                    bagsUrl: `https://bags.fm/${tokenMint}`,
+                    jupiterUrl: `https://jup.ag/?sell=So11111111111111111111111111111111111111112&buy=${tokenMint}`
+                });
+            }
+        }
+
+        return bagsLaunches;
+
+    } catch (error) {
+        console.error('❌ Bags DBC fetch error:', error.message);
+        return [];
+    }
+}
+
 // ✅ REMOVED: seenTokens global dedup - let frontend handle it!
 // const seenTokens = new Set();
 
@@ -1162,7 +1350,7 @@ app.get('/api/live-launches', async (req, res) => {
                 graduatedAt: graduatedAt, // Include timestamp
                 // RugCheck data
                 rugCheckScore: rugCheck?.score || 0,
-                top10HoldersPercent: rugCheck?.top10Percent || null,
+                topHoldersPercent: rugCheck?.top10Percent || null,
                 creatorAddress: rugCheck?.creator || null,
                 creatorPercent: rugCheck?.creatorPercent || null,
                 creatorHasRugged: rugCheck?.creatorHasRugged || false,
@@ -1177,19 +1365,81 @@ app.get('/api/live-launches', async (req, res) => {
                     earlyBuyersPercent: bundle.earlyBuyersPercent || null, // NEW: e.g. "52.1%"
                     riskLevel: bundle.riskLevel || 'NONE',
                     summary: bundle.summary || 'No data'
-                } : null
+                } : null,
+                // Source identifier
+                source: 'Pump'
             };
         });
+        
+        // ==========================================
+        // ALSO FETCH BAGS.FM DBC LAUNCHES
+        // ==========================================
+        let bagsFormatted = [];
+        try {
+            const bagsLaunches = await fetchBagsLaunches();
+            console.log(`🛍️ Found ${bagsLaunches.length} Bags.fm launches`);
+            
+            // Fetch RugCheck for Bags tokens (in parallel, but limited)
+            for (const token of bagsLaunches.slice(0, 10)) { // Limit to 10 for performance
+                try {
+                    const rugCheck = await fetchRugCheckData(token.contract);
+                    const createdTime = token.createdAt ? new Date(token.createdAt).getTime() : currentCheckTime;
+                    const ageMinutes = Math.floor((currentCheckTime - createdTime) / (1000 * 60));
+                    
+                    bagsFormatted.push({
+                        symbol: token.symbol,
+                        name: token.name,
+                        contract: token.contract,
+                        ageMinutes: ageMinutes,
+                        liquidity: token.liquidity || 0,
+                        price: token.price || 0,
+                        dex: token.dex || 'meteora',
+                        hasLogo: true,
+                        hasWebsite: false,
+                        hasSocials: false,
+                        website: null,
+                        dexscreenerUrl: token.dexscreenerUrl,
+                        jupiterUrl: token.jupiterUrl,
+                        bagsUrl: token.bagsUrl,
+                        priceChange: token.priceChange || { m5: 0, h1: 0 },
+                        graduated: false, // Still on bonding curve
+                        marketCap: token.marketCap || 0,
+                        graduatedAt: token.createdAt,
+                        // RugCheck data
+                        rugCheckScore: rugCheck?.score || 0,
+                        topHoldersPercent: rugCheck?.top10Percent || null,
+                        creatorAddress: rugCheck?.creator || null,
+                        creatorPercent: rugCheck?.creatorPercent || null,
+                        creatorHasRugged: rugCheck?.creatorHasRugged || false,
+                        rugCheckRisks: rugCheck?.risks || [],
+                        isRugged: rugCheck?.rugged || false,
+                        // No bundle detection for Bags (they're on bonding curve)
+                        bundleDetection: null,
+                        // Source identifier
+                        source: 'Bags'
+                    });
+                } catch (err) {
+                    console.log(`⚠️ RugCheck failed for Bags token ${token.contract.slice(0,8)}`);
+                }
+            }
+        } catch (bagsError) {
+            console.log(`⚠️ Bags fetch error (continuing without): ${bagsError.message}`);
+        }
+        
+        // Combine Pump.fun + Bags launches
+        const allLaunches = [...formatted, ...bagsFormatted];
+        console.log(`✅ Total launches: ${formatted.length} Pump + ${bagsFormatted.length} Bags = ${allLaunches.length}`);
         
         res.json({
             success: true,
             timestamp: new Date().toISOString(),
             totalScanned: tokens.length,
-            launches: formatted,
-            count: formatted.length,
-            message: 'Graduated Pump.fun tokens (completed bonding curve)',
+            launches: allLaunches,
+            count: allLaunches.length,
+            pumpCount: formatted.length,
+            bagsCount: bagsFormatted.length,
+            message: 'Pump.fun graduations + Bags.fm DBC launches',
             scamFilterRate: `${tokens.length > 0 ? ((1 - formatted.length / tokens.length) * 100).toFixed(1) : '0'}%`
-            // ✅ REMOVED: seenTokensCount: seenTokens.size
         });
         
     } catch (error) {
@@ -1202,191 +1452,72 @@ app.get('/api/live-launches', async (req, res) => {
 });
 
 // ==========================================
-// BAGS.FM DBC LAUNCH TRACKING
+// REFRESH TOKEN DATA ENDPOINT
 // ==========================================
 
-// Meteora DBC Program ID (where Bags.fm tokens launch)
-const METEORA_DBC_PROGRAM = 'dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN';
-
-// Track last check time for Bags launches
-let lastBagsCheck = Date.now() - (60 * 60 * 1000); // Look back 1 hour on startup
-
-// Cache for Bags token metadata (from DexScreener)
-const bagsMetadataCache = new Map();
-const BAGS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-
-// Check if a token address is a Bags.fm token (ends in BAGS)
-function isBagsToken(address) {
-    return address && address.toUpperCase().endsWith('BAGS');
-}
-
-// Fetch token metadata from DexScreener (free)
-async function fetchBagsTokenMetadata(tokenMint) {
+// Refresh holder data for a single token (called by frontend refresh button)
+app.get('/api/refresh/:contract', async (req, res) => {
     try {
-        // Check cache first
-        const cached = bagsMetadataCache.get(tokenMint);
-        if (cached && (Date.now() - cached.timestamp < BAGS_CACHE_TTL)) {
-            return cached.data;
-        }
-
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
-
-        const response = await fetch(
-            `https://api.dexscreener.com/latest/dex/tokens/${tokenMint}`,
-            { signal: controller.signal }
-        );
-        clearTimeout(timeout);
-
-        if (!response.ok) {
-            console.log(`⚠️ DexScreener ${response.status} for ${tokenMint.slice(0, 8)}`);
-            return null;
-        }
-
-        const data = await response.json();
+        const { contract } = req.params;
         
-        // Get the first pair (most liquid)
-        const pair = data.pairs?.[0];
-        if (!pair) {
-            console.log(`⚠️ No pairs found on DexScreener for ${tokenMint.slice(0, 8)}`);
-            return null;
+        if (!contract || contract.length < 32) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid contract address'
+            });
         }
-
-        const metadata = {
-            symbol: pair.baseToken?.symbol || 'UNKNOWN',
-            name: pair.baseToken?.name || 'Unknown Token',
-            price: parseFloat(pair.priceUsd) || 0,
-            liquidity: pair.liquidity?.usd || 0,
-            marketCap: pair.marketCap || pair.fdv || 0,
-            priceChange5m: pair.priceChange?.m5 || 0,
-            priceChange1h: pair.priceChange?.h1 || 0,
-            pairAddress: pair.pairAddress,
-            dexId: pair.dexId,
-            createdAt: pair.pairCreatedAt
-        };
-
-        // Cache the result
-        bagsMetadataCache.set(tokenMint, { data: metadata, timestamp: Date.now() });
-
-        return metadata;
-    } catch (error) {
-        console.log(`⚠️ Metadata fetch error for ${tokenMint.slice(0, 8)}:`, error.message);
-        return null;
-    }
-}
-
-// Fetch new Bags.fm launches from Meteora DBC
-async function fetchBagsLaunches() {
-    if (!HELIUS_API_KEY) {
-        console.log('⚠️ HELIUS_API_KEY not set - skipping Bags DBC check');
-        return [];
-    }
-
-    try {
-        console.log('🛍️ Fetching Bags.fm DBC launches from Helius...');
-
-        // Get recent transactions on the Meteora DBC program
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15000);
-
-        const response = await fetch(
-            `${HELIUS_API_URL}/addresses/${METEORA_DBC_PROGRAM}/transactions?api-key=${HELIUS_API_KEY}&limit=50`,
-            { signal: controller.signal }
-        );
-        clearTimeout(timeout);
-
-        if (!response.ok) {
-            console.log(`⚠️ Helius DBC API ${response.status}`);
-            return [];
-        }
-
-        const transactions = await response.json();
-        console.log(`📊 Helius returned ${transactions.length} DBC transactions`);
-
-        if (!transactions || transactions.length === 0) {
-            return [];
-        }
-
-        // Extract unique token mints from transactions
-        const potentialTokens = new Set();
-
-        for (const tx of transactions) {
-            // Skip if older than last check
-            const txTime = tx.timestamp ? tx.timestamp * 1000 : Date.now();
-            if (txTime <= lastBagsCheck) continue;
-
-            // Look for token mints in the transaction
-            // Check tokenTransfers
-            if (tx.tokenTransfers) {
-                for (const transfer of tx.tokenTransfers) {
-                    if (transfer.mint && isBagsToken(transfer.mint)) {
-                        potentialTokens.add(transfer.mint);
-                    }
-                }
-            }
-
-            // Check account data
-            if (tx.accountData) {
-                for (const account of tx.accountData) {
-                    if (account.account && isBagsToken(account.account)) {
-                        potentialTokens.add(account.account);
-                    }
-                }
-            }
-
-            // Check instructions for any addresses ending in BAGS
-            if (tx.instructions) {
-                for (const ix of tx.instructions) {
-                    if (ix.accounts) {
-                        for (const acc of ix.accounts) {
-                            if (isBagsToken(acc)) {
-                                potentialTokens.add(acc);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        console.log(`🛍️ Found ${potentialTokens.size} potential Bags tokens`);
-
-        // Fetch metadata for each Bags token
-        const bagsLaunches = [];
         
-        for (const tokenMint of potentialTokens) {
-            const metadata = await fetchBagsTokenMetadata(tokenMint);
-            
-            if (metadata) {
-                bagsLaunches.push({
-                    symbol: metadata.symbol,
-                    name: metadata.name,
-                    contract: tokenMint,
-                    price: metadata.price,
-                    liquidity: metadata.liquidity,
-                    marketCap: metadata.marketCap,
-                    priceChange: {
-                        m5: metadata.priceChange5m,
-                        h1: metadata.priceChange1h
-                    },
-                    source: 'Bags',
-                    dex: metadata.dexId || 'meteora',
-                    createdAt: metadata.createdAt,
-                    dexscreenerUrl: `https://dexscreener.com/solana/${tokenMint}`,
-                    bagsUrl: `https://bags.fm/${tokenMint}`,
-                    jupiterUrl: `https://jup.ag/?sell=So11111111111111111111111111111111111111112&buy=${tokenMint}`
-                });
+        console.log(`🔄 Refreshing data for ${contract.slice(0, 8)}...`);
+        
+        // Fetch fresh RugCheck data
+        const rugCheck = await fetchRugCheckData(contract);
+        
+        // Also fetch current price from DexScreener
+        let price = null;
+        let liquidity = null;
+        
+        try {
+            const dexResponse = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
+            if (dexResponse.ok) {
+                const dexData = await dexResponse.json();
+                const pair = dexData.pairs?.[0];
+                if (pair) {
+                    price = parseFloat(pair.priceUsd) || null;
+                    liquidity = pair.liquidity?.usd || null;
+                }
             }
+        } catch (dexErr) {
+            console.log(`⚠️ DexScreener fetch failed: ${dexErr.message}`);
         }
-
-        return bagsLaunches;
-
+        
+        console.log(`✅ Refresh complete for ${contract.slice(0, 8)}:`, {
+            topHolders: rugCheck?.top10Percent,
+            creator: rugCheck?.creatorPercent,
+            price,
+            liquidity
+        });
+        
+        res.json({
+            success: true,
+            contract: contract,
+            topHoldersPercent: rugCheck?.top10Percent || null,
+            creatorPercent: rugCheck?.creatorPercent || null,
+            price: price,
+            liquidity: liquidity,
+            rugCheckScore: rugCheck?.score || 0,
+            timestamp: new Date().toISOString()
+        });
+        
     } catch (error) {
-        console.error('❌ Bags DBC fetch error:', error.message);
-        return [];
+        console.error(`❌ Refresh error:`, error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
     }
-}
+});
 
-// API Endpoint: Get Bags.fm DBC launches
+// API Endpoint: Get Bags.fm DBC launches (standalone)
 app.get('/api/bags-launches', async (req, res) => {
     try {
         console.log('🛍️ Fetching Bags.fm DBC launches...');
@@ -2589,7 +2720,8 @@ app.listen(PORT, () => {
     console.log(`   POST /api/whale/live/mark-read`);
     console.log(`   POST /api/whale/live/mark-all-read`);
     console.log(`   GET  /api/stats`);
-    console.log(`   GET  /api/live-launches (Pump.fun graduations)`);
+    console.log(`   GET  /api/live-launches (Pump.fun graduations + Bags.fm)`);
+    console.log(`   GET  /api/refresh/:contract (Refresh token data)`);
     console.log(`   GET  /api/bags-launches (Bags.fm DBC launches)`);
     console.log(`   GET  /api/all-launches (Combined Pump + Bags)`);
     console.log(`   GET  /api/admin/projects/count`);
