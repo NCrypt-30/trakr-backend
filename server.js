@@ -591,13 +591,8 @@ async function fetchRugCheckData(contract, retryCount = 0, bypassCache = false) 
             const top20 = data.topHolders.slice(0, 20);
             
             for (const holder of top20) {
-                // Get holder percentage
+                // Get holder percentage (RugCheck returns percentages directly, e.g. 25.35 = 25.35%)
                 let holderPct = holder.pct || holder.percentage || holder.percent || holder.pctOwned || 0;
-                
-                // If it's a decimal (0.0189), convert to percentage
-                if (holderPct > 0 && holderPct < 1) {
-                    holderPct = holderPct * 100;
-                }
                 
                 // Check if this holder's address OR owner is an AMM/LP using knownAccounts
                 const addressInfo = data.knownAccounts?.[holder.address];
