@@ -491,13 +491,17 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 // Fetch RugCheck data for a token (holder %, creator %, score)
-async function fetchRugCheckData(contract, retryCount = 0) {
+async function fetchRugCheckData(contract, retryCount = 0, bypassCache = false) {
     try {
-        // Check cache first
-        const cached = rugCheckCache.get(contract);
-        if (cached && (Date.now() - cached.timestamp < RUGCHECK_CACHE_TTL)) {
-            console.log(`📦 RugCheck cache hit for ${contract.slice(0, 8)}`);
-            return cached.data;
+        // Check cache first (unless bypassing)
+        if (!bypassCache) {
+            const cached = rugCheckCache.get(contract);
+            if (cached && (Date.now() - cached.timestamp < RUGCHECK_CACHE_TTL)) {
+                console.log(`📦 RugCheck cache hit for ${contract.slice(0, 8)}`);
+                return cached.data;
+            }
+        } else {
+            console.log(`🔄 Bypassing cache for ${contract.slice(0, 8)}`);
         }
         
         // Rate limiting - wait if needed
@@ -523,7 +527,7 @@ async function fetchRugCheckData(contract, retryCount = 0) {
                 console.log(`⚠️ RugCheck 429 for ${contract.slice(0, 8)}, retry ${retryCount + 1}/3 in ${retryDelay/1000}s...`);
                 await sleep(retryDelay);
                 lastRugCheckCall = Date.now(); // Reset rate limit timer
-                return fetchRugCheckData(contract, retryCount + 1);
+                return fetchRugCheckData(contract, retryCount + 1, bypassCache);
             } else {
                 console.log(`❌ RugCheck 429 for ${contract.slice(0, 8)} - max retries exceeded`);
                 return null;
@@ -1491,8 +1495,8 @@ app.get('/api/refresh/:contract', async (req, res) => {
         
         console.log(`🔄 Refreshing data for ${contract.slice(0, 8)}...`);
         
-        // Fetch fresh RugCheck data
-        const rugCheck = await fetchRugCheckData(contract);
+        // Fetch fresh RugCheck data (bypass cache!)
+        const rugCheck = await fetchRugCheckData(contract, 0, true);
         
         // Also fetch current price from DexScreener
         let price = null;
