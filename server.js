@@ -1063,10 +1063,6 @@ async function fetchBagsLaunches() {
         const potentialTokens = new Set();
 
         for (const tx of transactions) {
-            // Skip if older than last check
-            const txTime = tx.timestamp ? tx.timestamp * 1000 : Date.now();
-            if (txTime <= lastBagsCheck) continue;
-
             // Look for token mints in the transaction
             // Check tokenTransfers
             if (tx.tokenTransfers) {
@@ -1102,16 +1098,26 @@ async function fetchBagsLaunches() {
 
         console.log(`🛍️ Found ${potentialTokens.size} potential Bags tokens`);
 
-        // Update last check time
-        lastBagsCheck = Date.now();
-
-        // Fetch metadata for each Bags token
+        // Fetch metadata for each Bags token and filter by CREATION TIME
         const bagsLaunches = [];
+        const maxAgeMinutes = 60; // Only show tokens created in last 60 minutes
+        const now = Date.now();
         
         for (const tokenMint of potentialTokens) {
             const metadata = await fetchBagsTokenMetadata(tokenMint);
             
             if (metadata) {
+                // Check token age - filter out old tokens
+                const createdTime = metadata.createdAt ? new Date(metadata.createdAt).getTime() : 0;
+                const ageMinutes = createdTime ? Math.floor((now - createdTime) / (1000 * 60)) : 9999;
+                
+                if (ageMinutes > maxAgeMinutes) {
+                    console.log(`⏭️ Skipping ${metadata.symbol} - too old (${ageMinutes}m)`);
+                    continue;
+                }
+                
+                console.log(`✅ Bags token: ${metadata.symbol} (${ageMinutes}m old)`);
+                
                 bagsLaunches.push({
                     symbol: metadata.symbol,
                     name: metadata.name,
@@ -1126,6 +1132,7 @@ async function fetchBagsLaunches() {
                     source: 'Bags',
                     dex: metadata.dexId || 'meteora',
                     createdAt: metadata.createdAt,
+                    ageMinutes: ageMinutes,
                     dexscreenerUrl: `https://dexscreener.com/solana/${tokenMint}`,
                     bagsUrl: `https://bags.fm/${tokenMint}`,
                     jupiterUrl: `https://jup.ag/?sell=So11111111111111111111111111111111111111112&buy=${tokenMint}`
@@ -1133,6 +1140,7 @@ async function fetchBagsLaunches() {
             }
         }
 
+        console.log(`🛍️ Returning ${bagsLaunches.length} fresh Bags tokens (< ${maxAgeMinutes}m old)`);
         return bagsLaunches;
 
     } catch (error) {
