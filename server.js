@@ -581,17 +581,31 @@ async function fetchRugCheckData(contract, retryCount = 0, bypassCache = false) 
         }
         
         // =====================================================
-        // TOP 10 HOLDERS - Try multiple possible formats  
+        // TOP 10 HOLDERS - Use RugCheck's pre-calculated value
         // =====================================================
         let top10Percent = null;
         
-        if (data.topHolders && data.topHolders.length > 0) {
+        // Method 1: Use RugCheck's pre-calculated total (this matches their website!)
+        if (data.topHoldersTotal !== undefined) {
+            top10Percent = data.topHoldersTotal.toFixed(2) + '%';
+            console.log(`   ↳ Using RugCheck topHoldersTotal: ${top10Percent}`);
+        }
+        // Method 2: Check totalTopHoldersPercent
+        else if (data.totalTopHoldersPercent !== undefined) {
+            top10Percent = data.totalTopHoldersPercent.toFixed(2) + '%';
+            console.log(`   ↳ Using RugCheck totalTopHoldersPercent: ${top10Percent}`);
+        }
+        // Method 3: Check tokenMeta
+        else if (data.tokenMeta?.topHoldersPercent !== undefined) {
+            top10Percent = data.tokenMeta.topHoldersPercent.toFixed(2) + '%';
+            console.log(`   ↳ Using RugCheck tokenMeta.topHoldersPercent: ${top10Percent}`);
+        }
+        // Method 4: Fallback - calculate from topHolders array
+        else if (data.topHolders && data.topHolders.length > 0) {
             let top10Total = 0;
-            let holdersIncluded = 0;
             const top10 = data.topHolders.slice(0, 10);
             
             for (const holder of top10) {
-                // Get holder percentage
                 let holderPct = holder.pct || holder.percentage || holder.percent || holder.pctOwned || 0;
                 
                 // If it's a decimal (0.0189), convert to percentage
@@ -599,58 +613,13 @@ async function fetchRugCheckData(contract, retryCount = 0, bypassCache = false) 
                     holderPct = holderPct * 100;
                 }
                 
-                // Build searchable string from all possible fields
-                const searchStr = [
-                    holder.address,
-                    holder.owner,
-                    holder.label,
-                    holder.name,
-                    holder.tag,
-                    holder.type
-                ].filter(Boolean).join(' ').toLowerCase();
-                
-                // Skip LP/AMM addresses (Pump.fun, Raydium, Orca, Meteora, etc.)
-                const isLP = holder.isLP || 
-                    holder.isLiquidity ||
-                    holder.isAMM ||
-                    searchStr.includes('pump') ||
-                    searchStr.includes('amm') ||
-                    searchStr.includes('lp') ||
-                    searchStr.includes('liquidity') ||
-                    searchStr.includes('raydium') ||
-                    searchStr.includes('orca') ||
-                    searchStr.includes('meteora') ||
-                    searchStr.includes('bonding') ||
-                    // Skip if holder has >50% (almost certainly LP/AMM)
-                    holderPct > 50;
-                
-                if (isLP) {
-                    console.log(`   ↳ Skipping LP/AMM: ${holder.address?.slice(0, 8) || 'unknown'} (${holderPct.toFixed(2)}%)`);
-                    continue;
-                }
-                
                 top10Total += holderPct;
-                holdersIncluded++;
-            }
-            
-            // Sanity check: cap at 100%
-            if (top10Total > 100) {
-                console.warn(`   ⚠️ Top 10 total was ${top10Total.toFixed(2)}% - capping at 100%`);
-                top10Total = 100;
             }
             
             if (top10Total > 0) {
                 top10Percent = top10Total.toFixed(2) + '%';
-                console.log(`   ↳ Top ${holdersIncluded} holders (excl. LP): ${top10Percent}`);
+                console.log(`   ↳ Calculated from topHolders array: ${top10Percent}`);
             }
-        }
-        
-        // Fallback: Check pre-calculated fields
-        if (!top10Percent && data.totalTopHoldersPercent !== undefined) {
-            top10Percent = data.totalTopHoldersPercent.toFixed(2) + '%';
-        }
-        if (!top10Percent && data.tokenMeta?.topHoldersPercent !== undefined) {
-            top10Percent = data.tokenMeta.topHoldersPercent.toFixed(2) + '%';
         }
         
         console.log(`✅ RugCheck for ${contract.slice(0, 8)}: creator=${creatorPercent}, top10=${top10Percent}`);
