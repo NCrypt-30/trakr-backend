@@ -581,16 +581,16 @@ async function fetchRugCheckData(contract, retryCount = 0, bypassCache = false) 
         }
         
         // =====================================================
-        // TOP 10 HOLDERS - Try multiple possible formats  
+        // TOP 20 HOLDERS - Match RugCheck (top 20 minus LPs)
         // =====================================================
         let top10Percent = null;
         
         if (data.topHolders && data.topHolders.length > 0) {
-            let top10Total = 0;
+            let top20Total = 0;
             let holdersIncluded = 0;
-            const top10 = data.topHolders.slice(0, 10);
+            const top20 = data.topHolders.slice(0, 20);
             
-            for (const holder of top10) {
+            for (const holder of top20) {
                 // Get holder percentage
                 let holderPct = holder.pct || holder.percentage || holder.percent || holder.pctOwned || 0;
                 
@@ -599,48 +599,30 @@ async function fetchRugCheckData(contract, retryCount = 0, bypassCache = false) 
                     holderPct = holderPct * 100;
                 }
                 
-                // Build searchable string from all possible fields
-                const searchStr = [
-                    holder.address,
-                    holder.owner,
-                    holder.label,
-                    holder.name,
-                    holder.tag,
-                    holder.type
-                ].filter(Boolean).join(' ').toLowerCase();
-                
-                // Skip LP/AMM addresses (Pump.fun, Raydium, Orca, Meteora, etc.)
-                const isLP = holder.isLP || 
-                    holder.isLiquidity ||
-                    holder.isAMM ||
-                    searchStr.includes('pump') ||
-                    searchStr.includes('amm') ||
-                    searchStr.includes('lp') ||
-                    searchStr.includes('liquidity') ||
-                    searchStr.includes('raydium') ||
-                    searchStr.includes('orca') ||
-                    searchStr.includes('meteora') ||
-                    searchStr.includes('bonding') ||
-                    // Skip if holder has >50% (almost certainly LP/AMM)
-                    holderPct > 50;
+                // Check if this holder's owner is an AMM/LP using knownAccounts
+                const ownerInfo = data.knownAccounts?.[holder.owner];
+                const isLP = ownerInfo?.type === 'AMM' || 
+                    ownerInfo?.type === 'LP' ||
+                    ownerInfo?.name?.toLowerCase().includes('amm') ||
+                    ownerInfo?.name?.toLowerCase().includes('liquidity');
                 
                 if (isLP) {
-                    console.log(`   ↳ Skipping LP/AMM: ${holder.address?.slice(0, 8) || 'unknown'} (${holderPct.toFixed(2)}%)`);
+                    console.log(`   ↳ Skipping LP/AMM: ${holder.address?.slice(0, 8) || 'unknown'} (${holderPct.toFixed(2)}%) - ${ownerInfo?.name || 'unknown'}`);
                     continue;
                 }
                 
-                top10Total += holderPct;
+                top20Total += holderPct;
                 holdersIncluded++;
             }
             
             // Sanity check: cap at 100%
-            if (top10Total > 100) {
-                console.warn(`   ⚠️ Top 10 total was ${top10Total.toFixed(2)}% - capping at 100%`);
-                top10Total = 100;
+            if (top20Total > 100) {
+                console.warn(`   ⚠️ Top 20 total was ${top20Total.toFixed(2)}% - capping at 100%`);
+                top20Total = 100;
             }
             
-            if (top10Total > 0) {
-                top10Percent = top10Total.toFixed(2) + '%';
+            if (top20Total > 0) {
+                top10Percent = top20Total.toFixed(2) + '%';
                 console.log(`   ↳ Top ${holdersIncluded} holders (excl. LP): ${top10Percent}`);
             }
         }
