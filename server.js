@@ -599,15 +599,22 @@ async function fetchRugCheckData(contract, retryCount = 0, bypassCache = false) 
                     holderPct = holderPct * 100;
                 }
                 
-                // Check if this holder's owner is an AMM/LP using knownAccounts
+                // Check if this holder's address OR owner is an AMM/LP using knownAccounts
+                const addressInfo = data.knownAccounts?.[holder.address];
                 const ownerInfo = data.knownAccounts?.[holder.owner];
-                const isLP = ownerInfo?.type === 'AMM' || 
+                const isLP = addressInfo?.type === 'AMM' || 
+                    addressInfo?.type === 'LP' ||
+                    addressInfo?.name?.toLowerCase().includes('amm') ||
+                    addressInfo?.name?.toLowerCase().includes('liquidity') ||
+                    addressInfo?.name?.toLowerCase().includes('pool') ||
+                    ownerInfo?.type === 'AMM' || 
                     ownerInfo?.type === 'LP' ||
                     ownerInfo?.name?.toLowerCase().includes('amm') ||
-                    ownerInfo?.name?.toLowerCase().includes('liquidity');
+                    ownerInfo?.name?.toLowerCase().includes('liquidity') ||
+                    ownerInfo?.name?.toLowerCase().includes('pool');
                 
                 if (isLP) {
-                    console.log(`   ↳ Skipping LP/AMM: ${holder.address?.slice(0, 8) || 'unknown'} (${holderPct.toFixed(2)}%) - ${ownerInfo?.name || 'unknown'}`);
+                    console.log(`   ↳ Skipping LP/AMM: ${holder.address?.slice(0, 8) || 'unknown'} (${holderPct.toFixed(2)}%) - ${addressInfo?.name || ownerInfo?.name || 'unknown'}`);
                     continue;
                 }
                 
