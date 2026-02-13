@@ -511,11 +511,9 @@ async function fetchRugCheckData(contract, retryCount = 0) {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
         
-        console.log(`🔍 CALLING RUGCHECK API for ${contract}`);
         let response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`, {
             signal: controller.signal
         });
-        console.log(`🔍 RUGCHECK RESPONSE: ${response.status} for ${contract.slice(0, 8)}`);
         clearTimeout(timeout);
         
         // Handle rate limiting (429) - retry with exponential backoff
@@ -538,14 +536,6 @@ async function fetchRugCheckData(contract, retryCount = 0) {
         }
         
         const data = await response.json();
-        
-        // DEBUG: Log raw holder data
-        console.log(`📊 RugCheck raw data for ${contract.slice(0, 8)}:`);
-        console.log(`   - topHolders count: ${data.topHolders?.length || 0}`);
-        console.log(`   - totalTopHoldersPercent: ${data.totalTopHoldersPercent}`);
-        if (data.topHolders && data.topHolders.length > 0) {
-            console.log(`   - First holder: pct=${data.topHolders[0].pct}, label=${data.topHolders[0].label || 'none'}`);
-        }
         
         // Check if creator has rugged before (look in risks array)
         const creatorRugRisk = data.risks?.find(r => 
@@ -587,52 +577,84 @@ async function fetchRugCheckData(contract, retryCount = 0) {
         }
         
         // =====================================================
-        // TOP HOLDERS - Sum pct values, excluding LP/AMM
+        // TOP 10 HOLDERS - Try multiple possible formats  
         // =====================================================
-        let topHoldersPercent = null;
+        let top10Percent = null;
         
-        // Get LP addresses from markets data
-        const lpAddresses = new Set();
-        if (data.markets && Array.isArray(data.markets)) {
-            for (const market of data.markets) {
-                // Add any address fields that might be LP
-                if (market.lp) lpAddresses.add(market.lp);
-                if (market.lpAddress) lpAddresses.add(market.lpAddress);
-                if (market.liquidityA) lpAddresses.add(market.liquidityA);
-                if (market.liquidityB) lpAddresses.add(market.liquidityB);
-                if (market.pubkey) lpAddresses.add(market.pubkey);
-            }
-        }
-        console.log(`   ↳ Found ${lpAddresses.size} LP addresses from markets`);
-        
-        if (data.topHolders && Array.isArray(data.topHolders) && data.topHolders.length > 0) {
-            let total = 0;
-            let count = 0;
+        if (data.topHolders && data.topHolders.length > 0) {
+            let top10Total = 0;
+            let holdersIncluded = 0;
+            const top10 = data.topHolders.slice(0, 10);
             
-            for (const holder of data.topHolders) {
-                const pct = holder.pct || 0;
-                const address = holder.address || '';
-                const owner = holder.owner || '';
+            for (const holder of top10) {
+                // Get holder percentage
+                let holderPct = holder.pct || holder.percentage || holder.percent || holder.pctOwned || 0;
                 
-                // Skip if address or owner is in LP addresses
-                if (lpAddresses.has(address) || lpAddresses.has(owner)) {
-                    console.log(`   ↳ Skipping LP: ${address.slice(0, 8)} (${pct.toFixed(2)}%)`);
+                // If it's a decimal (0.0189), convert to percentage
+                if (holderPct > 0 && holderPct < 1) {
+                    holderPct = holderPct * 100;
+                }
+                
+                // Build searchable string from all possible fields
+                const searchStr = [
+                    holder.address,
+                    holder.owner,
+                    holder.label,
+                    holder.name,
+                    holder.tag,
+                    holder.type
+                ].filter(Boolean).join(' ').toLowerCase();
+                
+                // Skip LP/AMM addresses (Pump.fun, Raydium, Orca, Meteora, etc.)
+                const isLP = holder.isLP || 
+                    holder.isLiquidity ||
+                    holder.isAMM ||
+                    searchStr.includes('pump') ||
+                    searchStr.includes('amm') ||
+                    searchStr.includes('lp') ||
+                    searchStr.includes('liquidity') ||
+                    searchStr.includes('raydium') ||
+                    searchStr.includes('orca') ||
+                    searchStr.includes('meteora') ||
+                    searchStr.includes('bonding') ||
+                    // Skip if holder has >50% (almost certainly LP/AMM)
+                    holderPct > 50;
+                
+                if (isLP) {
+                    console.log(`   ↳ Skipping LP/AMM: ${holder.address?.slice(0, 8) || 'unknown'} (${holderPct.toFixed(2)}%)`);
                     continue;
                 }
                 
-                total += pct;
-                count++;
+                top10Total += holderPct;
+                holdersIncluded++;
             }
-            topHoldersPercent = total.toFixed(2) + '%';
-            console.log(`   ↳ Top ${count} holders (excl. LP): ${topHoldersPercent}`);
+            
+            // Sanity check: cap at 100%
+            if (top10Total > 100) {
+                console.warn(`   ⚠️ Top 10 total was ${top10Total.toFixed(2)}% - capping at 100%`);
+                top10Total = 100;
+            }
+            
+            if (top10Total > 0) {
+                top10Percent = top10Total.toFixed(2) + '%';
+                console.log(`   ↳ Top ${holdersIncluded} holders (excl. LP): ${top10Percent}`);
+            }
         }
         
-        console.log(`✅ RugCheck for ${contract.slice(0, 8)}: creator=${creatorPercent}, topHolders=${topHoldersPercent}`);
+        // Fallback: Check pre-calculated fields
+        if (!top10Percent && data.totalTopHoldersPercent !== undefined) {
+            top10Percent = data.totalTopHoldersPercent.toFixed(2) + '%';
+        }
+        if (!top10Percent && data.tokenMeta?.topHoldersPercent !== undefined) {
+            top10Percent = data.tokenMeta.topHoldersPercent.toFixed(2) + '%';
+        }
+        
+        console.log(`✅ RugCheck for ${contract.slice(0, 8)}: creator=${creatorPercent}, top10=${top10Percent}`);
         
         const result = {
             score: Math.round((data.score || 0) / 10),
             topHolders: data.topHolders || null,
-            topHoldersPercent: topHoldersPercent,
+            top10Percent: top10Percent,
             creator: data.creator || null,
             creatorBalance: data.creatorBalance || null,
             creatorPercent: creatorPercent,
@@ -654,36 +676,252 @@ async function fetchRugCheckData(contract, retryCount = 0) {
 }
 
 // ==========================================
-// FRESH WALLET DETECTION (Helius API)
+// BUNDLE DETECTION (Helius API)
 // ==========================================
 
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 const HELIUS_API_URL = `https://api.helius.xyz/v0`;
 
-// ==========================================
-// DEBUG ENDPOINT - See raw RugCheck data
-// ==========================================
-app.get('/api/debug/rugcheck/:contract', async (req, res) => {
-    try {
-        const { contract } = req.params;
-        
-        const response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`);
-        const data = await response.json();
-        
-        // Return the FULL raw response so we can see all fields
-        res.json(data);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+// Cache for bundle data (same TTL as RugCheck)
+const bundleCache = new Map();
+const BUNDLE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+// Clean up old bundle cache entries every 10 minutes
+setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [key, value] of bundleCache.entries()) {
+        if (now - value.timestamp > BUNDLE_CACHE_TTL) {
+            bundleCache.delete(key);
+            cleaned++;
+        }
     }
-});
+    if (cleaned > 0) {
+        console.log(`🧹 Cleaned ${cleaned} expired bundle cache entries`);
+    }
+}, 10 * 60 * 1000);
+
+// Pump.fun program ID
+const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+
+// Fetch bundle detection data for a token
+async function fetchBundleData(tokenMint) {
+    try {
+        if (!HELIUS_API_KEY) {
+            console.log('⚠️ HELIUS_API_KEY not set - skipping bundle detection');
+            return null;
+        }
+
+        // Check cache first
+        const cached = bundleCache.get(tokenMint);
+        if (cached && (Date.now() - cached.timestamp < BUNDLE_CACHE_TTL)) {
+            console.log(`📦 Bundle cache hit for ${tokenMint.slice(0, 8)}`);
+            return cached.data;
+        }
+
+        console.log(`🔍 Bundle check for ${tokenMint.slice(0, 8)}...`);
+
+        // Step 1: Get token supply using Helius RPC
+        let totalSupply = 0;
+        try {
+            const supplyResponse = await fetch(HELIUS_RPC_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    method: 'getTokenSupply',
+                    params: [tokenMint]
+                })
+            });
+            const supplyData = await supplyResponse.json();
+            if (supplyData.result?.value?.uiAmount) {
+                totalSupply = supplyData.result.value.uiAmount;
+                console.log(`   Token supply: ${totalSupply.toLocaleString()}`);
+            }
+        } catch (err) {
+            console.log(`   Could not fetch token supply: ${err.message}`);
+        }
+
+        // Step 2: Get the earliest transactions on this token using Helius parsed transaction API
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
+
+        const response = await fetch(
+            `${HELIUS_API_URL}/addresses/${tokenMint}/transactions?api-key=${HELIUS_API_KEY}&limit=50&type=SWAP`,
+            { signal: controller.signal }
+        );
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+            console.log(`⚠️ Helius API ${response.status} for ${tokenMint.slice(0, 8)}`);
+            return null;
+        }
+
+        const transactions = await response.json();
+
+        if (!transactions || transactions.length === 0) {
+            console.log(`   No transactions found for ${tokenMint.slice(0, 8)}`);
+            return { isBundled: false, bundledWallets: 0, riskLevel: 'NONE', reason: 'No early transactions found' };
+        }
+
+        // Step 3: Sort by slot (ascending) to get earliest transactions first
+        transactions.sort((a, b) => (a.slot || 0) - (b.slot || 0));
+
+        // Step 4: Extract early buyers - focus on first transactions (token creation phase)
+        const earlyBuyers = [];
+        const firstSlot = transactions[0]?.slot || 0;
+        
+        // Look at transactions within the first 10 slots (~4 seconds on Solana)
+        const SLOT_WINDOW = 10;
+
+        for (const tx of transactions) {
+            if (!tx.slot) continue;
+            
+            // Only look at early transactions (within first 10 slots of token's first tx)
+            if (tx.slot > firstSlot + SLOT_WINDOW) break;
+
+            // Get the fee payer (buyer wallet)
+            const buyer = tx.feePayer;
+            if (!buyer) continue;
+
+            // Find the token transfer for this mint
+            const tokenTransfer = tx.tokenTransfers?.find(t => t.mint === tokenMint);
+            
+            // Check if this is a buy (token transfer TO the buyer)
+            const isBuy = (tokenTransfer && tokenTransfer.toUserAccount === buyer) || 
+                          tx.description?.toLowerCase().includes('swap') || 
+                          tx.type === 'SWAP';
+
+            if (isBuy) {
+                // Get token amount - try multiple possible fields
+                let tokenAmount = 0;
+                if (tokenTransfer) {
+                    tokenAmount = tokenTransfer.tokenAmount || 
+                                  tokenTransfer.amount || 
+                                  (tokenTransfer.rawTokenAmount?.tokenAmount ? 
+                                   parseFloat(tokenTransfer.rawTokenAmount.tokenAmount) / Math.pow(10, tokenTransfer.rawTokenAmount.decimals || 6) : 0);
+                }
+                
+                earlyBuyers.push({
+                    wallet: buyer,
+                    slot: tx.slot,
+                    signature: tx.signature,
+                    slotOffset: tx.slot - firstSlot,
+                    tokenAmount: tokenAmount
+                });
+            }
+        }
+
+        // Step 5: Group buyers by slot
+        const slotGroups = {};
+        for (const buyer of earlyBuyers) {
+            if (!slotGroups[buyer.slot]) {
+                slotGroups[buyer.slot] = [];
+            }
+            slotGroups[buyer.slot].push(buyer);
+        }
+
+        // Step 6: Detect bundles and calculate amounts
+        let maxWalletsInSlot = 0;
+        let bundleSlot = null;
+        let bundleTokenAmount = 0; // Total tokens bought by bundled wallets (same slot)
+        const uniqueEarlyWallets = new Set(earlyBuyers.map(b => b.wallet));
+
+        for (const [slot, buyers] of Object.entries(slotGroups)) {
+            const uniqueWallets = new Set(buyers.map(b => b.wallet));
+            if (uniqueWallets.size > maxWalletsInSlot) {
+                maxWalletsInSlot = uniqueWallets.size;
+                bundleSlot = slot;
+                // Sum token amounts for this bundle slot
+                bundleTokenAmount = buyers.reduce((sum, b) => sum + (b.tokenAmount || 0), 0);
+            }
+        }
+
+        // Calculate total early buyer token amount
+        const totalEarlyTokenAmount = earlyBuyers.reduce((sum, b) => sum + (b.tokenAmount || 0), 0);
+        const walletsInEarlySlots = uniqueEarlyWallets.size;
+
+        // Step 7: Calculate percentages
+        let bundledPercent = null;
+        let earlyBuyersPercent = null;
+        
+        if (totalSupply > 0) {
+            if (bundleTokenAmount > 0) {
+                bundledPercent = ((bundleTokenAmount / totalSupply) * 100).toFixed(1) + '%';
+            }
+            if (totalEarlyTokenAmount > 0) {
+                earlyBuyersPercent = ((totalEarlyTokenAmount / totalSupply) * 100).toFixed(1) + '%';
+            }
+        }
+
+        // Step 8: Determine risk level based on PERCENTAGE of supply owned
+        let riskLevel = 'NONE';
+        let isBundled = false;
+        
+        // Parse the percentage for comparison
+        const bundlePct = bundledPercent ? parseFloat(bundledPercent) : 0;
+        const earlyPct = earlyBuyersPercent ? parseFloat(earlyBuyersPercent) : 0;
+
+        // Risk based on how much supply the bundle/early buyers control
+        if (bundlePct >= 30 || earlyPct >= 50) {
+            riskLevel = 'CRITICAL';
+            isBundled = true;
+        } else if (bundlePct >= 20 || earlyPct >= 40) {
+            riskLevel = 'HIGH';
+            isBundled = true;
+        } else if (bundlePct >= 10 || earlyPct >= 25) {
+            riskLevel = 'MEDIUM';
+            isBundled = true;
+        } else if (bundlePct >= 5 || maxWalletsInSlot >= 3) {
+            riskLevel = 'LOW';
+            isBundled = true;
+        }
+        // If we couldn't get percentages, fall back to wallet count
+        else if (totalSupply === 0 && maxWalletsInSlot >= 5) {
+            riskLevel = 'HIGH';
+            isBundled = true;
+        }
+
+        const result = {
+            isBundled: isBundled,
+            bundledWallets: maxWalletsInSlot,
+            bundledPercent: bundledPercent,              // NEW: e.g. "34.2%"
+            totalEarlyBuyers: walletsInEarlySlots,
+            earlyBuyersPercent: earlyBuyersPercent,      // NEW: e.g. "52.1%"
+            bundleSlot: bundleSlot,
+            slotsAnalyzed: Object.keys(slotGroups).length,
+            transactionsAnalyzed: earlyBuyers.length,
+            riskLevel: riskLevel,
+            // Human-readable summary
+            summary: isBundled 
+                ? `${maxWalletsInSlot} wallets${bundledPercent ? ` (${bundledPercent})` : ''} bought in same block`
+                : `Organic distribution: ${walletsInEarlySlots} buyers across ${Object.keys(slotGroups).length} blocks`
+        };
+
+        console.log(`✅ Bundle check ${tokenMint.slice(0, 8)}: ${result.riskLevel} risk (${maxWalletsInSlot} same-slot${bundledPercent ? ` = ${bundledPercent}` : ''}, ${walletsInEarlySlots} early${earlyBuyersPercent ? ` = ${earlyBuyersPercent}` : ''})`);
+
+        // Cache the result
+        bundleCache.set(tokenMint, { data: result, timestamp: Date.now() });
+
+        return result;
+
+    } catch (error) {
+        if (error.name === 'AbortError') {
+            console.log(`⚠️ Bundle check timeout for ${tokenMint.slice(0, 8)}`);
+        } else {
+            console.log(`⚠️ Bundle check error for ${tokenMint.slice(0, 8)}:`, error.message);
+        }
+        return null;
+    }
+}
 
 // ==========================================
-// REFRESH ENDPOINT (Holders + Price + Liquidity)
+// BUNDLE DETECTION DEBUG ENDPOINT
 // ==========================================
 
-// Refresh all data for a single token
-app.get('/api/refresh/:contract', async (req, res) => {
+app.get('/api/debug/bundle/:contract', async (req, res) => {
     try {
         const { contract } = req.params;
         
@@ -691,277 +929,29 @@ app.get('/api/refresh/:contract', async (req, res) => {
             return res.status(400).json({ error: 'Contract address required' });
         }
         
-        console.log(`🔄 Refreshing all data for ${contract}`);
+        console.log(`🔍 Debug: Fetching bundle data for ${contract}`);
         
-        // Clear cache for this token to force fresh fetch
-        rugCheckCache.delete(contract);
+        const bundleData = await fetchBundleData(contract);
         
-        // Fetch holder data and price/liquidity in parallel
-        const [rugCheckData, priceData] = await Promise.all([
-            fetchRugCheckData(contract),
-            fetchPriceAndLiquidity(contract)
-        ]);
-        
-        const response_data = {
+        res.json({
             success: true,
             contract: contract,
-            creatorPercent: rugCheckData?.creatorPercent || null,
-            topHoldersPercent: rugCheckData?.topHoldersPercent || null,
-            price: priceData?.price || null,
-            liquidity: priceData?.liquidity || null
-        };
-        
-        console.log(`🔄 Refresh response for ${contract.slice(0, 8)}:`, JSON.stringify(response_data));
-        
-        res.json(response_data);
+            bundle: bundleData
+        });
         
     } catch (error) {
-        console.error('Refresh error:', error);
+        console.error('Debug bundle error:', error);
         res.status(500).json({
-            success: false,
             error: error.message,
             contract: req.params.contract
         });
     }
 });
 
-// Helper function to fetch price and liquidity from DexScreener (with Jupiter fallback)
-async function fetchPriceAndLiquidity(contract) {
-    // Try DexScreener first
-    try {
-        console.log(`   💰 Fetching price/liquidity for ${contract.slice(0, 8)}...`);
-        const dexUrl = `https://api.dexscreener.com/latest/dex/tokens/${contract}`;
-        const response = await fetch(dexUrl);
-        
-        if (response.status === 429) {
-            console.log(`   ⚠️ DexScreener rate limited, trying Jupiter...`);
-            return await fetchPriceFromJupiter(contract);
-        }
-        
-        if (!response.ok) {
-            console.log(`   ❌ DexScreener API error: ${response.status}, trying Jupiter...`);
-            return await fetchPriceFromJupiter(contract);
-        }
-        
-        const data = await response.json();
-        
-        if (data.pairs && data.pairs.length > 0) {
-            // Find the pair with highest liquidity
-            const bestPair = data.pairs.reduce((best, pair) => {
-                const pairLiq = pair.liquidity?.usd || 0;
-                const bestLiq = best?.liquidity?.usd || 0;
-                return pairLiq > bestLiq ? pair : best;
-            }, data.pairs[0]);
-            
-            const result = {
-                price: parseFloat(bestPair.priceUsd) || 0,
-                liquidity: bestPair.liquidity?.usd || 0
-            };
-            console.log(`   ✅ DexScreener: Price $${result.price}, Liq $${result.liquidity}`);
-            return result;
-        }
-        
-        console.log(`   ⚠️ No DexScreener pairs, trying Jupiter...`);
-        return await fetchPriceFromJupiter(contract);
-    } catch (error) {
-        console.log(`   ❌ DexScreener error: ${error.message}, trying Jupiter...`);
-        return await fetchPriceFromJupiter(contract);
-    }
-}
-
-// Fallback: Jupiter Price API
-async function fetchPriceFromJupiter(contract) {
-    try {
-        const jupiterUrl = `https://api.jup.ag/price/v2?ids=${contract}`;
-        const response = await fetch(jupiterUrl);
-        
-        if (!response.ok) {
-            console.log(`   ❌ Jupiter API error: ${response.status}`);
-            return null;
-        }
-        
-        const data = await response.json();
-        
-        if (data.data && data.data[contract]) {
-            const price = parseFloat(data.data[contract].price) || 0;
-            console.log(`   ✅ Jupiter: Price $${price} (no liquidity data)`);
-            return {
-                price: price,
-                liquidity: null  // Jupiter doesn't provide liquidity
-            };
-        }
-        
-        console.log(`   ⚠️ No Jupiter price data`);
-        return null;
-    } catch (error) {
-        console.log(`   ❌ Jupiter error: ${error.message}`);
-        return null;
-    }
-}
-
 // Live Launches - Get graduated Pump.fun tokens (using Moralis API)
 // Track last check time to only show NEW graduations going forward
 // FIX: Start by looking back 1 hour (3600000ms) instead of starting from "now"
 let lastGraduationCheck = Date.now() - (60 * 60 * 1000); // Look back 1 hour on startup
-let lastMeteoraCheck = Date.now() - (60 * 60 * 1000); // Look back 1 hour on startup for Meteora
-
-// Rolling cache - keeps tokens for 1 hour so all users can see them
-// Frontend handles dismissals per-user
-const TOKEN_CACHE_DURATION = 60 * 60 * 1000; // 1 hour in ms
-let rollingTokenCache = []; // Array of {token, addedAt}
-
-function cleanupTokenCache() {
-    const cutoff = Date.now() - TOKEN_CACHE_DURATION;
-    const before = rollingTokenCache.length;
-    rollingTokenCache = rollingTokenCache.filter(item => item.addedAt > cutoff);
-    const removed = before - rollingTokenCache.length;
-    if (removed > 0) {
-        console.log(`🧹 Cleaned ${removed} expired tokens from cache (${rollingTokenCache.length} remaining)`);
-    }
-}
-
-function addTokensToCache(tokens) {
-    const now = Date.now();
-    const existingContracts = new Set(rollingTokenCache.map(item => item.token.contract));
-    
-    let added = 0;
-    for (const token of tokens) {
-        if (!existingContracts.has(token.contract)) {
-            rollingTokenCache.push({ token, addedAt: now });
-            added++;
-        }
-    }
-    if (added > 0) {
-        console.log(`📥 Added ${added} new tokens to rolling cache (${rollingTokenCache.length} total)`);
-    }
-}
-
-function getCachedTokens() {
-    cleanupTokenCache();
-    const now = Date.now();
-    
-    // Recalculate ageMinutes for each cached token
-    return rollingTokenCache.map(item => {
-        const token = { ...item.token };
-        if (token.graduatedAt) {
-            const gradTime = typeof token.graduatedAt === 'number' 
-                ? token.graduatedAt 
-                : new Date(token.graduatedAt).getTime();
-            token.ageMinutes = Math.floor((now - gradTime) / (1000 * 60));
-        }
-        return token;
-    });
-}
-
-// Meteora Dynamic Bonding Curve Program ID
-const METEORA_DBC_PROGRAM = 'dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN';
-
-// Fetch Meteora DBC migrations from Helius
-async function fetchMeteoraMigrations() {
-    if (!HELIUS_API_KEY) {
-        console.log('⚠️ HELIUS_API_KEY not set - skipping Meteora DBC');
-        return [];
-    }
-    
-    try {
-        console.log('🔍 Fetching Meteora DBC migrations from Helius...');
-        
-        // Get recent transactions for the DBC program
-        const response = await fetch(
-            `${HELIUS_API_URL}/addresses/${METEORA_DBC_PROGRAM}/transactions?api-key=${HELIUS_API_KEY}&limit=50`,
-            { headers: { 'Accept': 'application/json' } }
-        );
-        
-        if (!response.ok) {
-            console.error(`Helius API error: ${response.status}`);
-            return [];
-        }
-        
-        const transactions = await response.json();
-        console.log(`📦 Helius returned ${transactions.length} DBC transactions`);
-        
-        // Filter for migration transactions only
-        const migrations = [];
-        for (const tx of transactions) {
-            // Check if this is a migration transaction
-            const isMigration = tx.type === 'UNKNOWN' && tx.instructions?.some(ix => 
-                ix.programId === METEORA_DBC_PROGRAM && 
-                (ix.data?.includes('migrate') || tx.description?.toLowerCase().includes('migrat'))
-            );
-            
-            // Also check parsed instructions for migration methods
-            const hasMigrationMethod = tx.instructions?.some(ix => {
-                const data = ix.data || '';
-                // Check for migrate_meteora_damm or migration_damm_v2 method signatures
-                return ix.programId === METEORA_DBC_PROGRAM;
-            });
-            
-            // Get token mint from accounts (usually in the transaction accounts)
-            let tokenMint = null;
-            if (tx.tokenTransfers && tx.tokenTransfers.length > 0) {
-                tokenMint = tx.tokenTransfers[0].mint;
-            } else if (tx.accountData) {
-                // Look for token mint in account data
-                for (const acc of tx.accountData) {
-                    if (acc.tokenBalanceChanges && acc.tokenBalanceChanges.length > 0) {
-                        tokenMint = acc.tokenBalanceChanges[0].mint;
-                        break;
-                    }
-                }
-            }
-            
-            // If we found a token mint and this looks like a DBC transaction, include it
-            if (tokenMint && tx.timestamp && hasMigrationMethod) {
-                migrations.push({
-                    tokenMint,
-                    timestamp: tx.timestamp * 1000, // Convert to milliseconds
-                    signature: tx.signature
-                });
-            }
-        }
-        
-        console.log(`📊 Found ${migrations.length} potential Meteora migrations`);
-        return migrations;
-        
-    } catch (error) {
-        console.error('❌ Meteora DBC fetch error:', error.message);
-        return [];
-    }
-}
-
-// Fetch token metadata from Helius DAS API
-async function fetchTokenMetadata(tokenMint) {
-    if (!HELIUS_API_KEY) return null;
-    
-    try {
-        const response = await fetch(HELIUS_RPC_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                jsonrpc: '2.0',
-                id: 'metadata',
-                method: 'getAsset',
-                params: { id: tokenMint }
-            })
-        });
-        
-        if (!response.ok) return null;
-        
-        const data = await response.json();
-        if (data.result) {
-            return {
-                name: data.result.content?.metadata?.name || 'Unknown',
-                symbol: data.result.content?.metadata?.symbol || 'UNKNOWN',
-                decimals: data.result.token_info?.decimals || 6,
-                logo: data.result.content?.links?.image || null
-            };
-        }
-        return null;
-    } catch (error) {
-        console.error(`Metadata fetch error for ${tokenMint.slice(0,8)}:`, error.message);
-        return null;
-    }
-}
 
 // ✅ REMOVED: seenTokens global dedup - let frontend handle it!
 // const seenTokens = new Set();
@@ -979,158 +969,170 @@ setInterval(() => {
 
 app.get('/api/live-launches', async (req, res) => {
     try {
-        console.log('🔍 Fetching graduated tokens from Pump.fun + Meteora DBC...');
+        console.log('🔍 Fetching graduated Pump.fun tokens from Moralis...');
         
         const MORALIS_API_KEY = process.env.MORALIS_API_KEY;
-        const currentCheckTime = Date.now();
         
-        // ========================================
-        // 1. FETCH PUMP.FUN GRADUATIONS (Moralis)
-        // ========================================
-        let pumpTokens = [];
-        if (MORALIS_API_KEY) {
-            try {
-                const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/graduated', {
-                    headers: {
-                        'Accept': 'application/json',
-                        'X-API-Key': MORALIS_API_KEY
-                    }
-                });
-                
-                if (response.ok) {
-                    const data = await response.json();
-                    // Handle different response formats
-                    if (Array.isArray(data)) {
-                        pumpTokens = data;
-                    } else if (data.result && Array.isArray(data.result)) {
-                        pumpTokens = data.result;
-                    } else if (data.tokens && Array.isArray(data.tokens)) {
-                        pumpTokens = data.tokens;
-                    } else if (data.data && Array.isArray(data.data)) {
-                        pumpTokens = data.data;
-                    }
-                    console.log(`📊 Moralis returned ${pumpTokens.length} Pump.fun graduations`);
-                }
-            } catch (err) {
-                console.error('⚠️ Moralis fetch error:', err.message);
-            }
-        } else {
-            console.log('⚠️ MORALIS_API_KEY not set - skipping Pump.fun');
+        if (!MORALIS_API_KEY) {
+            console.error('❌ MORALIS_API_KEY not set in environment variables');
+            return res.json({
+                success: false,
+                error: 'Moralis API key not configured',
+                launches: [],
+                totalScanned: 0,
+                count: 0
+            });
         }
         
-        // ========================================
-        // 2. METEORA DBC - DISABLED
-        // ========================================
-        // DISABLED: Causing excessive Helius API usage and returning old tokens
-        // TODO: Fix before re-enabling
-        let meteoraTokens = [];
-        let heliusCallCount = 0;
-        console.log('⚠️ Meteora DBC detection DISABLED - using Pump.fun only');
-        // ========================================
-        // 3. FILTER PUMP.FUN BY TIME
-        // ========================================
-        console.log(`⏰ Pump.fun last check: ${new Date(lastGraduationCheck).toISOString()}`);
-        console.log(`⏰ Meteora last check: ${new Date(lastMeteoraCheck).toISOString()}`);
-        
-        let pumpOldCount = 0;
-        const newPumpGraduations = pumpTokens.filter(token => {
-            const address = token.address || token.mint || token.token_address || token.tokenAddress;
-            if (!address) return false;
-            
-            const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
-            if (!graduatedAt) return false;
-            
-            const graduatedTime = typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime();
-            
-            if (graduatedTime <= lastGraduationCheck) {
-                pumpOldCount++;
-                return false;
+        // Moralis Solana API - Get graduated tokens
+        // Docs: https://docs.moralis.com/web3-data-api/solana/reference/token-api#get-graduated-tokens-by-exchange
+        // Use "pumpfun" as the exchange identifier (Pump.fun tokens that completed bonding curve)
+        const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/graduated', {
+            headers: {
+                'Accept': 'application/json',
+                'X-API-Key': MORALIS_API_KEY
             }
-            return true;
         });
         
-        console.log(`✅ Found ${newPumpGraduations.length} NEW Pump.fun graduations (skipped ${pumpOldCount} old)`);
-        console.log(`✅ Found ${meteoraTokens.length} NEW Meteora DBC migrations`);
-        console.log(`📊 Meteora Helius calls this poll: ${heliusCallCount}`);
-        
-        // NOTE: We update lastGraduationCheck AFTER adding to cache (see below)
-        // This prevents race conditions where User B polls before User A's tokens are cached
-        
-        // ========================================
-        // 4. METEORA METADATA - ALREADY FROM DEXSCREENER
-        // ========================================
-        // Metadata (name, symbol, price, liquidity) already captured during validation
-        // No additional Helius calls needed!
-        
-        // ========================================
-        // 5. COMBINE ALL TOKENS
-        // ========================================
-        const allNewTokens = [
-            // Pump.fun tokens with source tag
-            ...newPumpGraduations.map(token => ({
-                ...token,
-                _source: 'Pump',
-                _address: token.address || token.mint || token.token_address || token.tokenAddress,
-                _graduatedAt: token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp
-            })),
-            // Meteora tokens with source tag (metadata from DexScreener validation)
-            ...meteoraTokens.map(token => {
-                return {
-                    _source: 'Meteora',
-                    _address: token.mint,
-                    _graduatedAt: token.timestamp,
-                    symbol: token.symbol || 'UNKNOWN',
-                    name: token.name || 'Unknown Token',
-                    logo: token.logo || null,
-                    liquidity: token.liquidity,
-                    price: token.price
-                };
-            })
-        ];
-        
-        console.log(`📊 Total new tokens to process: ${allNewTokens.length}`);
-        
-        if (allNewTokens.length === 0) {
-            // No new tokens, but return cached tokens from last hour
-            const cachedTokens = getCachedTokens();
-            console.log(`📦 Returning ${cachedTokens.length} tokens from cache (no new tokens this poll)`);
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error(`Moralis API returned ${response.status}: ${errorText}`);
             return res.json({
                 success: true,
-                launches: cachedTokens,
-                totalScanned: pumpTokens.length + meteoraTokens.length,
-                count: cachedTokens.length,
+                launches: [],
+                totalScanned: 0,
+                count: 0,
                 timestamp: new Date().toISOString(),
-                message: `No new tokens (returning ${cachedTokens.length} from cache)`,
+                message: `API error: ${response.status}`,
                 scamFilterRate: '0%'
             });
         }
         
-        // ========================================
-        // 6. FETCH RUGCHECK DATA
-        // ========================================
-        console.log(`📊 Fetching RugCheck data for ${allNewTokens.length} tokens...`);
-        const rugCheckMap = new Map();
+        const data = await response.json();
+        console.log('📦 Moralis response structure:', Object.keys(data));
         
-        // RugCheck sequential
-        for (const token of allNewTokens) {
-            try {
-                const rugCheckData = await fetchRugCheckData(token._address);
-                rugCheckMap.set(token._address, rugCheckData);
-            } catch (err) {
-                rugCheckMap.set(token._address, null);
-            }
+        // Handle different possible response formats
+        let tokens = [];
+        if (Array.isArray(data)) {
+            tokens = data;
+        } else if (data.tokens && Array.isArray(data.tokens)) {
+            tokens = data.tokens;
+        } else if (data.result && Array.isArray(data.result)) {
+            tokens = data.result;
+        } else if (data.data && Array.isArray(data.data)) {
+            tokens = data.data;
         }
         
-        console.log(`✅ RugCheck complete`);
+        console.log(`📊 Moralis returned ${tokens.length} graduated tokens`);
         
-        // ========================================
-        // 7. FORMAT FINAL RESULTS
-        // ========================================
-        const formatted = allNewTokens.map(token => {
-            const address = token._address;
-            const graduatedAt = token._graduatedAt;
+        if (tokens.length === 0) {
+            return res.json({
+                success: true,
+                launches: [],
+                totalScanned: 0,
+                count: 0,
+                timestamp: new Date().toISOString(),
+                message: 'No graduated tokens found',
+                scamFilterRate: '0%'
+            });
+        }
+        
+        // ONLY show graduations AFTER last check (going forward only, ignore past)
+        const currentCheckTime = Date.now();
+        
+        // Better logging to debug the filtering
+        console.log(`⏰ Last check was at: ${new Date(lastGraduationCheck).toISOString()}`);
+        console.log(`⏰ Current check is at: ${new Date(currentCheckTime).toISOString()}`);
+        console.log(`⏰ Time window: ${Math.floor((currentCheckTime - lastGraduationCheck) / 1000 / 60)} minutes`);
+        // ✅ REMOVED: console.log(`🗂️ Currently tracking ${seenTokens.size} seen tokens`);
+        
+        let oldCount = 0;
+        let newCount = 0;
+        
+        const newGraduations = tokens.filter(token => {
+            // Must have address
+            const address = token.address || token.mint || token.token_address || token.tokenAddress;
+            if (!address) {
+                return false;
+            }
+            
+            // ✅ REMOVED: DEDUPLICATION CHECK #1 - Let frontend handle it!
+            // if (seenTokens.has(address)) {
+            //     console.log(`⏭️ Skipping ${token.symbol}: already seen (dedup)`);
+            //     return false;
+            // }
+            
+            // Get graduation timestamp
+            const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
+            if (!graduatedAt) {
+                return false; // Skip if no timestamp
+            }
+            
+            const graduatedTime = typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime();
+            
+            // DEDUPLICATION CHECK #2: Time-based filter
+            if (graduatedTime <= lastGraduationCheck) {
+                oldCount++; // Count old tokens
+                return false; // Skip - graduated before last check
+            }
+            
+            // ✅ REMOVED: Mark as seen
+            // seenTokens.add(address);
+            
+            newCount++; // Count new tokens
+            return true;
+        });
+        
+        // Update last check time for next request
+        lastGraduationCheck = currentCheckTime;
+        
+        console.log(`✅ Found ${newGraduations.length} NEW graduations since last check`);
+        console.log(`   Skipped ${oldCount} old graduations (before last check)`);
+        // ✅ REMOVED: console.log(`🗂️ Now tracking ${seenTokens.size} seen tokens`);
+        
+        // Fetch RugCheck + Bundle data IN PARALLEL for each token
+        // RugCheck is sequential (rate limited), Bundle checks run in parallel alongside
+        console.log(`📊 Fetching RugCheck + Bundle data for ${newGraduations.length} tokens...`);
+        const rugCheckMap = new Map();
+        const bundleMap = new Map();
+        
+        // Start ALL bundle checks in parallel (Helius has generous rate limits)
+        const bundlePromises = newGraduations.map(async (token) => {
+            const address = token.address || token.mint || token.token_address || token.tokenAddress;
+            try {
+                const bundleData = await fetchBundleData(address);
+                bundleMap.set(address, bundleData);
+            } catch (err) {
+                console.log(`⚠️ Bundle check failed for ${address.slice(0, 8)}: ${err.message}`);
+                bundleMap.set(address, null);
+            }
+        });
+        
+        // Run RugCheck SEQUENTIALLY (rate limited) while bundles run in parallel
+        const rugCheckPromise = (async () => {
+            for (const token of newGraduations) {
+                const address = token.address || token.mint || token.token_address || token.tokenAddress;
+                try {
+                    const rugCheckData = await fetchRugCheckData(address);
+                    rugCheckMap.set(address, rugCheckData);
+                } catch (err) {
+                    console.log(`⚠️ RugCheck failed for ${address.slice(0, 8)}: ${err.message}`);
+                    rugCheckMap.set(address, null);
+                }
+            }
+        })();
+        
+        // Wait for BOTH to complete
+        await Promise.all([rugCheckPromise, ...bundlePromises]);
+        
+        console.log(`✅ RugCheck + Bundle complete: ${rugCheckMap.size} rugchecks, ${bundleMap.size} bundle checks`);
+        
+        // Format results with RugCheck + Bundle data
+        const formatted = newGraduations.map(token => {
+            const address = token.address || token.mint || token.token_address || token.tokenAddress;
+            const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
             const rugCheck = rugCheckMap.get(address);
-            const source = token._source;
+            const bundle = bundleMap.get(address);
             
             const ageMinutes = graduatedAt 
                 ? Math.floor((currentCheckTime - (typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime())) / (1000 * 60))
@@ -1140,62 +1142,383 @@ app.get('/api/live-launches', async (req, res) => {
                 symbol: token.symbol || 'UNKNOWN',
                 name: token.name || 'Unknown Token',
                 contract: address,
-                source: source, // 'Pump' or 'Meteora'
                 ageMinutes: ageMinutes,
                 liquidity: token.liquidity || token.reserve_in_usd || token.raydium_liquidity || 0,
                 price: token.priceUsd || token.price_usd || token.price || token.priceNative || 0,
-                dex: source === 'Pump' ? 'raydium' : 'meteora',
+                dex: 'raydium',
                 hasLogo: !!token.logo || !!token.image_uri || !!token.logoURI,
                 hasWebsite: !!token.website,
                 hasSocials: !!(token.twitter || token.telegram),
                 website: token.website || null,
                 dexscreenerUrl: `https://dexscreener.com/solana/${address}`,
                 jupiterUrl: `https://jup.ag/?sell=So11111111111111111111111111111111111111112&buy=${address}`,
-                raydiumUrl: source === 'Pump' 
-                    ? `https://raydium.io/swap/?inputCurrency=sol&outputCurrency=${address}`
-                    : `https://app.meteora.ag/pools?token=${address}`,
+                raydiumUrl: `https://raydium.io/swap/?inputCurrency=sol&outputCurrency=${address}`,
                 priceChange: {
                     m5: token.priceChange5m || token.price_change_5m || token.priceChange?.['5m'] || 0,
                     h1: token.priceChange1h || token.price_change_1h || token.priceChange?.['1h'] || 0
                 },
                 graduated: true,
                 marketCap: token.market_cap || token.marketCap || 0,
-                graduatedAt: graduatedAt,
+                graduatedAt: graduatedAt, // Include timestamp
                 // RugCheck data
                 rugCheckScore: rugCheck?.score || 0,
-                topHoldersPercent: rugCheck?.topHoldersPercent || null,
+                top10HoldersPercent: rugCheck?.top10Percent || null,
                 creatorAddress: rugCheck?.creator || null,
                 creatorPercent: rugCheck?.creatorPercent || null,
                 creatorHasRugged: rugCheck?.creatorHasRugged || false,
                 rugCheckRisks: rugCheck?.risks || [],
-                isRugged: rugCheck?.rugged || false
+                isRugged: rugCheck?.rugged || false,
+                // Bundle Detection data
+                bundleDetection: bundle ? {
+                    isBundled: bundle.isBundled || false,
+                    bundledWallets: bundle.bundledWallets || 0,
+                    bundledPercent: bundle.bundledPercent || null,        // NEW: e.g. "34.2%"
+                    totalEarlyBuyers: bundle.totalEarlyBuyers || 0,
+                    earlyBuyersPercent: bundle.earlyBuyersPercent || null, // NEW: e.g. "52.1%"
+                    riskLevel: bundle.riskLevel || 'NONE',
+                    summary: bundle.summary || 'No data'
+                } : null
             };
         });
-        
-        // Add newly formatted tokens to rolling cache
-        addTokensToCache(formatted);
-        
-        // NOW update check times (after cache is populated)
-        // This prevents race conditions between users
-        lastGraduationCheck = currentCheckTime;
-        lastMeteoraCheck = currentCheckTime;
-        
-        // Return ALL cached tokens (includes new ones + previous hour)
-        const allCachedTokens = getCachedTokens();
         
         res.json({
             success: true,
             timestamp: new Date().toISOString(),
-            totalScanned: pumpTokens.length + meteoraTokens.length,
-            launches: allCachedTokens,
-            count: allCachedTokens.length,
-            newThisPoll: formatted.length,
-            message: `New: ${formatted.length} | Cached: ${allCachedTokens.length} (Pump: ${newPumpGraduations.length}, Meteora: ${meteoraTokens.length})`,
-            scamFilterRate: '0%'
+            totalScanned: tokens.length,
+            launches: formatted,
+            count: formatted.length,
+            message: 'Graduated Pump.fun tokens (completed bonding curve)',
+            scamFilterRate: `${tokens.length > 0 ? ((1 - formatted.length / tokens.length) * 100).toFixed(1) : '0'}%`
+            // ✅ REMOVED: seenTokensCount: seenTokens.size
         });
         
     } catch (error) {
         console.error('❌ Live Launches API error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ==========================================
+// BAGS.FM DBC LAUNCH TRACKING
+// ==========================================
+
+// Meteora DBC Program ID (where Bags.fm tokens launch)
+const METEORA_DBC_PROGRAM = 'dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN';
+
+// Track last check time for Bags launches
+let lastBagsCheck = Date.now() - (60 * 60 * 1000); // Look back 1 hour on startup
+
+// Cache for Bags token metadata (from DexScreener)
+const bagsMetadataCache = new Map();
+const BAGS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+// Check if a token address is a Bags.fm token (ends in BAGS)
+function isBagsToken(address) {
+    return address && address.toUpperCase().endsWith('BAGS');
+}
+
+// Fetch token metadata from DexScreener (free)
+async function fetchBagsTokenMetadata(tokenMint) {
+    try {
+        // Check cache first
+        const cached = bagsMetadataCache.get(tokenMint);
+        if (cached && (Date.now() - cached.timestamp < BAGS_CACHE_TTL)) {
+            return cached.data;
+        }
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+
+        const response = await fetch(
+            `https://api.dexscreener.com/latest/dex/tokens/${tokenMint}`,
+            { signal: controller.signal }
+        );
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+            console.log(`⚠️ DexScreener ${response.status} for ${tokenMint.slice(0, 8)}`);
+            return null;
+        }
+
+        const data = await response.json();
+        
+        // Get the first pair (most liquid)
+        const pair = data.pairs?.[0];
+        if (!pair) {
+            console.log(`⚠️ No pairs found on DexScreener for ${tokenMint.slice(0, 8)}`);
+            return null;
+        }
+
+        const metadata = {
+            symbol: pair.baseToken?.symbol || 'UNKNOWN',
+            name: pair.baseToken?.name || 'Unknown Token',
+            price: parseFloat(pair.priceUsd) || 0,
+            liquidity: pair.liquidity?.usd || 0,
+            marketCap: pair.marketCap || pair.fdv || 0,
+            priceChange5m: pair.priceChange?.m5 || 0,
+            priceChange1h: pair.priceChange?.h1 || 0,
+            pairAddress: pair.pairAddress,
+            dexId: pair.dexId,
+            createdAt: pair.pairCreatedAt
+        };
+
+        // Cache the result
+        bagsMetadataCache.set(tokenMint, { data: metadata, timestamp: Date.now() });
+
+        return metadata;
+    } catch (error) {
+        console.log(`⚠️ Metadata fetch error for ${tokenMint.slice(0, 8)}:`, error.message);
+        return null;
+    }
+}
+
+// Fetch new Bags.fm launches from Meteora DBC
+async function fetchBagsLaunches() {
+    if (!HELIUS_API_KEY) {
+        console.log('⚠️ HELIUS_API_KEY not set - skipping Bags DBC check');
+        return [];
+    }
+
+    try {
+        console.log('🛍️ Fetching Bags.fm DBC launches from Helius...');
+
+        // Get recent transactions on the Meteora DBC program
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+
+        const response = await fetch(
+            `${HELIUS_API_URL}/addresses/${METEORA_DBC_PROGRAM}/transactions?api-key=${HELIUS_API_KEY}&limit=50`,
+            { signal: controller.signal }
+        );
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+            console.log(`⚠️ Helius DBC API ${response.status}`);
+            return [];
+        }
+
+        const transactions = await response.json();
+        console.log(`📊 Helius returned ${transactions.length} DBC transactions`);
+
+        if (!transactions || transactions.length === 0) {
+            return [];
+        }
+
+        // Extract unique token mints from transactions
+        const potentialTokens = new Set();
+
+        for (const tx of transactions) {
+            // Skip if older than last check
+            const txTime = tx.timestamp ? tx.timestamp * 1000 : Date.now();
+            if (txTime <= lastBagsCheck) continue;
+
+            // Look for token mints in the transaction
+            // Check tokenTransfers
+            if (tx.tokenTransfers) {
+                for (const transfer of tx.tokenTransfers) {
+                    if (transfer.mint && isBagsToken(transfer.mint)) {
+                        potentialTokens.add(transfer.mint);
+                    }
+                }
+            }
+
+            // Check account data
+            if (tx.accountData) {
+                for (const account of tx.accountData) {
+                    if (account.account && isBagsToken(account.account)) {
+                        potentialTokens.add(account.account);
+                    }
+                }
+            }
+
+            // Check instructions for any addresses ending in BAGS
+            if (tx.instructions) {
+                for (const ix of tx.instructions) {
+                    if (ix.accounts) {
+                        for (const acc of ix.accounts) {
+                            if (isBagsToken(acc)) {
+                                potentialTokens.add(acc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        console.log(`🛍️ Found ${potentialTokens.size} potential Bags tokens`);
+
+        // Fetch metadata for each Bags token
+        const bagsLaunches = [];
+        
+        for (const tokenMint of potentialTokens) {
+            const metadata = await fetchBagsTokenMetadata(tokenMint);
+            
+            if (metadata) {
+                bagsLaunches.push({
+                    symbol: metadata.symbol,
+                    name: metadata.name,
+                    contract: tokenMint,
+                    price: metadata.price,
+                    liquidity: metadata.liquidity,
+                    marketCap: metadata.marketCap,
+                    priceChange: {
+                        m5: metadata.priceChange5m,
+                        h1: metadata.priceChange1h
+                    },
+                    source: 'Bags',
+                    dex: metadata.dexId || 'meteora',
+                    createdAt: metadata.createdAt,
+                    dexscreenerUrl: `https://dexscreener.com/solana/${tokenMint}`,
+                    bagsUrl: `https://bags.fm/${tokenMint}`,
+                    jupiterUrl: `https://jup.ag/?sell=So11111111111111111111111111111111111111112&buy=${tokenMint}`
+                });
+            }
+        }
+
+        return bagsLaunches;
+
+    } catch (error) {
+        console.error('❌ Bags DBC fetch error:', error.message);
+        return [];
+    }
+}
+
+// API Endpoint: Get Bags.fm DBC launches
+app.get('/api/bags-launches', async (req, res) => {
+    try {
+        console.log('🛍️ Fetching Bags.fm DBC launches...');
+        
+        const currentCheckTime = Date.now();
+        console.log(`⏰ Last Bags check: ${new Date(lastBagsCheck).toISOString()}`);
+        console.log(`⏰ Current check: ${new Date(currentCheckTime).toISOString()}`);
+
+        const bagsLaunches = await fetchBagsLaunches();
+
+        // Fetch RugCheck data for each token (in parallel)
+        console.log(`📊 Fetching RugCheck for ${bagsLaunches.length} Bags tokens...`);
+        
+        const rugCheckPromises = bagsLaunches.map(async (token) => {
+            try {
+                const rugCheck = await fetchRugCheckData(token.contract);
+                return { contract: token.contract, rugCheck };
+            } catch (err) {
+                return { contract: token.contract, rugCheck: null };
+            }
+        });
+
+        const rugCheckResults = await Promise.all(rugCheckPromises);
+        const rugCheckMap = new Map(rugCheckResults.map(r => [r.contract, r.rugCheck]));
+
+        // Format results with RugCheck data
+        const formatted = bagsLaunches.map(token => {
+            const rugCheck = rugCheckMap.get(token.contract);
+            
+            // Calculate age in minutes
+            const createdTime = token.createdAt ? new Date(token.createdAt).getTime() : currentCheckTime;
+            const ageMinutes = Math.floor((currentCheckTime - createdTime) / (1000 * 60));
+            
+            return {
+                ...token,
+                ageMinutes: ageMinutes,
+                // RugCheck data
+                topHoldersPercent: rugCheck?.top10Percent || null,
+                creatorPercent: rugCheck?.creatorPercent || null,
+                creatorAddress: rugCheck?.creator || null,
+                creatorHasRugged: rugCheck?.creatorHasRugged || false,
+                rugCheckScore: rugCheck?.score || 0,
+                rugCheckRisks: rugCheck?.risks || []
+            };
+        });
+
+        // Update last check time
+        lastBagsCheck = currentCheckTime;
+
+        console.log(`✅ Returning ${formatted.length} Bags.fm launches`);
+
+        res.json({
+            success: true,
+            timestamp: new Date().toISOString(),
+            launches: formatted,
+            count: formatted.length,
+            message: 'Bags.fm DBC launches (bonding curve phase)',
+            source: 'Meteora DBC'
+        });
+
+    } catch (error) {
+        console.error('❌ Bags Launches API error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Combined endpoint: Get BOTH Pump.fun graduations AND Bags.fm launches
+app.get('/api/all-launches', async (req, res) => {
+    try {
+        console.log('🚀 Fetching ALL launches (Pump.fun + Bags.fm)...');
+
+        // Fetch both in parallel
+        const [pumpResponse, bagsLaunches] = await Promise.all([
+            // Reuse the existing Pump.fun logic
+            (async () => {
+                const MORALIS_API_KEY = process.env.MORALIS_API_KEY;
+                if (!MORALIS_API_KEY) return [];
+
+                const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/graduated', {
+                    headers: {
+                        'Accept': 'application/json',
+                        'X-API-Key': MORALIS_API_KEY
+                    }
+                });
+
+                if (!response.ok) return [];
+                const data = await response.json();
+                
+                let tokens = [];
+                if (Array.isArray(data)) tokens = data;
+                else if (data.tokens) tokens = data.tokens;
+                else if (data.result) tokens = data.result;
+                else if (data.data) tokens = data.data;
+
+                return tokens.slice(0, 20); // Limit for performance
+            })(),
+            // Bags.fm launches
+            fetchBagsLaunches()
+        ]);
+
+        // Simple format for Pump tokens (skip full RugCheck for speed)
+        const pumpFormatted = pumpResponse.map(token => ({
+            symbol: token.symbol || 'UNKNOWN',
+            name: token.name || 'Unknown Token',
+            contract: token.address || token.mint || token.token_address,
+            price: token.priceUsd || token.price_usd || token.price || 0,
+            liquidity: token.liquidity || token.reserve_in_usd || 0,
+            marketCap: token.market_cap || token.marketCap || 0,
+            source: 'Pump',
+            dex: 'raydium',
+            graduatedAt: token.graduated_at || token.graduatedAt,
+            dexscreenerUrl: `https://dexscreener.com/solana/${token.address || token.mint}`
+        }));
+
+        // Combine and sort by recency
+        const allLaunches = [...bagsLaunches, ...pumpFormatted];
+
+        res.json({
+            success: true,
+            timestamp: new Date().toISOString(),
+            launches: allLaunches,
+            count: allLaunches.length,
+            pumpCount: pumpFormatted.length,
+            bagsCount: bagsLaunches.length,
+            message: 'Combined Pump.fun graduations + Bags.fm DBC launches'
+        });
+
+    } catch (error) {
+        console.error('❌ All Launches API error:', error);
         res.status(500).json({
             success: false,
             error: error.message
@@ -1237,87 +1560,64 @@ app.post('/api/token-prices', async (req, res) => {
         // Fetch all prices in PARALLEL for speed
         const pricePromises = contracts.map(async (contract) => {
             try {
-                // Try DexScreener first (best for graduated tokens)
-                const dexUrl = `https://api.dexscreener.com/latest/dex/tokens/${contract}`;
-                const dexController = new AbortController();
-                const dexTimeout = setTimeout(() => dexController.abort(), 3000); // 3s timeout
+                // DexScreener API - free, reliable, real-time
+                const url = `https://api.dexscreener.com/latest/dex/tokens/${contract}`;
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 3000); // 3s timeout
                 
-                const dexResponse = await fetch(dexUrl, {
-                    signal: dexController.signal
+                const response = await fetch(url, {
+                    signal: controller.signal
                 });
-                clearTimeout(dexTimeout);
+                clearTimeout(timeout);
                 
-                if (dexResponse.ok) {
-                    const dexData = await dexResponse.json();
-                    
-                    if (dexData.pairs && dexData.pairs.length > 0) {
-                        const pair = dexData.pairs[0];
-                        return {
-                            contract: contract,
-                            success: true,
-                            price: pair.priceUsd || '0',
-                            priceNative: pair.priceNative || '0',
-                            priceChange: {
-                                m5: parseFloat(pair.priceChange?.m5 || 0),
-                                h1: parseFloat(pair.priceChange?.h1 || 0),
-                                h6: parseFloat(pair.priceChange?.h6 || 0),
-                                h24: parseFloat(pair.priceChange?.h24 || 0)
-                            },
-                            volume: {
-                                m5: parseFloat(pair.volume?.m5 || 0),
-                                h1: parseFloat(pair.volume?.h1 || 0),
-                                h6: parseFloat(pair.volume?.h6 || 0),
-                                h24: parseFloat(pair.volume?.h24 || 0)
-                            },
-                            liquidity: {
-                                usd: parseFloat(pair.liquidity?.usd || 0),
-                                base: parseFloat(pair.liquidity?.base || 0),
-                                quote: parseFloat(pair.liquidity?.quote || 0)
-                            },
-                            pairAddress: pair.pairAddress,
-                            dexId: pair.dexId,
-                            url: pair.url,
-                            source: 'dexscreener'
-                        };
-                    }
+                if (!response.ok) {
+                    console.error(`DexScreener error for ${contract.slice(0, 8)}: ${response.status}`);
+                    return {
+                        contract: contract,
+                        success: false,
+                        error: `API returned ${response.status}`
+                    };
                 }
                 
-                // DexScreener failed or no pairs - try Jupiter Price API (works for Pump.fun tokens)
-                console.log(`   DexScreener no data for ${contract.slice(0, 8)}, trying Jupiter...`);
-                const jupUrl = `https://price.jup.ag/v6/price?ids=${contract}`;
-                const jupController = new AbortController();
-                const jupTimeout = setTimeout(() => jupController.abort(), 3000);
+                const data = await response.json();
                 
-                const jupResponse = await fetch(jupUrl, {
-                    signal: jupController.signal
-                });
-                clearTimeout(jupTimeout);
-                
-                if (jupResponse.ok) {
-                    const jupData = await jupResponse.json();
-                    const priceData = jupData.data?.[contract];
-                    
-                    if (priceData && priceData.price) {
-                        console.log(`   ✅ Jupiter got price for ${contract.slice(0, 8)}: $${priceData.price}`);
-                        return {
-                            contract: contract,
-                            success: true,
-                            price: priceData.price.toString(),
-                            priceNative: '0', // Jupiter doesn't provide native price easily
-                            priceChange: { m5: 0, h1: 0, h6: 0, h24: 0 },
-                            volume: { m5: 0, h1: 0, h6: 0, h24: 0 },
-                            liquidity: { usd: 0, base: 0, quote: 0 },
-                            source: 'jupiter'
-                        };
-                    }
+                // Check if token has trading pairs
+                if (!data.pairs || data.pairs.length === 0) {
+                    return {
+                        contract: contract,
+                        success: false,
+                        error: 'No trading pairs found'
+                    };
                 }
                 
-                // Both APIs failed
-                console.log(`   ❌ No price found for ${contract.slice(0, 8)} (DexScreener + Jupiter failed)`);
+                // Get most liquid pair (usually first)
+                const pair = data.pairs[0];
+                
                 return {
                     contract: contract,
-                    success: false,
-                    error: 'No trading pairs found (tried DexScreener + Jupiter)'
+                    success: true,
+                    price: pair.priceUsd || '0',
+                    priceNative: pair.priceNative || '0',
+                    priceChange: {
+                        m5: parseFloat(pair.priceChange?.m5 || 0),
+                        h1: parseFloat(pair.priceChange?.h1 || 0),
+                        h6: parseFloat(pair.priceChange?.h6 || 0),
+                        h24: parseFloat(pair.priceChange?.h24 || 0)
+                    },
+                    volume: {
+                        m5: parseFloat(pair.volume?.m5 || 0),
+                        h1: parseFloat(pair.volume?.h1 || 0),
+                        h6: parseFloat(pair.volume?.h6 || 0),
+                        h24: parseFloat(pair.volume?.h24 || 0)
+                    },
+                    liquidity: {
+                        usd: parseFloat(pair.liquidity?.usd || 0),
+                        base: parseFloat(pair.liquidity?.base || 0),
+                        quote: parseFloat(pair.liquidity?.quote || 0)
+                    },
+                    pairAddress: pair.pairAddress,
+                    dexId: pair.dexId,
+                    url: pair.url
                 };
                 
             } catch (error) {
@@ -2289,6 +2589,9 @@ app.listen(PORT, () => {
     console.log(`   POST /api/whale/live/mark-read`);
     console.log(`   POST /api/whale/live/mark-all-read`);
     console.log(`   GET  /api/stats`);
+    console.log(`   GET  /api/live-launches (Pump.fun graduations)`);
+    console.log(`   GET  /api/bags-launches (Bags.fm DBC launches)`);
+    console.log(`   GET  /api/all-launches (Combined Pump + Bags)`);
     console.log(`   GET  /api/admin/projects/count`);
     console.log(`   DELETE /api/admin/projects/clear-all`);
     console.log(`   DELETE /api/admin/projects/clear-old`);
