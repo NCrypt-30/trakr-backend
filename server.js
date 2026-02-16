@@ -2947,7 +2947,7 @@ app.post('/api/wallet-tracker/webhook', async (req, res) => {
             }
             
             // Parse the transaction
-            const activity = parseHeliusTransaction(enrichedTx);
+            const activity = await parseHeliusTransaction(enrichedTx);
             if (!activity) {
                 console.log(`   ⏭️ Skipped (not tracked or invalid)`);
                 continue;
@@ -2981,8 +2981,62 @@ app.post('/api/wallet-tracker/webhook', async (req, res) => {
     }
 });
 
+// Cache for token symbols (to avoid repeated API calls)
+const tokenSymbolCache = new Map();
+
+// Known token symbols (common ones)
+const KNOWN_TOKENS = {
+    'So11111111111111111111111111111111111111112': 'SOL',
+    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'USDC',
+    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 'USDT',
+    'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So': 'mSOL',
+    'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263': 'BONK',
+    'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN': 'JUP',
+    '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs': 'ETH',
+    'HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3': 'PYTH',
+    'rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof': 'RENDER'
+};
+
+// Get token symbol from cache, known list, or DexScreener
+async function getTokenSymbol(mint) {
+    if (!mint) return null;
+    
+    // Check known tokens first
+    if (KNOWN_TOKENS[mint]) {
+        return KNOWN_TOKENS[mint];
+    }
+    
+    // Check cache
+    if (tokenSymbolCache.has(mint)) {
+        return tokenSymbolCache.get(mint);
+    }
+    
+    // Fetch from DexScreener
+    try {
+        const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+        if (response.ok) {
+            const data = await response.json();
+            if (data.pairs && data.pairs.length > 0) {
+                const symbol = data.pairs[0].baseToken?.symbol;
+                if (symbol) {
+                    tokenSymbolCache.set(mint, symbol);
+                    console.log(`   📛 Got symbol from DexScreener: ${mint.slice(0, 8)} = ${symbol}`);
+                    return symbol;
+                }
+            }
+        }
+    } catch (e) {
+        console.warn(`   ⚠️ Failed to fetch symbol for ${mint.slice(0, 8)}: ${e.message}`);
+    }
+    
+    // Fallback to first 8 chars
+    const fallback = mint.slice(0, 8);
+    tokenSymbolCache.set(mint, fallback);
+    return fallback;
+}
+
 // Parse Helius enhanced transaction into activity
-function parseHeliusTransaction(tx) {
+async function parseHeliusTransaction(tx) {
     try {
         if (!tx || !tx.signature) return null;
         
@@ -3013,8 +3067,8 @@ function parseHeliusTransaction(tx) {
                 tokenInAmount = solAmount;
                 
                 if (swap.tokenOutputs?.[0]) {
-                    tokenOut = swap.tokenOutputs[0].symbol || swap.tokenOutputs[0].mint?.slice(0, 8);
                     tokenOutMint = swap.tokenOutputs[0].mint;
+                    tokenOut = swap.tokenOutputs[0].symbol || await getTokenSymbol(tokenOutMint);
                     tokenOutAmount = swap.tokenOutputs[0].tokenAmount;
                 }
                 type = 'buy';
@@ -3025,18 +3079,18 @@ function parseHeliusTransaction(tx) {
                 tokenOutAmount = solAmount;
                 
                 if (swap.tokenInputs?.[0]) {
-                    tokenIn = swap.tokenInputs[0].symbol || swap.tokenInputs[0].mint?.slice(0, 8);
                     tokenInMint = swap.tokenInputs[0].mint;
+                    tokenIn = swap.tokenInputs[0].symbol || await getTokenSymbol(tokenInMint);
                     tokenInAmount = swap.tokenInputs[0].tokenAmount;
                 }
                 type = 'sell';
             } else if (swap.tokenInputs?.[0] && swap.tokenOutputs?.[0]) {
                 // Token -> Token
-                tokenIn = swap.tokenInputs[0].symbol || swap.tokenInputs[0].mint?.slice(0, 8);
                 tokenInMint = swap.tokenInputs[0].mint;
+                tokenIn = swap.tokenInputs[0].symbol || await getTokenSymbol(tokenInMint);
                 tokenInAmount = swap.tokenInputs[0].tokenAmount;
-                tokenOut = swap.tokenOutputs[0].symbol || swap.tokenOutputs[0].mint?.slice(0, 8);
                 tokenOutMint = swap.tokenOutputs[0].mint;
+                tokenOut = swap.tokenOutputs[0].symbol || await getTokenSymbol(tokenOutMint);
                 tokenOutAmount = swap.tokenOutputs[0].tokenAmount;
                 type = 'swap';
             }
@@ -3076,8 +3130,8 @@ function parseHeliusTransaction(tx) {
             if (outTransfer && nativeChange > 1000000) {
                 // Sent token, received SOL = SELL
                 type = 'sell';
-                tokenIn = outTransfer.symbol || outTransfer.mint?.slice(0, 8);
                 tokenInMint = outTransfer.mint;
+                tokenIn = outTransfer.symbol || await getTokenSymbol(tokenInMint);
                 tokenInAmount = outTransfer.tokenAmount;
                 tokenOut = 'SOL';
                 solAmount = nativeChange / 1e9;
@@ -3090,34 +3144,34 @@ function parseHeliusTransaction(tx) {
                 tokenIn = 'SOL';
                 solAmount = Math.abs(nativeChange) / 1e9;
                 tokenInAmount = solAmount;
-                tokenOut = inTransfer.symbol || inTransfer.mint?.slice(0, 8);
                 tokenOutMint = inTransfer.mint;
+                tokenOut = inTransfer.symbol || await getTokenSymbol(tokenOutMint);
                 tokenOutAmount = inTransfer.tokenAmount;
                 console.log(`   ✅ Detected BUY: ${solAmount.toFixed(4)} SOL -> ${tokenOut}`);
                 
             } else if (outTransfer && inTransfer) {
                 // Token to token swap
                 type = 'swap';
-                tokenIn = outTransfer.symbol || outTransfer.mint?.slice(0, 8);
                 tokenInMint = outTransfer.mint;
+                tokenIn = outTransfer.symbol || await getTokenSymbol(tokenInMint);
                 tokenInAmount = outTransfer.tokenAmount;
-                tokenOut = inTransfer.symbol || inTransfer.mint?.slice(0, 8);
                 tokenOutMint = inTransfer.mint;
+                tokenOut = inTransfer.symbol || await getTokenSymbol(tokenOutMint);
                 tokenOutAmount = inTransfer.tokenAmount;
                 console.log(`   ✅ Detected SWAP: ${tokenIn} -> ${tokenOut}`);
                 
             } else if (outTransfer) {
                 // Just sent
                 type = 'sent';
-                tokenIn = outTransfer.symbol || outTransfer.mint?.slice(0, 8);
                 tokenInMint = outTransfer.mint;
+                tokenIn = outTransfer.symbol || await getTokenSymbol(tokenInMint);
                 tokenInAmount = outTransfer.tokenAmount;
                 
             } else if (inTransfer) {
                 // Just received
                 type = 'received';
-                tokenOut = inTransfer.symbol || inTransfer.mint?.slice(0, 8);
                 tokenOutMint = inTransfer.mint;
+                tokenOut = inTransfer.symbol || await getTokenSymbol(tokenOutMint);
                 tokenOutAmount = inTransfer.tokenAmount;
             }
         }
