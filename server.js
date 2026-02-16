@@ -2912,101 +2912,112 @@ function parseHeliusTransaction(tx) {
     try {
         if (!tx || !tx.signature) return null;
         
-        console.log(`📝 Parsing tx: ${tx.signature?.slice(0, 8)}... type=${tx.type}`);
+        console.log(`📝 Parsing tx: ${tx.signature?.slice(0, 8)}...`);
+        console.log(`   Type: ${tx.type}, Description: ${tx.description?.slice(0, 50) || 'none'}`);
+        
+        // Log for debugging
+        if (tx.events) {
+            console.log(`   Events: swap=${!!tx.events.swap}, nft=${!!tx.events.nft}`);
+        }
         
         // Determine transaction type and involved wallets
         let type = 'transfer';
         let token = null;
         let tokenMint = null;
         let amount = null;
-        let amountUsd = null;
+        let amountSol = null; // Store SOL amount instead of USD
         let walletAddress = tx.feePayer;
         
         const SOL_MINT = 'So11111111111111111111111111111111111111112';
         
-        // Check for swap/trade (most important for copy trading)
-        if (tx.type === 'SWAP' || tx.events?.swap) {
-            const swap = tx.events?.swap;
-            if (swap) {
-                // Determine if buy or sell based on what's being swapped
-                // Buy = SOL in, Token out
-                // Sell = Token in, SOL out
-                const hasNativeInput = swap.nativeInput && swap.nativeInput.amount > 0;
-                const hasNativeOutput = swap.nativeOutput && swap.nativeOutput.amount > 0;
+        // Method 1: Check for swap in events (most reliable)
+        if (tx.events?.swap) {
+            const swap = tx.events.swap;
+            console.log(`   Swap event found: nativeIn=${swap.nativeInput?.amount}, nativeOut=${swap.nativeOutput?.amount}`);
+            
+            const hasNativeInput = swap.nativeInput && swap.nativeInput.amount > 0;
+            const hasNativeOutput = swap.nativeOutput && swap.nativeOutput.amount > 0;
+            
+            if (hasNativeInput && swap.tokenOutputs?.length > 0) {
+                type = 'buy';
+                const tokenOut = swap.tokenOutputs[0];
+                token = tokenOut.symbol || null;
+                tokenMint = tokenOut.mint;
+                amount = tokenOut.tokenAmount;
+                amountSol = swap.nativeInput.amount / 1e9;
+                console.log(`   ✅ BUY: ${amountSol.toFixed(4)} SOL → ${token || tokenMint?.slice(0, 8)}`);
                 
-                if (hasNativeInput && swap.tokenOutputs?.length > 0) {
-                    // Bought tokens with SOL
-                    type = 'buy';
-                    const tokenOut = swap.tokenOutputs[0];
-                    token = tokenOut.symbol || tokenOut.mint?.slice(0, 8) || 'Unknown';
-                    tokenMint = tokenOut.mint;
-                    amount = tokenOut.tokenAmount;
-                    // Calculate USD value from SOL input
-                    const solAmount = swap.nativeInput.amount / 1e9;
-                    amountUsd = solAmount * 250; // Rough estimate, will be updated by Jupiter
-                    
-                    console.log(`   ✅ BUY detected: ${solAmount.toFixed(4)} SOL → ${token} (${tokenMint?.slice(0, 8)})`);
-                    
-                } else if (hasNativeOutput && swap.tokenInputs?.length > 0) {
-                    // Sold tokens for SOL
-                    type = 'sell';
-                    const tokenIn = swap.tokenInputs[0];
-                    token = tokenIn.symbol || tokenIn.mint?.slice(0, 8) || 'Unknown';
-                    tokenMint = tokenIn.mint;
-                    amount = tokenIn.tokenAmount;
-                    // Calculate USD value from SOL output
-                    const solAmount = swap.nativeOutput.amount / 1e9;
-                    amountUsd = solAmount * 250;
-                    
-                    console.log(`   ✅ SELL detected: ${token} → ${solAmount.toFixed(4)} SOL`);
-                    
-                } else if (swap.tokenInputs?.length > 0 && swap.tokenOutputs?.length > 0) {
-                    // Token to token swap - treat as buy of output token
-                    type = 'buy';
-                    const tokenOut = swap.tokenOutputs[0];
-                    token = tokenOut.symbol || tokenOut.mint?.slice(0, 8) || 'Unknown';
-                    tokenMint = tokenOut.mint;
-                    amount = tokenOut.tokenAmount;
-                    
-                    console.log(`   ✅ TOKEN SWAP detected: ${swap.tokenInputs[0]?.symbol || '?'} → ${token}`);
+            } else if (hasNativeOutput && swap.tokenInputs?.length > 0) {
+                type = 'sell';
+                const tokenIn = swap.tokenInputs[0];
+                token = tokenIn.symbol || null;
+                tokenMint = tokenIn.mint;
+                amount = tokenIn.tokenAmount;
+                amountSol = swap.nativeOutput.amount / 1e9;
+                console.log(`   ✅ SELL: ${token || tokenMint?.slice(0, 8)} → ${amountSol.toFixed(4)} SOL`);
+                
+            } else if (swap.tokenInputs?.length > 0 && swap.tokenOutputs?.length > 0) {
+                type = 'buy';
+                const tokenOut = swap.tokenOutputs[0];
+                token = tokenOut.symbol || null;
+                tokenMint = tokenOut.mint;
+                amount = tokenOut.tokenAmount;
+                console.log(`   ✅ TOKEN SWAP: → ${token || tokenMint?.slice(0, 8)}`);
+            }
+        }
+        
+        // Method 2: Check transaction type and description for swaps
+        if (type === 'transfer') {
+            const txType = (tx.type || '').toUpperCase();
+            const desc = (tx.description || '').toLowerCase();
+            
+            // Check if description indicates a swap
+            if (desc.includes('swapped') || desc.includes('swap') || txType === 'SWAP') {
+                console.log(`   Detected swap from description/type`);
+                
+                // Try to parse from description: "X swapped 0.1 SOL for 1000 TOKEN"
+                const swapMatch = desc.match(/swapped\s+([\d.]+)\s+(\w+)\s+for\s+([\d.]+)\s+(\w+)/i);
+                if (swapMatch) {
+                    const [, inAmount, inToken, outAmount, outToken] = swapMatch;
+                    if (inToken.toUpperCase() === 'SOL') {
+                        type = 'buy';
+                        token = outToken;
+                        amountSol = parseFloat(inAmount);
+                    } else if (outToken.toUpperCase() === 'SOL') {
+                        type = 'sell';
+                        token = inToken;
+                        amountSol = parseFloat(outAmount);
+                    }
+                    console.log(`   ✅ Parsed from desc: ${type} ${token}`);
                 }
             }
         }
         
-        // If not a swap, check for simple transfer
+        // Method 3: Check tokenTransfers for simple transfers
         if (type === 'transfer' && tx.tokenTransfers && tx.tokenTransfers.length > 0) {
             const transfer = tx.tokenTransfers[0];
             
-            // Skip if it's just SOL transfer
-            if (transfer.mint !== SOL_MINT) {
-                token = transfer.symbol || transfer.mint?.slice(0, 8) || 'Unknown';
+            if (transfer.mint && transfer.mint !== SOL_MINT) {
+                token = transfer.symbol || null;
                 tokenMint = transfer.mint;
                 amount = transfer.tokenAmount;
                 
-                // Determine if it's incoming or outgoing
                 if (transfer.toUserAccount === walletAddress) {
                     type = 'received';
                 } else if (transfer.fromUserAccount === walletAddress) {
                     type = 'sent';
                 }
-                
-                console.log(`   ✅ TRANSFER detected: ${token} ${type}`);
+                console.log(`   ✅ Transfer: ${type} ${token || tokenMint?.slice(0, 8)}`);
             }
         }
         
-        // Use the transaction description if available and we don't have a token
-        if (!token && tx.description) {
-            token = tx.description.slice(0, 30);
-        }
-        
-        // Set type from tx.type if still transfer
+        // Final fallback for type
         if (type === 'transfer' && tx.type) {
-            type = tx.type.toLowerCase();
+            type = tx.type.toLowerCase().replace('fungible', '');
         }
         
         // Skip if wallet isn't tracked
         if (!walletAddress || !trackedWallets.has(walletAddress)) {
-            // Check if any involved account is tracked
             const involvedAccounts = [
                 tx.feePayer,
                 ...(tx.tokenTransfers?.map(t => t.fromUserAccount) || []),
@@ -3018,18 +3029,17 @@ function parseHeliusTransaction(tx) {
             if (!walletAddress) return null;
         }
         
-        // Don't return if tokenMint is SOL (can't copy trade SOL)
-        // But still track the activity
+        console.log(`   📤 Final: type=${type}, token=${token}, mint=${tokenMint?.slice(0, 8) || 'none'}`);
         
         return {
             id: tx.signature,
             signature: tx.signature,
             walletAddress,
             type,
-            token,
-            tokenMint: tokenMint !== SOL_MINT ? tokenMint : null, // Don't set SOL as tokenMint for copy trade
+            token, // Symbol only (e.g., "USDC")
+            tokenMint: tokenMint !== SOL_MINT ? tokenMint : null,
             amount,
-            amountUsd,
+            amountSol, // SOL amount (no USD conversion)
             timestamp: tx.timestamp ? tx.timestamp * 1000 : Date.now(),
             description: tx.description
         };
@@ -3148,39 +3158,59 @@ app.get('/api/wallet-tracker/holdings/:address', async (req, res) => {
             });
         }
         
-        // Get all prices from Jupiter (batch in groups of 10 to be safe)
+        // Get all prices from DexScreener (free, no auth required)
         if (holdings.length > 0) {
             try {
-                const BATCH_SIZE = 10;
                 const allPrices = {};
                 
-                for (let i = 0; i < holdings.length; i += BATCH_SIZE) {
-                    const batch = holdings.slice(i, i + BATCH_SIZE);
+                // Get SOL price from Binance (reliable, free)
+                try {
+                    const solPriceResponse = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT');
+                    if (solPriceResponse.ok) {
+                        const solPriceData = await solPriceResponse.json();
+                        if (solPriceData.price) {
+                            allPrices['So11111111111111111111111111111111111111112'] = { price: parseFloat(solPriceData.price) };
+                            console.log(`📊 SOL price from Binance: $${solPriceData.price}`);
+                        }
+                    }
+                } catch (e) {
+                    console.warn('⚠️ Could not fetch SOL price from Binance');
+                }
+                
+                // Get other token prices from DexScreener (batch up to 30)
+                const nonSolHoldings = holdings.filter(h => h.mint !== 'So11111111111111111111111111111111111111112');
+                const BATCH_SIZE = 30;
+                
+                for (let i = 0; i < nonSolHoldings.length; i += BATCH_SIZE) {
+                    const batch = nonSolHoldings.slice(i, i + BATCH_SIZE);
                     const mints = batch.map(h => h.mint).join(',');
                     
-                    // Try Jupiter Price API v6
-                    const priceUrl = `https://api.jup.ag/price/v2?ids=${mints}`;
-                    console.log(`📊 Fetching prices from Jupiter: ${batch.length} tokens`);
+                    const priceUrl = `https://api.dexscreener.com/latest/dex/tokens/${mints}`;
+                    console.log(`📊 Fetching prices from DexScreener: ${batch.length} tokens`);
                     
                     const priceResponse = await fetch(priceUrl, {
                         method: 'GET',
-                        headers: { 
-                            'Accept': 'application/json',
-                            'User-Agent': 'Trakr/1.0'
-                        }
+                        headers: { 'Accept': 'application/json' }
                     });
                     
                     if (priceResponse.ok) {
                         const priceData = await priceResponse.json();
-                        if (priceData.data) {
-                            Object.assign(allPrices, priceData.data);
+                        
+                        // DexScreener returns pairs, extract price per token
+                        if (priceData.pairs) {
+                            for (const pair of priceData.pairs) {
+                                const mint = pair.baseToken?.address;
+                                if (mint && !allPrices[mint] && pair.priceUsd) {
+                                    allPrices[mint] = { price: parseFloat(pair.priceUsd) };
+                                }
+                            }
                         }
                     } else {
-                        console.warn(`⚠️ Jupiter API returned ${priceResponse.status}`);
+                        console.warn(`⚠️ DexScreener API returned ${priceResponse.status}`);
                     }
                 }
                 
-                // Update holdings with Jupiter prices
+                // Update holdings with prices
                 holdings.forEach(holding => {
                     const priceInfo = allPrices[holding.mint];
                     if (priceInfo?.price) {
@@ -3192,7 +3222,7 @@ app.get('/api/wallet-tracker/holdings/:address', async (req, res) => {
                 console.log(`✅ Got prices for ${Object.keys(allPrices).length} tokens`);
                 
             } catch (e) {
-                console.warn('⚠️ Could not fetch prices from Jupiter:', e.message);
+                console.warn('⚠️ Could not fetch prices:', e.message);
             }
         }
         
