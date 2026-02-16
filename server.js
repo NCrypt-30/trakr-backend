@@ -3070,41 +3070,52 @@ app.get('/api/wallet-tracker/holdings/:address', async (req, res) => {
                 name: item.content?.metadata?.name || item.token_info?.name || 'Unknown Token',
                 balance: item.token_info?.balance || 0,
                 decimals: item.token_info?.decimals || 9,
-                valueUsd: item.token_info?.price_info?.total_price || null
+                valueUsd: null // Will be filled by Jupiter
             }));
         
-        // Add native SOL balance at the beginning
+        // Add native SOL balance
         if (solBalanceData.result?.value) {
             const solBalance = solBalanceData.result.value;
-            const solAmount = solBalance / 1e9; // Convert lamports to SOL
-            
-            // Get SOL price (rough estimate, or fetch from API)
-            // Using a simple fetch to get current SOL price
-            let solPrice = 200; // Default fallback
-            try {
-                const priceResponse = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-                if (priceResponse.ok) {
-                    const priceData = await priceResponse.json();
-                    solPrice = priceData.solana?.usd || 200;
-                }
-            } catch (e) {
-                console.warn('⚠️ Could not fetch SOL price, using default');
-            }
-            
-            const solValueUsd = solAmount * solPrice;
-            
             holdings.unshift({
                 mint: 'So11111111111111111111111111111111111111112',
                 symbol: 'SOL',
                 name: 'Solana',
                 balance: solBalance,
                 decimals: 9,
-                valueUsd: solValueUsd
+                valueUsd: null
             });
         }
         
-        // Sort by USD value (highest first)
-        holdings.sort((a, b) => (b.valueUsd || 0) - (a.valueUsd || 0));
+        // Get all prices from Jupiter in one call
+        if (holdings.length > 0) {
+            try {
+                const mints = holdings.map(h => h.mint).join(',');
+                const priceResponse = await fetch(`https://price.jup.ag/v6/price?ids=${mints}`);
+                
+                if (priceResponse.ok) {
+                    const priceData = await priceResponse.json();
+                    
+                    // Update holdings with Jupiter prices
+                    holdings.forEach(holding => {
+                        const priceInfo = priceData.data?.[holding.mint];
+                        if (priceInfo?.price) {
+                            const amount = holding.balance / Math.pow(10, holding.decimals);
+                            holding.valueUsd = amount * priceInfo.price;
+                        }
+                    });
+                }
+            } catch (e) {
+                console.warn('⚠️ Could not fetch prices from Jupiter:', e.message);
+            }
+        }
+        
+        // Sort by USD value (highest first), nulls at end
+        holdings.sort((a, b) => {
+            if (a.valueUsd === null && b.valueUsd === null) return 0;
+            if (a.valueUsd === null) return 1;
+            if (b.valueUsd === null) return -1;
+            return b.valueUsd - a.valueUsd;
+        });
         
         console.log(`👛 Fetched ${holdings.length} holdings for ${address.slice(0, 8)}...`);
         
