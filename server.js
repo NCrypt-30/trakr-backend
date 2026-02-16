@@ -2736,7 +2736,7 @@ const PORT = process.env.PORT || 3000;
 
 // In-memory storage for wallet activities (persists until server restart)
 const walletTrackerActivities = new Map(); // walletAddress -> [{activity}]
-const trackedWallets = new Set(); // Track which wallets have webhooks
+const trackedWallets = new Map(); // address -> {name, events, minAmount} - Map instead of Set for metadata
 
 // Helius webhook URL (where Helius sends notifications)
 const WEBHOOK_URL = process.env.WEBHOOK_URL || `https://trakr-backend-0v6u.onrender.com/api/wallet-tracker/webhook`;
@@ -2750,15 +2750,17 @@ app.post('/api/wallet-tracker/add', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Invalid wallet address' });
         }
         
-        // Check if already tracking
-        if (trackedWallets.has(address)) {
-            return res.json({ success: true, message: 'Already tracking this wallet' });
-        }
+        // Store wallet info in memory
+        trackedWallets.set(address, { name, events, minAmount });
+        walletTrackerActivities.set(address, walletTrackerActivities.get(address) || []);
+        
+        console.log(`👛 Now tracking wallet: ${address.slice(0, 8)}... (${name})`);
+        console.log(`   Total tracked wallets: ${trackedWallets.size}`);
         
         // Register webhook with Helius
         if (HELIUS_API_KEY) {
             try {
-                // First, get existing webhooks to see if we need to create or update
+                // First, get existing webhooks
                 const listResponse = await fetch(
                     `https://api.helius.xyz/v0/webhooks?api-key=${HELIUS_API_KEY}`
                 );
@@ -2784,7 +2786,7 @@ app.post('/api/wallet-tracker/add', async (req, res) => {
                                 body: JSON.stringify({
                                     webhookURL: WEBHOOK_URL,
                                     accountAddresses: [...currentAddresses, address],
-                                    transactionTypes: ['ANY'],
+                                    transactionTypes: ['SWAP', 'TRANSFER', 'ANY'],
                                     webhookType: 'enhanced'
                                 })
                             }
@@ -2806,7 +2808,7 @@ app.post('/api/wallet-tracker/add', async (req, res) => {
                             body: JSON.stringify({
                                 webhookURL: WEBHOOK_URL,
                                 accountAddresses: [address],
-                                transactionTypes: ['ANY'],
+                                transactionTypes: ['SWAP', 'TRANSFER', 'ANY'],
                                 webhookType: 'enhanced'
                             })
                         }
@@ -2824,14 +2826,41 @@ app.post('/api/wallet-tracker/add', async (req, res) => {
             }
         }
         
-        trackedWallets.add(address);
-        walletTrackerActivities.set(address, walletTrackerActivities.get(address) || []);
-        
-        console.log(`👛 Now tracking wallet: ${address.slice(0, 8)}...`);
         res.json({ success: true, message: 'Wallet added to tracking' });
         
     } catch (error) {
         console.error('❌ Add wallet error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Sync tracked wallets from frontend (call on page load)
+app.post('/api/wallet-tracker/sync', async (req, res) => {
+    try {
+        const { wallets } = req.body;
+        
+        if (!wallets || !Array.isArray(wallets)) {
+            return res.status(400).json({ success: false, error: 'Wallets array required' });
+        }
+        
+        // Sync wallets to memory
+        for (const wallet of wallets) {
+            if (wallet.address && !trackedWallets.has(wallet.address)) {
+                trackedWallets.set(wallet.address, { 
+                    name: wallet.name, 
+                    events: wallet.events, 
+                    minAmount: wallet.minAmount 
+                });
+                walletTrackerActivities.set(wallet.address, []);
+            }
+        }
+        
+        console.log(`🔄 Synced ${wallets.length} wallets from frontend. Total: ${trackedWallets.size}`);
+        
+        res.json({ success: true, tracked: trackedWallets.size });
+        
+    } catch (error) {
+        console.error('❌ Sync error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -2862,9 +2891,9 @@ app.post('/api/wallet-tracker/remove', async (req, res) => {
         trackedWallets.delete(address);
         walletTrackerActivities.delete(address);
         
-        // TODO: Update Helius webhook to remove address (optional for now)
-        
         console.log(`🗑️ Stopped tracking wallet: ${address.slice(0, 8)}...`);
+        console.log(`   Remaining tracked wallets: ${trackedWallets.size}`);
+        
         res.json({ success: true, message: 'Wallet removed from tracking' });
         
     } catch (error) {
@@ -2879,11 +2908,56 @@ app.post('/api/wallet-tracker/webhook', async (req, res) => {
         const transactions = Array.isArray(req.body) ? req.body : [req.body];
         
         console.log(`📥 Received ${transactions.length} webhook notifications`);
+        console.log(`   Tracked wallets in memory: ${trackedWallets.size}`);
         
         for (const tx of transactions) {
+            // Log raw webhook data for debugging
+            console.log(`   Raw tx sig: ${tx.signature?.slice(0, 8)}, type: ${tx.type}`);
+            console.log(`   Has tokenTransfers: ${tx.tokenTransfers?.length || 0}`);
+            console.log(`   Has nativeTransfers: ${tx.nativeTransfers?.length || 0}`);
+            console.log(`   Has accountData: ${tx.accountData?.length || 0}`);
+            console.log(`   nativeBalanceChange: ${tx.nativeBalanceChange || 'none'}`);
+            
+            // If no swap event data, try to fetch full parsed transaction from Helius
+            let enrichedTx = tx;
+            if (!tx.events?.swap && tx.signature && HELIUS_API_KEY) {
+                try {
+                    console.log(`   🔍 Fetching full tx details from Helius...`);
+                    const parseResponse = await fetch(
+                        `https://api.helius.xyz/v0/transactions/?api-key=${HELIUS_API_KEY}`,
+                        {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ transactions: [tx.signature] })
+                        }
+                    );
+                    
+                    if (parseResponse.ok) {
+                        const parsed = await parseResponse.json();
+                        if (parsed && parsed.length > 0) {
+                            enrichedTx = parsed[0];
+                            console.log(`   ✅ Enriched: type=${enrichedTx.type}, hasSwap=${!!enrichedTx.events?.swap}`);
+                            console.log(`   Enriched tokenTransfers: ${enrichedTx.tokenTransfers?.length || 0}`);
+                            console.log(`   Enriched nativeTransfers: ${enrichedTx.nativeTransfers?.length || 0}`);
+                        }
+                    }
+                } catch (e) {
+                    console.warn(`   ⚠️ Failed to fetch tx details: ${e.message}`);
+                }
+            }
+            
             // Parse the transaction
-            const activity = parseHeliusTransaction(tx);
-            if (!activity) continue;
+            const activity = parseHeliusTransaction(enrichedTx);
+            if (!activity) {
+                console.log(`   ⏭️ Skipped (not tracked or invalid)`);
+                continue;
+            }
+            
+            // Get wallet metadata
+            const walletMeta = trackedWallets.get(activity.walletAddress);
+            if (walletMeta) {
+                activity.walletName = walletMeta.name || activity.walletAddress.slice(0, 8);
+            }
             
             // Store the activity
             const walletActivities = walletTrackerActivities.get(activity.walletAddress) || [];
@@ -2896,7 +2970,7 @@ app.post('/api/wallet-tracker/webhook', async (req, res) => {
             
             walletTrackerActivities.set(activity.walletAddress, walletActivities);
             
-            console.log(`💸 ${activity.walletAddress.slice(0, 8)}: ${activity.type} ${activity.token || 'unknown'}`);
+            console.log(`   💸 Stored: ${activity.walletAddress.slice(0, 8)} ${activity.type} | ${activity.tokenIn || '?'} -> ${activity.tokenOut || '?'}`);
         }
         
         res.status(200).json({ success: true });
@@ -2912,108 +2986,140 @@ function parseHeliusTransaction(tx) {
     try {
         if (!tx || !tx.signature) return null;
         
-        console.log(`📝 Parsing tx: ${tx.signature?.slice(0, 8)}...`);
-        console.log(`   Type: ${tx.type}, Description: ${tx.description?.slice(0, 50) || 'none'}`);
-        
-        // Log for debugging
-        if (tx.events) {
-            console.log(`   Events: swap=${!!tx.events.swap}, nft=${!!tx.events.nft}`);
-        }
-        
-        // Determine transaction type and involved wallets
-        let type = 'transfer';
-        let token = null;
-        let tokenMint = null;
-        let amount = null;
-        let amountSol = null; // Store SOL amount instead of USD
+        const SOL_MINT = 'So11111111111111111111111111111111111111112';
         let walletAddress = tx.feePayer;
         
-        const SOL_MINT = 'So11111111111111111111111111111111111111112';
+        console.log(`📝 Parsing tx: ${tx.signature?.slice(0, 8)}...`);
+        console.log(`   Type: ${tx.type}`);
         
-        // Method 1: Check for swap in events (most reliable)
+        let type = 'transfer';
+        let tokenIn = null;  // Token user spent
+        let tokenOut = null; // Token user received
+        let tokenInMint = null;
+        let tokenOutMint = null;
+        let tokenInAmount = null;
+        let tokenOutAmount = null;
+        let solAmount = null;
+        
+        // Method 1: Check for swap event (best case)
         if (tx.events?.swap) {
             const swap = tx.events.swap;
-            console.log(`   Swap event found: nativeIn=${swap.nativeInput?.amount}, nativeOut=${swap.nativeOutput?.amount}`);
+            console.log(`   ✅ Has swap event`);
             
-            const hasNativeInput = swap.nativeInput && swap.nativeInput.amount > 0;
-            const hasNativeOutput = swap.nativeOutput && swap.nativeOutput.amount > 0;
-            
-            if (hasNativeInput && swap.tokenOutputs?.length > 0) {
-                type = 'buy';
-                const tokenOut = swap.tokenOutputs[0];
-                token = tokenOut.symbol || null;
-                tokenMint = tokenOut.mint;
-                amount = tokenOut.tokenAmount;
-                amountSol = swap.nativeInput.amount / 1e9;
-                console.log(`   ✅ BUY: ${amountSol.toFixed(4)} SOL → ${token || tokenMint?.slice(0, 8)}`);
+            if (swap.nativeInput?.amount > 0) {
+                // SOL -> Token (BUY)
+                solAmount = swap.nativeInput.amount / 1e9;
+                tokenIn = 'SOL';
+                tokenInAmount = solAmount;
                 
-            } else if (hasNativeOutput && swap.tokenInputs?.length > 0) {
+                if (swap.tokenOutputs?.[0]) {
+                    tokenOut = swap.tokenOutputs[0].symbol || swap.tokenOutputs[0].mint?.slice(0, 8);
+                    tokenOutMint = swap.tokenOutputs[0].mint;
+                    tokenOutAmount = swap.tokenOutputs[0].tokenAmount;
+                }
+                type = 'buy';
+            } else if (swap.nativeOutput?.amount > 0) {
+                // Token -> SOL (SELL)
+                solAmount = swap.nativeOutput.amount / 1e9;
+                tokenOut = 'SOL';
+                tokenOutAmount = solAmount;
+                
+                if (swap.tokenInputs?.[0]) {
+                    tokenIn = swap.tokenInputs[0].symbol || swap.tokenInputs[0].mint?.slice(0, 8);
+                    tokenInMint = swap.tokenInputs[0].mint;
+                    tokenInAmount = swap.tokenInputs[0].tokenAmount;
+                }
                 type = 'sell';
-                const tokenIn = swap.tokenInputs[0];
-                token = tokenIn.symbol || null;
-                tokenMint = tokenIn.mint;
-                amount = tokenIn.tokenAmount;
-                amountSol = swap.nativeOutput.amount / 1e9;
-                console.log(`   ✅ SELL: ${token || tokenMint?.slice(0, 8)} → ${amountSol.toFixed(4)} SOL`);
-                
-            } else if (swap.tokenInputs?.length > 0 && swap.tokenOutputs?.length > 0) {
-                type = 'buy';
-                const tokenOut = swap.tokenOutputs[0];
-                token = tokenOut.symbol || null;
-                tokenMint = tokenOut.mint;
-                amount = tokenOut.tokenAmount;
-                console.log(`   ✅ TOKEN SWAP: → ${token || tokenMint?.slice(0, 8)}`);
+            } else if (swap.tokenInputs?.[0] && swap.tokenOutputs?.[0]) {
+                // Token -> Token
+                tokenIn = swap.tokenInputs[0].symbol || swap.tokenInputs[0].mint?.slice(0, 8);
+                tokenInMint = swap.tokenInputs[0].mint;
+                tokenInAmount = swap.tokenInputs[0].tokenAmount;
+                tokenOut = swap.tokenOutputs[0].symbol || swap.tokenOutputs[0].mint?.slice(0, 8);
+                tokenOutMint = swap.tokenOutputs[0].mint;
+                tokenOutAmount = swap.tokenOutputs[0].tokenAmount;
+                type = 'swap';
             }
         }
         
-        // Method 2: Check transaction type and description for swaps
-        if (type === 'transfer') {
-            const txType = (tx.type || '').toUpperCase();
-            const desc = (tx.description || '').toLowerCase();
+        // Method 2: Detect swap from token transfers + native balance change
+        if (type === 'transfer' && tx.tokenTransfers?.length > 0) {
+            // Try to get native balance change from multiple sources
+            let nativeChange = tx.nativeBalanceChange || 0;
             
-            // Check if description indicates a swap
-            if (desc.includes('swapped') || desc.includes('swap') || txType === 'SWAP') {
-                console.log(`   Detected swap from description/type`);
-                
-                // Try to parse from description: "X swapped 0.1 SOL for 1000 TOKEN"
-                const swapMatch = desc.match(/swapped\s+([\d.]+)\s+(\w+)\s+for\s+([\d.]+)\s+(\w+)/i);
-                if (swapMatch) {
-                    const [, inAmount, inToken, outAmount, outToken] = swapMatch;
-                    if (inToken.toUpperCase() === 'SOL') {
-                        type = 'buy';
-                        token = outToken;
-                        amountSol = parseFloat(inAmount);
-                    } else if (outToken.toUpperCase() === 'SOL') {
-                        type = 'sell';
-                        token = inToken;
-                        amountSol = parseFloat(outAmount);
+            // If not at top level, check accountData for fee payer's balance change
+            if (nativeChange === 0 && tx.accountData) {
+                const feePayerData = tx.accountData.find(a => a.account === walletAddress);
+                if (feePayerData) {
+                    nativeChange = feePayerData.nativeBalanceChange || 0;
+                }
+            }
+            
+            // Also check nativeTransfers
+            if (nativeChange === 0 && tx.nativeTransfers) {
+                for (const transfer of tx.nativeTransfers) {
+                    if (transfer.toUserAccount === walletAddress) {
+                        nativeChange += transfer.amount || 0;
                     }
-                    console.log(`   ✅ Parsed from desc: ${type} ${token}`);
+                    if (transfer.fromUserAccount === walletAddress) {
+                        nativeChange -= transfer.amount || 0;
+                    }
                 }
             }
-        }
-        
-        // Method 3: Check tokenTransfers for simple transfers
-        if (type === 'transfer' && tx.tokenTransfers && tx.tokenTransfers.length > 0) {
-            const transfer = tx.tokenTransfers[0];
             
-            if (transfer.mint && transfer.mint !== SOL_MINT) {
-                token = transfer.symbol || null;
-                tokenMint = transfer.mint;
-                amount = transfer.tokenAmount;
+            // Find token transfers involving our wallet
+            const outTransfer = tx.tokenTransfers.find(t => t.fromUserAccount === walletAddress);
+            const inTransfer = tx.tokenTransfers.find(t => t.toUserAccount === walletAddress);
+            
+            console.log(`   Analyzing transfers: out=${!!outTransfer}, in=${!!inTransfer}, nativeChange=${nativeChange}`);
+            
+            if (outTransfer && nativeChange > 1000000) {
+                // Sent token, received SOL = SELL
+                type = 'sell';
+                tokenIn = outTransfer.symbol || outTransfer.mint?.slice(0, 8);
+                tokenInMint = outTransfer.mint;
+                tokenInAmount = outTransfer.tokenAmount;
+                tokenOut = 'SOL';
+                solAmount = nativeChange / 1e9;
+                tokenOutAmount = solAmount;
+                console.log(`   ✅ Detected SELL: ${tokenIn} -> ${solAmount.toFixed(4)} SOL`);
                 
-                if (transfer.toUserAccount === walletAddress) {
-                    type = 'received';
-                } else if (transfer.fromUserAccount === walletAddress) {
-                    type = 'sent';
-                }
-                console.log(`   ✅ Transfer: ${type} ${token || tokenMint?.slice(0, 8)}`);
+            } else if (inTransfer && nativeChange < -1000000) {
+                // Received token, spent SOL = BUY
+                type = 'buy';
+                tokenIn = 'SOL';
+                solAmount = Math.abs(nativeChange) / 1e9;
+                tokenInAmount = solAmount;
+                tokenOut = inTransfer.symbol || inTransfer.mint?.slice(0, 8);
+                tokenOutMint = inTransfer.mint;
+                tokenOutAmount = inTransfer.tokenAmount;
+                console.log(`   ✅ Detected BUY: ${solAmount.toFixed(4)} SOL -> ${tokenOut}`);
+                
+            } else if (outTransfer && inTransfer) {
+                // Token to token swap
+                type = 'swap';
+                tokenIn = outTransfer.symbol || outTransfer.mint?.slice(0, 8);
+                tokenInMint = outTransfer.mint;
+                tokenInAmount = outTransfer.tokenAmount;
+                tokenOut = inTransfer.symbol || inTransfer.mint?.slice(0, 8);
+                tokenOutMint = inTransfer.mint;
+                tokenOutAmount = inTransfer.tokenAmount;
+                console.log(`   ✅ Detected SWAP: ${tokenIn} -> ${tokenOut}`);
+                
+            } else if (outTransfer) {
+                // Just sent
+                type = 'sent';
+                tokenIn = outTransfer.symbol || outTransfer.mint?.slice(0, 8);
+                tokenInMint = outTransfer.mint;
+                tokenInAmount = outTransfer.tokenAmount;
+                
+            } else if (inTransfer) {
+                // Just received
+                type = 'received';
+                tokenOut = inTransfer.symbol || inTransfer.mint?.slice(0, 8);
+                tokenOutMint = inTransfer.mint;
+                tokenOutAmount = inTransfer.tokenAmount;
             }
-        }
-        
-        // Final fallback for type
-        if (type === 'transfer' && tx.type) {
-            type = tx.type.toLowerCase().replace('fungible', '');
         }
         
         // Skip if wallet isn't tracked
@@ -3022,27 +3128,31 @@ function parseHeliusTransaction(tx) {
                 tx.feePayer,
                 ...(tx.tokenTransfers?.map(t => t.fromUserAccount) || []),
                 ...(tx.tokenTransfers?.map(t => t.toUserAccount) || []),
-                ...(tx.accountData?.map(a => a.account) || [])
             ].filter(Boolean);
             
             walletAddress = involvedAccounts.find(a => trackedWallets.has(a));
             if (!walletAddress) return null;
         }
         
-        console.log(`   📤 Final: type=${type}, token=${token}, mint=${tokenMint?.slice(0, 8) || 'none'}`);
-        
-        return {
+        // Build activity object
+        const activity = {
             id: tx.signature,
             signature: tx.signature,
             walletAddress,
             type,
-            token, // Symbol only (e.g., "USDC")
-            tokenMint: tokenMint !== SOL_MINT ? tokenMint : null,
-            amount,
-            amountSol, // SOL amount (no USD conversion)
+            tokenIn,
+            tokenInMint: tokenInMint !== SOL_MINT ? tokenInMint : null,
+            tokenInAmount,
+            tokenOut,
+            tokenOutMint: tokenOutMint !== SOL_MINT ? tokenOutMint : null,
+            tokenOutAmount,
+            solAmount,
             timestamp: tx.timestamp ? tx.timestamp * 1000 : Date.now(),
-            description: tx.description
         };
+        
+        console.log(`   📤 Result: ${type} | ${tokenIn || '?'} -> ${tokenOut || '?'}`);
+        
+        return activity;
     } catch (error) {
         console.warn('⚠️ Failed to parse transaction:', error.message);
         return null;
