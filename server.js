@@ -3021,10 +3021,21 @@ app.get('/api/wallet-tracker/holdings/:address', async (req, res) => {
             return res.status(500).json({ success: false, error: 'Helius API key not configured' });
         }
         
-        // Use Helius getAssetsByOwner
-        const response = await fetch(
-            `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
-            {
+        // Fetch native SOL balance and token holdings in parallel
+        const [solBalanceResponse, tokensResponse] = await Promise.all([
+            // Get native SOL balance
+            fetch(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 'sol-balance',
+                    method: 'getBalance',
+                    params: [address]
+                })
+            }),
+            // Get token holdings
+            fetch(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -3040,21 +3051,18 @@ app.get('/api/wallet-tracker/holdings/:address', async (req, res) => {
                         }
                     }
                 })
-            }
-        );
+            })
+        ]);
         
-        if (!response.ok) {
-            throw new Error(`Helius API error: ${response.status}`);
+        const solBalanceData = await solBalanceResponse.json();
+        const tokensData = await tokensResponse.json();
+        
+        if (tokensData.error) {
+            throw new Error(tokensData.error.message || 'Unknown Helius error');
         }
         
-        const data = await response.json();
-        
-        if (data.error) {
-            throw new Error(data.error.message || 'Unknown Helius error');
-        }
-        
-        // Parse holdings
-        const holdings = (data.result?.items || [])
+        // Parse token holdings
+        const holdings = (tokensData.result?.items || [])
             .filter(item => item.token_info || item.interface === 'FungibleToken')
             .map(item => ({
                 mint: item.id,
@@ -3063,8 +3071,40 @@ app.get('/api/wallet-tracker/holdings/:address', async (req, res) => {
                 balance: item.token_info?.balance || 0,
                 decimals: item.token_info?.decimals || 9,
                 valueUsd: item.token_info?.price_info?.total_price || null
-            }))
-            .sort((a, b) => (b.valueUsd || 0) - (a.valueUsd || 0));
+            }));
+        
+        // Add native SOL balance at the beginning
+        if (solBalanceData.result?.value) {
+            const solBalance = solBalanceData.result.value;
+            const solAmount = solBalance / 1e9; // Convert lamports to SOL
+            
+            // Get SOL price (rough estimate, or fetch from API)
+            // Using a simple fetch to get current SOL price
+            let solPrice = 200; // Default fallback
+            try {
+                const priceResponse = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+                if (priceResponse.ok) {
+                    const priceData = await priceResponse.json();
+                    solPrice = priceData.solana?.usd || 200;
+                }
+            } catch (e) {
+                console.warn('⚠️ Could not fetch SOL price, using default');
+            }
+            
+            const solValueUsd = solAmount * solPrice;
+            
+            holdings.unshift({
+                mint: 'So11111111111111111111111111111111111111112',
+                symbol: 'SOL',
+                name: 'Solana',
+                balance: solBalance,
+                decimals: 9,
+                valueUsd: solValueUsd
+            });
+        }
+        
+        // Sort by USD value (highest first)
+        holdings.sort((a, b) => (b.valueUsd || 0) - (a.valueUsd || 0));
         
         console.log(`👛 Fetched ${holdings.length} holdings for ${address.slice(0, 8)}...`);
         
