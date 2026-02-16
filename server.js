@@ -2730,6 +2730,361 @@ app.post('/jupiter/swap', async (req, res) => {
 // ==========================================
 
 const PORT = process.env.PORT || 3000;
+// ==========================================
+// WALLET TRACKER (Helius Webhooks)
+// ==========================================
+
+// In-memory storage for wallet activities (persists until server restart)
+const walletTrackerActivities = new Map(); // walletAddress -> [{activity}]
+const trackedWallets = new Set(); // Track which wallets have webhooks
+
+// Helius webhook URL (where Helius sends notifications)
+const WEBHOOK_URL = process.env.WEBHOOK_URL || `https://trakr-backend-0v6u.onrender.com/api/wallet-tracker/webhook`;
+
+// Add a wallet to track
+app.post('/api/wallet-tracker/add', async (req, res) => {
+    try {
+        const { address, name, events, minAmount } = req.body;
+        
+        if (!address || address.length < 32) {
+            return res.status(400).json({ success: false, error: 'Invalid wallet address' });
+        }
+        
+        // Check if already tracking
+        if (trackedWallets.has(address)) {
+            return res.json({ success: true, message: 'Already tracking this wallet' });
+        }
+        
+        // Register webhook with Helius
+        if (HELIUS_API_KEY) {
+            try {
+                // First, get existing webhooks to see if we need to create or update
+                const listResponse = await fetch(
+                    `https://api.helius.xyz/v0/webhooks?api-key=${HELIUS_API_KEY}`
+                );
+                
+                let webhookId = null;
+                if (listResponse.ok) {
+                    const webhooks = await listResponse.json();
+                    const existingWebhook = webhooks.find(w => w.webhookURL === WEBHOOK_URL);
+                    if (existingWebhook) {
+                        webhookId = existingWebhook.webhookID;
+                    }
+                }
+                
+                if (webhookId) {
+                    // Update existing webhook to add new address
+                    const currentAddresses = await getWebhookAddresses(webhookId);
+                    if (!currentAddresses.includes(address)) {
+                        const updateResponse = await fetch(
+                            `https://api.helius.xyz/v0/webhooks/${webhookId}?api-key=${HELIUS_API_KEY}`,
+                            {
+                                method: 'PUT',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    webhookURL: WEBHOOK_URL,
+                                    accountAddresses: [...currentAddresses, address],
+                                    transactionTypes: ['ANY'],
+                                    webhookType: 'enhanced'
+                                })
+                            }
+                        );
+                        
+                        if (!updateResponse.ok) {
+                            console.warn(`⚠️ Failed to update webhook: ${updateResponse.status}`);
+                        } else {
+                            console.log(`✅ Added ${address.slice(0, 8)} to existing webhook`);
+                        }
+                    }
+                } else {
+                    // Create new webhook
+                    const createResponse = await fetch(
+                        `https://api.helius.xyz/v0/webhooks?api-key=${HELIUS_API_KEY}`,
+                        {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                webhookURL: WEBHOOK_URL,
+                                accountAddresses: [address],
+                                transactionTypes: ['ANY'],
+                                webhookType: 'enhanced'
+                            })
+                        }
+                    );
+                    
+                    if (!createResponse.ok) {
+                        console.warn(`⚠️ Failed to create webhook: ${createResponse.status}`);
+                    } else {
+                        const data = await createResponse.json();
+                        console.log(`✅ Created new webhook: ${data.webhookID}`);
+                    }
+                }
+            } catch (webhookError) {
+                console.warn(`⚠️ Webhook setup error: ${webhookError.message}`);
+            }
+        }
+        
+        trackedWallets.add(address);
+        walletTrackerActivities.set(address, walletTrackerActivities.get(address) || []);
+        
+        console.log(`👛 Now tracking wallet: ${address.slice(0, 8)}...`);
+        res.json({ success: true, message: 'Wallet added to tracking' });
+        
+    } catch (error) {
+        console.error('❌ Add wallet error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Helper to get current webhook addresses
+async function getWebhookAddresses(webhookId) {
+    try {
+        const response = await fetch(
+            `https://api.helius.xyz/v0/webhooks/${webhookId}?api-key=${HELIUS_API_KEY}`
+        );
+        if (!response.ok) return [];
+        const data = await response.json();
+        return data.accountAddresses || [];
+    } catch {
+        return [];
+    }
+}
+
+// Remove a wallet from tracking
+app.post('/api/wallet-tracker/remove', async (req, res) => {
+    try {
+        const { address } = req.body;
+        
+        if (!address) {
+            return res.status(400).json({ success: false, error: 'Address required' });
+        }
+        
+        trackedWallets.delete(address);
+        walletTrackerActivities.delete(address);
+        
+        // TODO: Update Helius webhook to remove address (optional for now)
+        
+        console.log(`🗑️ Stopped tracking wallet: ${address.slice(0, 8)}...`);
+        res.json({ success: true, message: 'Wallet removed from tracking' });
+        
+    } catch (error) {
+        console.error('❌ Remove wallet error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Webhook endpoint - Helius sends transaction notifications here
+app.post('/api/wallet-tracker/webhook', async (req, res) => {
+    try {
+        const transactions = Array.isArray(req.body) ? req.body : [req.body];
+        
+        console.log(`📥 Received ${transactions.length} webhook notifications`);
+        
+        for (const tx of transactions) {
+            // Parse the transaction
+            const activity = parseHeliusTransaction(tx);
+            if (!activity) continue;
+            
+            // Store the activity
+            const walletActivities = walletTrackerActivities.get(activity.walletAddress) || [];
+            walletActivities.unshift(activity);
+            
+            // Keep only last 100 activities per wallet
+            if (walletActivities.length > 100) {
+                walletActivities.length = 100;
+            }
+            
+            walletTrackerActivities.set(activity.walletAddress, walletActivities);
+            
+            console.log(`💸 ${activity.walletAddress.slice(0, 8)}: ${activity.type} ${activity.token || 'unknown'}`);
+        }
+        
+        res.status(200).json({ success: true });
+        
+    } catch (error) {
+        console.error('❌ Webhook error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Parse Helius enhanced transaction into activity
+function parseHeliusTransaction(tx) {
+    try {
+        if (!tx || !tx.signature) return null;
+        
+        // Determine transaction type and involved wallets
+        let type = 'transfer';
+        let token = null;
+        let tokenMint = null;
+        let amount = null;
+        let amountUsd = null;
+        let walletAddress = null;
+        
+        // Check for swap/trade
+        if (tx.type === 'SWAP' || tx.events?.swap) {
+            const swap = tx.events?.swap;
+            if (swap) {
+                type = swap.nativeInput ? 'buy' : 'sell';
+                token = swap.tokenOutputs?.[0]?.symbol || swap.tokenInputs?.[0]?.symbol;
+                tokenMint = swap.tokenOutputs?.[0]?.mint || swap.tokenInputs?.[0]?.mint;
+                amountUsd = swap.nativeInput?.amount ? (swap.nativeInput.amount / 1e9) * 200 : null; // Rough SOL to USD
+            }
+        }
+        
+        // Check for transfer
+        if (tx.tokenTransfers && tx.tokenTransfers.length > 0) {
+            const transfer = tx.tokenTransfers[0];
+            token = transfer.tokenStandard || transfer.mint?.slice(0, 8);
+            tokenMint = transfer.mint;
+            amount = transfer.tokenAmount;
+            walletAddress = transfer.fromUserAccount || transfer.toUserAccount;
+        }
+        
+        // Get wallet from fee payer if not found
+        if (!walletAddress && tx.feePayer) {
+            walletAddress = tx.feePayer;
+        }
+        
+        // Skip if wallet isn't tracked
+        if (!walletAddress || !trackedWallets.has(walletAddress)) {
+            // Check if any involved account is tracked
+            const involvedAccounts = [
+                tx.feePayer,
+                ...(tx.tokenTransfers?.map(t => t.fromUserAccount) || []),
+                ...(tx.tokenTransfers?.map(t => t.toUserAccount) || []),
+                ...(tx.accountData?.map(a => a.account) || [])
+            ].filter(Boolean);
+            
+            walletAddress = involvedAccounts.find(a => trackedWallets.has(a));
+            if (!walletAddress) return null;
+        }
+        
+        return {
+            id: tx.signature,
+            signature: tx.signature,
+            walletAddress,
+            type,
+            token,
+            tokenMint,
+            amount,
+            amountUsd,
+            timestamp: tx.timestamp ? tx.timestamp * 1000 : Date.now(),
+            raw: tx
+        };
+    } catch (error) {
+        console.warn('⚠️ Failed to parse transaction:', error.message);
+        return null;
+    }
+}
+
+// Get activity for tracked wallets
+app.post('/api/wallet-tracker/activity', async (req, res) => {
+    try {
+        const { addresses } = req.body;
+        
+        if (!addresses || !Array.isArray(addresses)) {
+            return res.status(400).json({ success: false, error: 'Addresses array required' });
+        }
+        
+        // Collect activities for all requested addresses
+        const allActivities = [];
+        for (const address of addresses) {
+            const activities = walletTrackerActivities.get(address) || [];
+            allActivities.push(...activities);
+        }
+        
+        // Sort by timestamp (newest first)
+        allActivities.sort((a, b) => b.timestamp - a.timestamp);
+        
+        res.json({
+            success: true,
+            activities: allActivities.slice(0, 100),
+            count: allActivities.length
+        });
+        
+    } catch (error) {
+        console.error('❌ Get activity error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get wallet holdings using Helius
+app.get('/api/wallet-tracker/holdings/:address', async (req, res) => {
+    try {
+        const { address } = req.params;
+        
+        if (!address || address.length < 32) {
+            return res.status(400).json({ success: false, error: 'Invalid address' });
+        }
+        
+        if (!HELIUS_API_KEY) {
+            return res.status(500).json({ success: false, error: 'Helius API key not configured' });
+        }
+        
+        // Use Helius getAssetsByOwner
+        const response = await fetch(
+            `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 'holdings',
+                    method: 'getAssetsByOwner',
+                    params: {
+                        ownerAddress: address,
+                        page: 1,
+                        limit: 50,
+                        displayOptions: {
+                            showFungible: true
+                        }
+                    }
+                })
+            }
+        );
+        
+        if (!response.ok) {
+            throw new Error(`Helius API error: ${response.status}`);
+        }
+        
+        const data = await response.json();
+        
+        if (data.error) {
+            throw new Error(data.error.message || 'Unknown Helius error');
+        }
+        
+        // Parse holdings
+        const holdings = (data.result?.items || [])
+            .filter(item => item.token_info || item.interface === 'FungibleToken')
+            .map(item => ({
+                mint: item.id,
+                symbol: item.content?.metadata?.symbol || item.token_info?.symbol || 'Unknown',
+                name: item.content?.metadata?.name || item.token_info?.name || 'Unknown Token',
+                balance: item.token_info?.balance || 0,
+                decimals: item.token_info?.decimals || 9,
+                valueUsd: item.token_info?.price_info?.total_price || null
+            }))
+            .sort((a, b) => (b.valueUsd || 0) - (a.valueUsd || 0));
+        
+        console.log(`👛 Fetched ${holdings.length} holdings for ${address.slice(0, 8)}...`);
+        
+        res.json({
+            success: true,
+            address,
+            holdings,
+            count: holdings.length
+        });
+        
+    } catch (error) {
+        console.error('❌ Get holdings error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ==========================================
+// SERVER START
+// ==========================================
+
 app.listen(PORT, () => {
     console.log(`🚀 Trakr Backend running on port ${PORT}`);
     console.log(`📡 Endpoints:`);
