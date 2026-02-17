@@ -2726,16 +2726,18 @@ app.post('/jupiter/swap', async (req, res) => {
 });
 
 // ==========================================
-// JUPITER LIMIT ORDERS
+// JUPITER LIMIT ORDERS (Trigger API v1)
 // ==========================================
+
+const JUPITER_TRIGGER_API = 'https://api.jup.ag/trigger/v1';
 
 // POST /jupiter/limit/create - Create a limit order (buy or sell)
 app.post('/jupiter/limit/create', async (req, res) => {
     try {
-        console.log('🎯 Creating limit order...');
+        console.log('🎯 Creating limit order via Trigger API...');
         console.log('   Body:', JSON.stringify(req.body, null, 2));
         
-        const response = await fetch('https://api.jup.ag/limit/v2/createOrder', {
+        const response = await fetch(`${JUPITER_TRIGGER_API}/createOrder`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -2747,7 +2749,7 @@ app.post('/jupiter/limit/create', async (req, res) => {
         
         if (!response.ok) {
             const errorText = await response.text();
-            console.error('❌ Jupiter limit create error:', response.status, errorText);
+            console.error('❌ Jupiter trigger create error:', response.status, errorText);
             return res.status(response.status).json({
                 error: 'Jupiter limit order failed',
                 status: response.status,
@@ -2756,7 +2758,7 @@ app.post('/jupiter/limit/create', async (req, res) => {
         }
         
         const data = await response.json();
-        console.log('✅ Limit order created');
+        console.log('✅ Limit order created:', data.order || 'unknown');
         res.json(data);
         
     } catch (error) {
@@ -2772,9 +2774,9 @@ app.post('/jupiter/limit/create', async (req, res) => {
 app.get('/jupiter/limit/orders/:wallet', async (req, res) => {
     try {
         const { wallet } = req.params;
-        console.log(`📋 Fetching limit orders for: ${wallet.slice(0, 8)}...`);
+        console.log(`📋 Fetching trigger orders for: ${wallet.slice(0, 8)}...`);
         
-        const response = await fetch(`https://api.jup.ag/limit/v2/openOrders?wallet=${wallet}`, {
+        const response = await fetch(`${JUPITER_TRIGGER_API}/getTriggerOrders?user=${wallet}&status=active`, {
             method: 'GET',
             headers: {
                 'Accept': 'application/json',
@@ -2784,7 +2786,7 @@ app.get('/jupiter/limit/orders/:wallet', async (req, res) => {
         
         if (!response.ok) {
             const errorText = await response.text();
-            console.error('❌ Jupiter limit orders error:', response.status, errorText);
+            console.error('❌ Jupiter trigger orders error:', response.status, errorText);
             return res.status(response.status).json({
                 error: 'Failed to fetch limit orders',
                 status: response.status,
@@ -2793,8 +2795,9 @@ app.get('/jupiter/limit/orders/:wallet', async (req, res) => {
         }
         
         const data = await response.json();
-        console.log(`✅ Found ${data.length || 0} open orders`);
-        res.json(data);
+        const orders = data.orders || data || [];
+        console.log(`✅ Found ${orders.length} active orders`);
+        res.json(orders);
         
     } catch (error) {
         console.error('❌ Limit orders proxy error:', error);
@@ -2810,7 +2813,10 @@ app.post('/jupiter/limit/cancel', async (req, res) => {
     try {
         console.log('🗑️ Cancelling limit order(s)...');
         
-        const response = await fetch('https://api.jup.ag/limit/v2/cancelOrders', {
+        const orders = req.body.orders || [];
+        const endpoint = orders.length > 1 ? 'cancelOrders' : 'cancelOrder';
+        
+        const response = await fetch(`${JUPITER_TRIGGER_API}/${endpoint}`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -2822,7 +2828,7 @@ app.post('/jupiter/limit/cancel', async (req, res) => {
         
         if (!response.ok) {
             const errorText = await response.text();
-            console.error('❌ Jupiter limit cancel error:', response.status, errorText);
+            console.error('❌ Jupiter trigger cancel error:', response.status, errorText);
             return res.status(response.status).json({
                 error: 'Failed to cancel limit order',
                 status: response.status,
@@ -2849,7 +2855,7 @@ app.get('/jupiter/limit/history/:wallet', async (req, res) => {
         const { wallet } = req.params;
         console.log(`📜 Fetching order history for: ${wallet.slice(0, 8)}...`);
         
-        const response = await fetch(`https://api.jup.ag/limit/v2/orderHistory?wallet=${wallet}`, {
+        const response = await fetch(`${JUPITER_TRIGGER_API}/getTriggerOrders?user=${wallet}&status=history`, {
             method: 'GET',
             headers: {
                 'Accept': 'application/json',
@@ -2868,8 +2874,9 @@ app.get('/jupiter/limit/history/:wallet', async (req, res) => {
         }
         
         const data = await response.json();
-        console.log(`✅ Found ${data.length || 0} historical orders`);
-        res.json(data);
+        const orders = data.orders || data || [];
+        console.log(`✅ Found ${orders.length} historical orders`);
+        res.json(orders);
         
     } catch (error) {
         console.error('❌ Order history proxy error:', error);
