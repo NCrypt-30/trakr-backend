@@ -2726,10 +2726,220 @@ app.post('/jupiter/swap', async (req, res) => {
 });
 
 // ==========================================
+// JUPITER LIMIT ORDERS
+// ==========================================
+
+// POST /jupiter/limit/create - Create a limit order (buy or sell)
+app.post('/jupiter/limit/create', async (req, res) => {
+    try {
+        console.log('🎯 Creating limit order...');
+        console.log('   Body:', JSON.stringify(req.body, null, 2));
+        
+        const response = await fetch('https://api.jup.ag/limit/v2/createOrder', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'x-api-key': process.env.JUPITER_API_KEY
+            },
+            body: JSON.stringify(req.body)
+        });
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('❌ Jupiter limit create error:', response.status, errorText);
+            return res.status(response.status).json({
+                error: 'Jupiter limit order failed',
+                status: response.status,
+                message: errorText
+            });
+        }
+        
+        const data = await response.json();
+        console.log('✅ Limit order created');
+        res.json(data);
+        
+    } catch (error) {
+        console.error('❌ Limit create proxy error:', error);
+        res.status(500).json({
+            error: 'Proxy error',
+            message: error.message
+        });
+    }
+});
+
+// GET /jupiter/limit/orders/:wallet - Get open limit orders for a wallet
+app.get('/jupiter/limit/orders/:wallet', async (req, res) => {
+    try {
+        const { wallet } = req.params;
+        console.log(`📋 Fetching limit orders for: ${wallet.slice(0, 8)}...`);
+        
+        const response = await fetch(`https://api.jup.ag/limit/v2/openOrders?wallet=${wallet}`, {
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json',
+                'x-api-key': process.env.JUPITER_API_KEY
+            }
+        });
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('❌ Jupiter limit orders error:', response.status, errorText);
+            return res.status(response.status).json({
+                error: 'Failed to fetch limit orders',
+                status: response.status,
+                message: errorText
+            });
+        }
+        
+        const data = await response.json();
+        console.log(`✅ Found ${data.length || 0} open orders`);
+        res.json(data);
+        
+    } catch (error) {
+        console.error('❌ Limit orders proxy error:', error);
+        res.status(500).json({
+            error: 'Proxy error',
+            message: error.message
+        });
+    }
+});
+
+// POST /jupiter/limit/cancel - Cancel limit orders
+app.post('/jupiter/limit/cancel', async (req, res) => {
+    try {
+        console.log('🗑️ Cancelling limit order(s)...');
+        
+        const response = await fetch('https://api.jup.ag/limit/v2/cancelOrders', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'x-api-key': process.env.JUPITER_API_KEY
+            },
+            body: JSON.stringify(req.body)
+        });
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('❌ Jupiter limit cancel error:', response.status, errorText);
+            return res.status(response.status).json({
+                error: 'Failed to cancel limit order',
+                status: response.status,
+                message: errorText
+            });
+        }
+        
+        const data = await response.json();
+        console.log('✅ Limit order(s) cancelled');
+        res.json(data);
+        
+    } catch (error) {
+        console.error('❌ Limit cancel proxy error:', error);
+        res.status(500).json({
+            error: 'Proxy error',
+            message: error.message
+        });
+    }
+});
+
+// GET /jupiter/limit/history/:wallet - Get order history for a wallet
+app.get('/jupiter/limit/history/:wallet', async (req, res) => {
+    try {
+        const { wallet } = req.params;
+        console.log(`📜 Fetching order history for: ${wallet.slice(0, 8)}...`);
+        
+        const response = await fetch(`https://api.jup.ag/limit/v2/orderHistory?wallet=${wallet}`, {
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json',
+                'x-api-key': process.env.JUPITER_API_KEY
+            }
+        });
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('❌ Jupiter order history error:', response.status, errorText);
+            return res.status(response.status).json({
+                error: 'Failed to fetch order history',
+                status: response.status,
+                message: errorText
+            });
+        }
+        
+        const data = await response.json();
+        console.log(`✅ Found ${data.length || 0} historical orders`);
+        res.json(data);
+        
+    } catch (error) {
+        console.error('❌ Order history proxy error:', error);
+        res.status(500).json({
+            error: 'Proxy error',
+            message: error.message
+        });
+    }
+});
+
+// ==========================================
 // START SERVER
 // ==========================================
 
 const PORT = process.env.PORT || 3000;
+// ==========================================
+// TRADINGVIEW WEBHOOKS
+// ==========================================
+
+const tvAlerts = []; // Store last 50 alerts
+
+app.post('/api/tradingview/webhook', (req, res) => {
+    try {
+        const alert = req.body;
+        
+        console.log('📊 TradingView Alert:', JSON.stringify(alert));
+        
+        // Parse the alert
+        const tvAlert = {
+            id: Date.now().toString(),
+            type: alert.type || 'signal', // 'long', 'exit', 'stop'
+            message: alert.message || 'TradingView Alert',
+            ticker: alert.ticker || 'BREADTH',
+            value: alert.value || null,
+            timestamp: Date.now()
+        };
+        
+        // Add to alerts array
+        tvAlerts.unshift(tvAlert);
+        
+        // Keep only last 50
+        if (tvAlerts.length > 50) {
+            tvAlerts.length = 50;
+        }
+        
+        console.log(`   ✅ Stored alert: ${tvAlert.type} - ${tvAlert.message}`);
+        
+        res.status(200).json({ success: true });
+        
+    } catch (error) {
+        console.error('❌ TradingView webhook error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get TradingView alerts
+app.get('/api/tradingview/alerts', (req, res) => {
+    res.json({
+        success: true,
+        alerts: tvAlerts,
+        count: tvAlerts.length
+    });
+});
+
+// Clear TradingView alerts
+app.post('/api/tradingview/clear', (req, res) => {
+    tvAlerts.length = 0;
+    res.json({ success: true });
+});
+
 // ==========================================
 // WALLET TRACKER (Helius Webhooks)
 // ==========================================
