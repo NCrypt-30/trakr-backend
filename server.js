@@ -2776,7 +2776,12 @@ app.get('/jupiter/limit/orders/:wallet', async (req, res) => {
         const { wallet } = req.params;
         console.log(`📋 Fetching trigger orders for: ${wallet.slice(0, 8)}...`);
         
-        const response = await fetch(`${JUPITER_TRIGGER_API}/getTriggerOrders?user=${wallet}&status=active`, {
+        // Try the new Trigger API format
+        // Docs say: getTriggerOrders?user=<wallet>&orderStatus=<active|history>
+        const url = `${JUPITER_TRIGGER_API}/getTriggerOrders?user=${wallet}&orderStatus=active`;
+        console.log(`   URL: ${url}`);
+        
+        const response = await fetch(url, {
             method: 'GET',
             headers: {
                 'Accept': 'application/json',
@@ -2784,17 +2789,35 @@ app.get('/jupiter/limit/orders/:wallet', async (req, res) => {
             }
         });
         
+        const responseText = await response.text();
+        console.log(`   Response status: ${response.status}`);
+        console.log(`   Response: ${responseText.slice(0, 500)}`);
+        
         if (!response.ok) {
-            const errorText = await response.text();
-            console.error('❌ Jupiter trigger orders error:', response.status, errorText);
+            // If getTriggerOrders fails, try the old openOrders endpoint as fallback
+            console.log('   Trying fallback openOrders endpoint...');
+            const fallbackResponse = await fetch(`https://api.jup.ag/limit/v2/openOrders?wallet=${wallet}`, {
+                method: 'GET',
+                headers: {
+                    'Accept': 'application/json',
+                    'x-api-key': process.env.JUPITER_API_KEY
+                }
+            });
+            
+            if (fallbackResponse.ok) {
+                const fallbackData = await fallbackResponse.json();
+                console.log(`✅ Fallback found ${fallbackData.length || 0} orders`);
+                return res.json(fallbackData);
+            }
+            
             return res.status(response.status).json({
                 error: 'Failed to fetch limit orders',
                 status: response.status,
-                message: errorText
+                message: responseText
             });
         }
         
-        const data = await response.json();
+        const data = JSON.parse(responseText);
         const orders = data.orders || data || [];
         console.log(`✅ Found ${orders.length} active orders`);
         res.json(orders);
@@ -2855,7 +2878,7 @@ app.get('/jupiter/limit/history/:wallet', async (req, res) => {
         const { wallet } = req.params;
         console.log(`📜 Fetching order history for: ${wallet.slice(0, 8)}...`);
         
-        const response = await fetch(`${JUPITER_TRIGGER_API}/getTriggerOrders?user=${wallet}&status=history`, {
+        const response = await fetch(`${JUPITER_TRIGGER_API}/getTriggerOrders?user=${wallet}&orderStatus=history`, {
             method: 'GET',
             headers: {
                 'Accept': 'application/json',
