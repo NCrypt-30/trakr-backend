@@ -2835,18 +2835,22 @@ app.get('/jupiter/limit/orders/:wallet', async (req, res) => {
 app.post('/jupiter/limit/cancel', async (req, res) => {
     try {
         console.log('🗑️ Cancelling limit order(s)...');
+        console.log('   Body:', JSON.stringify(req.body, null, 2));
         
-        const orders = req.body.orders || [];
-        const endpoint = orders.length > 1 ? 'cancelOrders' : 'cancelOrder';
+        // New API uses 'order' for single cancel
+        const orderToCancel = req.body.orders?.[0] || req.body.order;
         
-        const response = await fetch(`${JUPITER_TRIGGER_API}/${endpoint}`, {
+        const response = await fetch(`${JUPITER_TRIGGER_API}/cancelOrder`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
                 'x-api-key': process.env.JUPITER_API_KEY
             },
-            body: JSON.stringify(req.body)
+            body: JSON.stringify({
+                maker: req.body.maker,
+                order: orderToCancel
+            })
         });
         
         if (!response.ok) {
