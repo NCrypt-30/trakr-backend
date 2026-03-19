@@ -952,7 +952,8 @@ app.get('/api/debug/bundle/:contract', async (req, res) => {
 // Live Launches - Get graduated Pump.fun tokens (using Moralis API)
 // Track last check time to only show NEW graduations going forward
 // FIX: Start by looking back 1 hour (3600000ms) instead of starting from "now"
-let lastGraduationCheck = Date.now() - (60 * 60 * 1000); // Look back 1 hour on startup
+// Graduation scanner - always return last 5 minutes
+// Frontend handles per-user deduplication via localStorage
 
 // ==========================================
 // BAGS.FM DBC LAUNCH TRACKING (Helper Functions)
@@ -1240,14 +1241,14 @@ app.get('/api/live-launches', async (req, res) => {
             });
         }
         
-        // ONLY show graduations AFTER last check (going forward only, ignore past)
+        // Show graduations from the last 1 minute (fixed window)
+        // Frontend handles per-user deduplication via localStorage seenContracts
         const currentCheckTime = Date.now();
+        const oneMinuteAgo = currentCheckTime - (60 * 1000); // 1 minute ago
         
         // Better logging to debug the filtering
-        console.log(`⏰ Last check was at: ${new Date(lastGraduationCheck).toISOString()}`);
-        console.log(`⏰ Current check is at: ${new Date(currentCheckTime).toISOString()}`);
-        console.log(`⏰ Time window: ${Math.floor((currentCheckTime - lastGraduationCheck) / 1000 / 60)} minutes`);
-        // ✅ REMOVED: console.log(`🗂️ Currently tracking ${seenTokens.size} seen tokens`);
+        console.log(`⏰ Showing graduations from last 1 minute: ${new Date(oneMinuteAgo).toISOString()}`);
+        console.log(`⏰ Current time: ${new Date(currentCheckTime).toISOString()}`);
         
         let oldCount = 0;
         let newCount = 0;
@@ -1259,38 +1260,28 @@ app.get('/api/live-launches', async (req, res) => {
                 return false;
             }
             
-            // ✅ REMOVED: DEDUPLICATION CHECK #1 - Let frontend handle it!
-            // if (seenTokens.has(address)) {
-            //     console.log(`⏭️ Skipping ${token.symbol}: already seen (dedup)`);
-            //     return false;
-            // }
-            
             // Get graduation timestamp
             const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
             if (!graduatedAt) {
-                return false; // Skip if no timestamp
+                // If no timestamp, include it (might be recent)
+                newCount++;
+                return true;
             }
             
             const graduatedTime = typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime();
             
-            // DEDUPLICATION CHECK #2: Time-based filter
-            if (graduatedTime <= lastGraduationCheck) {
+            // Time-based filter: only show graduations from last 1 minute
+            if (graduatedTime < oneMinuteAgo) {
                 oldCount++; // Count old tokens
-                return false; // Skip - graduated before last check
+                return false; // Skip - graduated more than 1 minute ago
             }
-            
-            // ✅ REMOVED: Mark as seen
-            // seenTokens.add(address);
             
             newCount++; // Count new tokens
             return true;
         });
         
-        // Update last check time for next request
-        lastGraduationCheck = currentCheckTime;
-        
-        console.log(`✅ Found ${newGraduations.length} NEW graduations since last check`);
-        console.log(`   Skipped ${oldCount} old graduations (before last check)`);
+        console.log(`✅ Found ${newGraduations.length} graduations in last 1 minute`);
+        console.log(`   Skipped ${oldCount} older graduations`);
         // ✅ REMOVED: console.log(`🗂️ Now tracking ${seenTokens.size} seen tokens`);
         
         // Fetch RugCheck + Bundle data IN PARALLEL for each token
