@@ -952,7 +952,7 @@ app.get('/api/debug/bundle/:contract', async (req, res) => {
 // Live Launches - Get graduated Pump.fun tokens (using Moralis API)
 // Track last check time to only show NEW graduations going forward
 // FIX: Start by looking back 1 hour (3600000ms) instead of starting from "now"
-// Graduation scanner - always return last 5 minutes
+// Graduation scanner - returns all recent graduations from Moralis
 // Frontend handles per-user deduplication via localStorage
 
 // ==========================================
@@ -1241,47 +1241,18 @@ app.get('/api/live-launches', async (req, res) => {
             });
         }
         
-        // Show graduations from the last 1 minute (fixed window)
+        // Return ALL graduated tokens from Moralis
         // Frontend handles per-user deduplication via localStorage seenContracts
         const currentCheckTime = Date.now();
-        const oneMinuteAgo = currentCheckTime - (60 * 1000); // 1 minute ago
-        
-        // Better logging to debug the filtering
-        console.log(`⏰ Showing graduations from last 1 minute: ${new Date(oneMinuteAgo).toISOString()}`);
-        console.log(`⏰ Current time: ${new Date(currentCheckTime).toISOString()}`);
-        
-        let oldCount = 0;
-        let newCount = 0;
+        console.log(`📊 Returning all ${tokens.length} graduated tokens (frontend will dedupe)`);
         
         const newGraduations = tokens.filter(token => {
             // Must have address
             const address = token.address || token.mint || token.token_address || token.tokenAddress;
-            if (!address) {
-                return false;
-            }
-            
-            // Get graduation timestamp
-            const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
-            if (!graduatedAt) {
-                // If no timestamp, include it (might be recent)
-                newCount++;
-                return true;
-            }
-            
-            const graduatedTime = typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime();
-            
-            // Time-based filter: only show graduations from last 1 minute
-            if (graduatedTime < oneMinuteAgo) {
-                oldCount++; // Count old tokens
-                return false; // Skip - graduated more than 1 minute ago
-            }
-            
-            newCount++; // Count new tokens
-            return true;
+            return !!address;
         });
         
-        console.log(`✅ Found ${newGraduations.length} graduations in last 1 minute`);
-        console.log(`   Skipped ${oldCount} older graduations`);
+        console.log(`✅ ${newGraduations.length} tokens have valid addresses`);
         // ✅ REMOVED: console.log(`🗂️ Now tracking ${seenTokens.size} seen tokens`);
         
         // Fetch RugCheck + Bundle data IN PARALLEL for each token
