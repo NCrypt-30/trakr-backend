@@ -513,18 +513,18 @@ async function fetchRugCheckData(contract, retryCount = 0, bypassCache = false) 
         lastRugCheckCall = Date.now();
         
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
+        const timeout = setTimeout(() => controller.abort(), 5000); // 5s timeout
         
         let response = await fetch(`https://api.rugcheck.xyz/v1/tokens/${contract}/report`, {
             signal: controller.signal
         });
         clearTimeout(timeout);
         
-        // Handle rate limiting (429) - retry with exponential backoff
+        // Handle rate limiting (429) - retry with shorter backoff
         if (response.status === 429) {
-            if (retryCount < 3) {
-                const retryDelay = Math.pow(2, retryCount + 1) * 2000; // 4s, 8s, 16s
-                console.log(`⚠️ RugCheck 429 for ${contract.slice(0, 8)}, retry ${retryCount + 1}/3 in ${retryDelay/1000}s...`);
+            if (retryCount < 2) {
+                const retryDelay = (retryCount + 1) * 1000; // 1s, 2s
+                console.log(`⚠️ RugCheck 429 for ${contract.slice(0, 8)}, retry ${retryCount + 1}/2 in ${retryDelay/1000}s...`);
                 await sleep(retryDelay);
                 lastRugCheckCall = Date.now(); // Reset rate limit timer
                 return fetchRugCheckData(contract, retryCount + 1, bypassCache);
@@ -1171,7 +1171,19 @@ setInterval(() => {
 }, 60 * 60 * 1000); // Every hour
 */
 
+// Cache for live-launches to prevent redundant processing
+let liveLaunchesCache = null;
+let liveLaunchesCacheTime = 0;
+const LIVE_LAUNCHES_CACHE_TTL = 10 * 1000; // 10 second cache
+
 app.get('/api/live-launches', async (req, res) => {
+    // Return cached result if fresh (prevents 3x calls from same client)
+    const now = Date.now();
+    if (liveLaunchesCache && (now - liveLaunchesCacheTime) < LIVE_LAUNCHES_CACHE_TTL) {
+        console.log('📦 Returning cached live-launches (< 10s old)');
+        return res.json(liveLaunchesCache);
+    }
+    
     try {
         console.log('🔍 Fetching graduated Pump.fun tokens from Moralis...');
         
@@ -1229,6 +1241,11 @@ app.get('/api/live-launches', async (req, res) => {
         
         console.log(`📊 Moralis returned ${tokens.length} graduated tokens`);
         
+        // DEBUG: Log first token to see actual field names and values
+        if (tokens.length > 0) {
+            console.log('🔍 SAMPLE TOKEN:', JSON.stringify(tokens[0], null, 2));
+        }
+        
         if (tokens.length === 0) {
             return res.json({
                 success: true,
@@ -1241,28 +1258,63 @@ app.get('/api/live-launches', async (req, res) => {
             });
         }
         
-        // Return ALL graduated tokens from Moralis
+        // Filter to tokens graduated in the last 60 minutes
         // Frontend handles per-user deduplication via localStorage seenContracts
         const currentCheckTime = Date.now();
-        console.log(`📊 Returning all ${tokens.length} graduated tokens (frontend will dedupe)`);
+        const sixtyMinutesAgo = currentCheckTime - (60 * 60 * 1000);
+        
+        console.log(`📊 Filtering ${tokens.length} tokens to last 60 minutes...`);
+        console.log(`⏰ Cutoff time: ${new Date(sixtyMinutesAgo).toISOString()}`);
+        
+        let includedCount = 0;
+        let skippedCount = 0;
+        let noTimestampCount = 0;
         
         const newGraduations = tokens.filter(token => {
             // Must have address
             const address = token.address || token.mint || token.token_address || token.tokenAddress;
-            return !!address;
+            if (!address) return false;
+            
+            // Get graduation timestamp - Moralis uses 'graduatedAt'
+            const graduatedAt = token.graduatedAt || token.graduated_at;
+            
+            if (!graduatedAt) {
+                noTimestampCount++;
+                return false; // Skip if no timestamp - can't verify it's recent
+            }
+            
+            // Parse timestamp
+            const graduatedTime = new Date(graduatedAt).getTime();
+            
+            // Debug first few
+            if (includedCount + skippedCount < 3) {
+                console.log(`🔍 Token ${address.slice(0,8)}: graduatedAt=${graduatedAt}, parsed=${new Date(graduatedTime).toISOString()}, age=${Math.floor((currentCheckTime - graduatedTime) / 60000)} min`);
+            }
+            
+            if (graduatedTime < sixtyMinutesAgo) {
+                skippedCount++;
+                return false;
+            }
+            
+            includedCount++;
+            return true;
         });
         
-        console.log(`✅ ${newGraduations.length} tokens have valid addresses`);
-        // ✅ REMOVED: console.log(`🗂️ Now tracking ${seenTokens.size} seen tokens`);
+        console.log(`✅ ${newGraduations.length} tokens in last 60 min (${skippedCount} older, ${noTimestampCount} no timestamp)`);
+        
+        // Limit to 10 most recent to avoid timeout on RugCheck/Bundle fetching
+        // Moralis returns tokens sorted by graduation time (most recent first)
+        const tokensToProcess = newGraduations.slice(0, 10);
+        console.log(`📊 Processing top ${tokensToProcess.length} tokens for RugCheck/Bundle`);
         
         // Fetch RugCheck + Bundle data IN PARALLEL for each token
         // RugCheck is sequential (rate limited), Bundle checks run in parallel alongside
-        console.log(`📊 Fetching RugCheck + Bundle data for ${newGraduations.length} tokens...`);
+        console.log(`📊 Fetching RugCheck + Bundle data for ${tokensToProcess.length} tokens...`);
         const rugCheckMap = new Map();
         const bundleMap = new Map();
         
         // Start ALL bundle checks in parallel (Helius has generous rate limits)
-        const bundlePromises = newGraduations.map(async (token) => {
+        const bundlePromises = tokensToProcess.map(async (token) => {
             const address = token.address || token.mint || token.token_address || token.tokenAddress;
             try {
                 const bundleData = await fetchBundleData(address);
@@ -1275,7 +1327,7 @@ app.get('/api/live-launches', async (req, res) => {
         
         // Run RugCheck SEQUENTIALLY (rate limited) while bundles run in parallel
         const rugCheckPromise = (async () => {
-            for (const token of newGraduations) {
+            for (const token of tokensToProcess) {
                 const address = token.address || token.mint || token.token_address || token.tokenAddress;
                 try {
                     const rugCheckData = await fetchRugCheckData(address);
@@ -1293,7 +1345,7 @@ app.get('/api/live-launches', async (req, res) => {
         console.log(`✅ RugCheck + Bundle complete: ${rugCheckMap.size} rugchecks, ${bundleMap.size} bundle checks`);
         
         // Format results with RugCheck + Bundle data
-        const formatted = newGraduations.map(token => {
+        const formatted = tokensToProcess.map(token => {
             const address = token.address || token.mint || token.token_address || token.tokenAddress;
             const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
             const rugCheck = rugCheckMap.get(address);
@@ -1415,7 +1467,7 @@ app.get('/api/live-launches', async (req, res) => {
         const allLaunches = [...formatted, ...bagsFormatted];
         console.log(`✅ Total launches: ${formatted.length} Pump + ${bagsFormatted.length} Bags = ${allLaunches.length}`);
         
-        res.json({
+        const result = {
             success: true,
             timestamp: new Date().toISOString(),
             totalScanned: tokens.length,
@@ -1425,7 +1477,13 @@ app.get('/api/live-launches', async (req, res) => {
             bagsCount: bagsFormatted.length,
             message: 'Pump.fun graduations + Bags.fm DBC launches',
             scamFilterRate: `${tokens.length > 0 ? ((1 - formatted.length / tokens.length) * 100).toFixed(1) : '0'}%`
-        });
+        };
+        
+        // Cache the result
+        liveLaunchesCache = result;
+        liveLaunchesCacheTime = Date.now();
+        
+        res.json(result);
         
     } catch (error) {
         console.error('❌ Live Launches API error:', error);
