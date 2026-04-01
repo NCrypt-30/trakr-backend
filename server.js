@@ -1191,10 +1191,12 @@ app.get('/api/live-launches', async (req, res) => {
         // Moralis Solana API - Get graduated tokens
         // Docs: https://docs.moralis.com/web3-data-api/solana/reference/token-api#get-graduated-tokens-by-exchange
         // Use "pumpfun" as the exchange identifier (Pump.fun tokens that completed bonding curve)
-        const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/graduated', {
+        // Add order param to try to get most recent first
+        const response = await fetch('https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/graduated?order=DESC', {
             headers: {
                 'Accept': 'application/json',
-                'X-API-Key': MORALIS_API_KEY
+                'X-API-Key': MORALIS_API_KEY,
+                'Cache-Control': 'no-cache'
             }
         });
         
@@ -1246,13 +1248,15 @@ app.get('/api/live-launches', async (req, res) => {
             });
         }
         
-        // Filter to tokens graduated in the last 2 minutes (fixed window)
-        // Same data for everyone - frontend handles per-user first load logic
+        // Filter to tokens graduated in the last 10 minutes
+        // Moralis API has some delay, so 2 minutes was too tight
+        // Frontend handles per-user first load logic (marks as seen, only shows truly new)
         const currentCheckTime = Date.now();
-        const twoMinutesAgo = currentCheckTime - (2 * 60 * 1000);
+        const maxAgeMinutes = 10;
+        const cutoffTime = currentCheckTime - (maxAgeMinutes * 60 * 1000);
         
-        console.log(`⏰ Showing graduations from last 2 minutes`);
-        console.log(`⏰ Cutoff: ${new Date(twoMinutesAgo).toISOString()}`);
+        console.log(`⏰ Showing graduations from last ${maxAgeMinutes} minutes`);
+        console.log(`⏰ Cutoff: ${new Date(cutoffTime).toISOString()}`);
         
         let includedCount = 0;
         let skippedCount = 0;
@@ -1279,8 +1283,8 @@ app.get('/api/live-launches', async (req, res) => {
                 console.log(`🔍 Token ${address.slice(0,8)}: graduatedAt=${graduatedAt}, age=${Math.floor((currentCheckTime - graduatedTime) / 60000)} min`);
             }
             
-            // Only include if graduated within last 2 minutes
-            if (graduatedTime < twoMinutesAgo) {
+            // Only include if graduated within maxAgeMinutes
+            if (graduatedTime < cutoffTime) {
                 skippedCount++;
                 return false;
             }
@@ -1289,7 +1293,7 @@ app.get('/api/live-launches', async (req, res) => {
             return true;
         });
         
-        console.log(`✅ ${newGraduations.length} graduations in last 2 min (${skippedCount} older, ${noTimestampCount} no timestamp)`);
+        console.log(`✅ ${newGraduations.length} graduations in last ${maxAgeMinutes} min (${skippedCount} older, ${noTimestampCount} no timestamp)`);
         
         // Process all new graduations (should be small number in 1-min window)
         // Fetch RugCheck + Bundle data IN PARALLEL for each token
