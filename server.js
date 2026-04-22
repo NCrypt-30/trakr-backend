@@ -974,18 +974,6 @@ function isBagsToken(address) {
     return address && address.toUpperCase().endsWith('BAGS');
 }
 
-// Check if a token address is a Printr token (ends in brrr)
-function isPrintrToken(address) {
-    return address && address.toLowerCase().endsWith('brrr');
-}
-
-// Determine which DBC launchpad a token came from
-function getDBCTokenSource(address) {
-    if (isBagsToken(address)) return 'Bags';
-    if (isPrintrToken(address)) return 'Printr';
-    return null;
-}
-
 // Fetch token metadata from DexScreener (free)
 async function fetchBagsTokenMetadata(tokenMint) {
     try {
@@ -1073,17 +1061,16 @@ async function fetchBagsLaunches() {
             return [];
         }
 
-        // Extract unique token mints from transactions (Map: mint -> source)
-        const potentialTokens = new Map();
+        // Extract unique token mints from transactions
+        const potentialTokens = new Set();
 
         for (const tx of transactions) {
             // Look for token mints in the transaction
             // Check tokenTransfers
             if (tx.tokenTransfers) {
                 for (const transfer of tx.tokenTransfers) {
-                    if (transfer.mint) {
-                        const source = getDBCTokenSource(transfer.mint);
-                        if (source) potentialTokens.set(transfer.mint, source);
+                    if (transfer.mint && isBagsToken(transfer.mint)) {
+                        potentialTokens.add(transfer.mint);
                     }
                 }
             }
@@ -1091,27 +1078,27 @@ async function fetchBagsLaunches() {
             // Check account data
             if (tx.accountData) {
                 for (const account of tx.accountData) {
-                    if (account.account) {
-                        const source = getDBCTokenSource(account.account);
-                        if (source) potentialTokens.set(account.account, source);
+                    if (account.account && isBagsToken(account.account)) {
+                        potentialTokens.add(account.account);
                     }
                 }
             }
 
-            // Check instructions for any addresses ending in BAGS or brrr
+            // Check instructions for any addresses ending in BAGS
             if (tx.instructions) {
                 for (const ix of tx.instructions) {
                     if (ix.accounts) {
                         for (const acc of ix.accounts) {
-                            const source = getDBCTokenSource(acc);
-                            if (source) potentialTokens.set(acc, source);
+                            if (isBagsToken(acc)) {
+                                potentialTokens.add(acc);
+                            }
                         }
                     }
                 }
             }
         }
 
-        console.log(`🛍️ Found ${potentialTokens.size} potential DBC tokens (Bags + Printr)`);
+        console.log(`🛍️ Found ${potentialTokens.size} potential Bags tokens`);
 
         // Fetch metadata for each Bags token IN PARALLEL and filter by CREATION TIME
         const bagsLaunches = [];
@@ -1119,7 +1106,7 @@ async function fetchBagsLaunches() {
         const now = Date.now();
         
         // Fetch all metadata in parallel for speed
-        const metadataPromises = Array.from(potentialTokens.keys()).map(async (tokenMint) => {
+        const metadataPromises = Array.from(potentialTokens).map(async (tokenMint) => {
             const metadata = await fetchBagsTokenMetadata(tokenMint);
             return { tokenMint, metadata };
         });
@@ -1127,7 +1114,6 @@ async function fetchBagsLaunches() {
         const metadataResults = await Promise.all(metadataPromises);
         
         for (const { tokenMint, metadata } of metadataResults) {
-            const tokenSource = potentialTokens.get(tokenMint);
             if (metadata) {
                 // Check token age - filter out old tokens
                 const createdTime = metadata.createdAt ? new Date(metadata.createdAt).getTime() : 0;
@@ -1138,7 +1124,7 @@ async function fetchBagsLaunches() {
                     continue;
                 }
                 
-                console.log(`✅ ${tokenSource} token: ${metadata.symbol} (${ageMinutes}m old)`);
+                console.log(`✅ Bags token: ${metadata.symbol} (${ageMinutes}m old)`);
                 
                 bagsLaunches.push({
                     symbol: metadata.symbol,
@@ -1151,19 +1137,18 @@ async function fetchBagsLaunches() {
                         m5: metadata.priceChange5m,
                         h1: metadata.priceChange1h
                     },
-                    source: tokenSource, // 'Bags' or 'Printr'
+                    source: 'Bags',
                     dex: metadata.dexId || 'meteora',
                     createdAt: metadata.createdAt,
                     ageMinutes: ageMinutes,
                     dexscreenerUrl: `https://dexscreener.com/solana/${tokenMint}`,
-                    bagsUrl: tokenSource === 'Bags' ? `https://bags.fm/${tokenMint}` : null,
-                    printrUrl: tokenSource === 'Printr' ? `https://printr.money/token/${tokenMint}` : null,
+                    bagsUrl: `https://bags.fm/${tokenMint}`,
                     jupiterUrl: `https://jup.ag/?sell=So11111111111111111111111111111111111111112&buy=${tokenMint}`
                 });
             }
         }
 
-        console.log(`🛍️ Returning ${bagsLaunches.length} fresh DBC tokens (< ${maxAgeMinutes}m old)`);
+        console.log(`🛍️ Returning ${bagsLaunches.length} fresh Bags tokens (< ${maxAgeMinutes}m old)`);
         return bagsLaunches;
 
     } catch (error) {
@@ -1445,7 +1430,6 @@ app.get('/api/live-launches', async (req, res) => {
                     dexscreenerUrl: token.dexscreenerUrl,
                     jupiterUrl: token.jupiterUrl,
                     bagsUrl: token.bagsUrl,
-                    printrUrl: token.printrUrl,
                     priceChange: token.priceChange || { m5: 0, h1: 0 },
                     graduated: false, // Still on bonding curve
                     marketCap: token.marketCap || 0,
@@ -1458,19 +1442,19 @@ app.get('/api/live-launches', async (req, res) => {
                     creatorHasRugged: rugCheck?.creatorHasRugged || false,
                     rugCheckRisks: rugCheck?.risks || [],
                     isRugged: rugCheck?.rugged || false,
-                    // No bundle detection for Bags/Printr (they're on bonding curve)
+                    // No bundle detection for Bags (they're on bonding curve)
                     bundleDetection: null,
-                    // Source identifier - preserve from DBC detection
-                    source: token.source || 'Bags'
+                    // Source identifier
+                    source: 'Bags'
                 });
             }
         } catch (bagsError) {
             console.log(`⚠️ Bags fetch error (continuing without): ${bagsError.message}`);
         }
         
-        // Combine Pump.fun + DBC launches (Bags + Printr)
+        // Combine Pump.fun + Bags launches
         const allLaunches = [...formatted, ...bagsFormatted];
-        console.log(`✅ Total launches: ${formatted.length} Pump + ${bagsFormatted.length} DBC (Bags/Printr) = ${allLaunches.length}`);
+        console.log(`✅ Total launches: ${formatted.length} Pump + ${bagsFormatted.length} Bags = ${allLaunches.length}`);
         
         res.json({
             success: true,
@@ -1479,9 +1463,8 @@ app.get('/api/live-launches', async (req, res) => {
             launches: allLaunches,
             count: allLaunches.length,
             pumpCount: formatted.length,
-            bagsCount: bagsFormatted.filter(t => t.source === 'Bags').length,
-            printrCount: bagsFormatted.filter(t => t.source === 'Printr').length,
-            message: 'Pump.fun graduations + Bags.fm + Printr DBC launches',
+            bagsCount: bagsFormatted.length,
+            message: 'Pump.fun graduations + Bags.fm DBC launches',
             scamFilterRate: `${tokens.length > 0 ? ((1 - formatted.length / tokens.length) * 100).toFixed(1) : '0'}%`
         });
         
@@ -3678,6 +3661,181 @@ app.get('/api/wallet-tracker/holdings/:address', async (req, res) => {
 });
 
 // ==========================================
+// ANALYTICS ENDPOINTS
+// ==========================================
+
+// Log wallet connection (call when user connects wallet)
+app.post('/api/analytics/connect', async (req, res) => {
+    try {
+        const { wallet_address } = req.body;
+        
+        if (!wallet_address) {
+            return res.status(400).json({ success: false, error: 'wallet_address required' });
+        }
+        
+        // Upsert: insert new user or update existing
+        const { data, error } = await supabase
+            .from('app_users')
+            .upsert({
+                wallet_address: wallet_address,
+                last_active: new Date().toISOString(),
+                connection_count: 1
+            }, {
+                onConflict: 'wallet_address',
+                ignoreDuplicates: false
+            })
+            .select();
+        
+        // If user exists, increment connection count
+        if (data && data.length > 0) {
+            await supabase
+                .from('app_users')
+                .update({ 
+                    last_active: new Date().toISOString(),
+                    connection_count: (data[0].connection_count || 0) + 1
+                })
+                .eq('wallet_address', wallet_address);
+        }
+        
+        if (error) {
+            console.error('Analytics connect error:', error);
+            return res.status(500).json({ success: false, error: error.message });
+        }
+        
+        console.log(`📊 Analytics: Wallet connected - ${wallet_address.slice(0, 8)}...`);
+        res.json({ success: true });
+        
+    } catch (error) {
+        console.error('❌ Analytics connect error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Log when user adds a wallet to track
+app.post('/api/analytics/track-wallet', async (req, res) => {
+    try {
+        const { user_wallet, tracked_wallet, label } = req.body;
+        
+        if (!user_wallet || !tracked_wallet) {
+            return res.status(400).json({ success: false, error: 'user_wallet and tracked_wallet required' });
+        }
+        
+        // Check if already tracking this wallet
+        const { data: existing } = await supabase
+            .from('tracked_wallets')
+            .select('id')
+            .eq('user_wallet', user_wallet)
+            .eq('tracked_wallet', tracked_wallet)
+            .single();
+        
+        if (existing) {
+            return res.json({ success: true, message: 'Already tracking' });
+        }
+        
+        // Insert new tracked wallet
+        const { error } = await supabase
+            .from('tracked_wallets')
+            .insert({
+                user_wallet: user_wallet,
+                tracked_wallet: tracked_wallet,
+                label: label || null
+            });
+        
+        if (error) {
+            console.error('Analytics track-wallet error:', error);
+            return res.status(500).json({ success: false, error: error.message });
+        }
+        
+        console.log(`📊 Analytics: ${user_wallet.slice(0, 8)}... tracking ${tracked_wallet.slice(0, 8)}...`);
+        res.json({ success: true });
+        
+    } catch (error) {
+        console.error('❌ Analytics track-wallet error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Log when user removes a tracked wallet
+app.delete('/api/analytics/untrack-wallet', async (req, res) => {
+    try {
+        const { user_wallet, tracked_wallet } = req.body;
+        
+        if (!user_wallet || !tracked_wallet) {
+            return res.status(400).json({ success: false, error: 'user_wallet and tracked_wallet required' });
+        }
+        
+        const { error } = await supabase
+            .from('tracked_wallets')
+            .delete()
+            .eq('user_wallet', user_wallet)
+            .eq('tracked_wallet', tracked_wallet);
+        
+        if (error) {
+            console.error('Analytics untrack-wallet error:', error);
+            return res.status(500).json({ success: false, error: error.message });
+        }
+        
+        console.log(`📊 Analytics: ${user_wallet.slice(0, 8)}... untracked ${tracked_wallet.slice(0, 8)}...`);
+        res.json({ success: true });
+        
+    } catch (error) {
+        console.error('❌ Analytics untrack-wallet error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get analytics summary (admin)
+app.get('/api/analytics/summary', async (req, res) => {
+    try {
+        // Total users
+        const { count: totalUsers } = await supabase
+            .from('app_users')
+            .select('*', { count: 'exact', head: true });
+        
+        // Active last 7 days
+        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+        const { count: activeUsers } = await supabase
+            .from('app_users')
+            .select('*', { count: 'exact', head: true })
+            .gte('last_active', sevenDaysAgo);
+        
+        // Total tracked wallets
+        const { count: totalTracked } = await supabase
+            .from('tracked_wallets')
+            .select('*', { count: 'exact', head: true });
+        
+        // Most tracked wallets
+        const { data: popularWallets } = await supabase
+            .from('tracked_wallets')
+            .select('tracked_wallet')
+            .limit(1000);
+        
+        // Count occurrences
+        const walletCounts = {};
+        popularWallets?.forEach(w => {
+            walletCounts[w.tracked_wallet] = (walletCounts[w.tracked_wallet] || 0) + 1;
+        });
+        
+        const topWallets = Object.entries(walletCounts)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 10)
+            .map(([wallet, count]) => ({ wallet, count }));
+        
+        res.json({
+            success: true,
+            totalUsers: totalUsers || 0,
+            activeUsersLast7Days: activeUsers || 0,
+            totalTrackedWallets: totalTracked || 0,
+            topTrackedWallets: topWallets
+        });
+        
+    } catch (error) {
+        console.error('❌ Analytics summary error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ==========================================
 // SERVER START
 // ==========================================
 
@@ -3704,4 +3862,8 @@ app.listen(PORT, () => {
     console.log(`   DELETE /api/admin/projects/filter`);
     console.log(`   GET  /jupiter/quote (Jupiter proxy)`);
     console.log(`   POST /jupiter/swap (Jupiter proxy)`);
+    console.log(`   POST /api/analytics/connect (Log wallet connection)`);
+    console.log(`   POST /api/analytics/track-wallet (Log tracked wallet)`);
+    console.log(`   DELETE /api/analytics/untrack-wallet (Log untracked wallet)`);
+    console.log(`   GET  /api/analytics/summary (Analytics summary)`);
 });
