@@ -1296,11 +1296,12 @@ app.get('/api/live-launches', async (req, res) => {
         console.log(`✅ ${newGraduations.length} graduations in last ${maxAgeMinutes} min (${skippedCount} older, ${noTimestampCount} no timestamp)`);
         
         // Process all new graduations (should be small number in 1-min window)
-        // Fetch RugCheck + Bundle data IN PARALLEL for each token
-        // RugCheck is sequential (rate limited), Bundle checks run in parallel alongside
-        console.log(`📊 Fetching RugCheck + Bundle data for ${newGraduations.length} tokens...`);
+        // Fetch RugCheck + Bundle + DexScreener data IN PARALLEL for each token
+        // RugCheck is sequential (rate limited), Bundle + DexScreener run in parallel alongside
+        console.log(`📊 Fetching RugCheck + Bundle + DexScreener data for ${newGraduations.length} tokens...`);
         const rugCheckMap = new Map();
         const bundleMap = new Map();
+        const dexScreenerMap = new Map();
         
         // Start ALL bundle checks in parallel (Helius has generous rate limits)
         const bundlePromises = newGraduations.map(async (token) => {
@@ -1314,7 +1315,45 @@ app.get('/api/live-launches', async (req, res) => {
             }
         });
         
-        // Run RugCheck SEQUENTIALLY (rate limited) while bundles run in parallel
+        // Batch DexScreener fetch for all tokens (up to 30 per call)
+        const dexScreenerPromise = (async () => {
+            const addresses = newGraduations.map(token => 
+                token.address || token.mint || token.token_address || token.tokenAddress
+            );
+            
+            // DexScreener supports up to 30 tokens per request
+            const BATCH_SIZE = 30;
+            for (let i = 0; i < addresses.length; i += BATCH_SIZE) {
+                const batch = addresses.slice(i, i + BATCH_SIZE);
+                const batchStr = batch.join(',');
+                
+                try {
+                    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${batchStr}`);
+                    if (response.ok) {
+                        const data = await response.json();
+                        
+                        // Map each pair to its token address
+                        if (data.pairs) {
+                            for (const pair of data.pairs) {
+                                const addr = pair.baseToken?.address;
+                                if (addr && !dexScreenerMap.has(addr)) {
+                                    dexScreenerMap.set(addr, {
+                                        marketCap: pair.marketCap || pair.fdv || 0,
+                                        liquidity: pair.liquidity?.usd || 0,
+                                        price: parseFloat(pair.priceUsd) || 0
+                                    });
+                                }
+                            }
+                        }
+                    }
+                } catch (err) {
+                    console.log(`⚠️ DexScreener batch failed: ${err.message}`);
+                }
+            }
+            console.log(`📊 DexScreener: Got data for ${dexScreenerMap.size}/${addresses.length} tokens`);
+        })();
+        
+        // Run RugCheck SEQUENTIALLY (rate limited) while bundles + dexscreener run in parallel
         const rugCheckPromise = (async () => {
             for (const token of newGraduations) {
                 const address = token.address || token.mint || token.token_address || token.tokenAddress;
@@ -1328,17 +1367,18 @@ app.get('/api/live-launches', async (req, res) => {
             }
         })();
         
-        // Wait for BOTH to complete
-        await Promise.all([rugCheckPromise, ...bundlePromises]);
+        // Wait for ALL to complete
+        await Promise.all([rugCheckPromise, dexScreenerPromise, ...bundlePromises]);
         
-        console.log(`✅ RugCheck + Bundle complete: ${rugCheckMap.size} rugchecks, ${bundleMap.size} bundle checks`);
+        console.log(`✅ RugCheck + Bundle + DexScreener complete: ${rugCheckMap.size} rugchecks, ${bundleMap.size} bundles, ${dexScreenerMap.size} dexscreener`);
         
-        // Format results with RugCheck + Bundle data
+        // Format results with RugCheck + Bundle + DexScreener data
         const formatted = newGraduations.map(token => {
             const address = token.address || token.mint || token.token_address || token.tokenAddress;
             const graduatedAt = token.graduated_at || token.graduatedAt || token.migration_timestamp || token.timestamp;
             const rugCheck = rugCheckMap.get(address);
             const bundle = bundleMap.get(address);
+            const dexData = dexScreenerMap.get(address);
             
             const ageMinutes = graduatedAt 
                 ? Math.floor((currentCheckTime - (typeof graduatedAt === 'number' ? graduatedAt : new Date(graduatedAt).getTime())) / (1000 * 60))
@@ -1349,8 +1389,8 @@ app.get('/api/live-launches', async (req, res) => {
                 name: token.name || 'Unknown Token',
                 contract: address,
                 ageMinutes: ageMinutes,
-                liquidity: token.liquidity || token.reserve_in_usd || token.raydium_liquidity || 0,
-                price: token.priceUsd || token.price_usd || token.price || token.priceNative || 0,
+                liquidity: dexData?.liquidity || token.liquidity || token.reserve_in_usd || token.raydium_liquidity || 0,
+                price: dexData?.price || token.priceUsd || token.price_usd || token.price || token.priceNative || 0,
                 dex: 'raydium',
                 hasLogo: !!token.logo || !!token.image_uri || !!token.logoURI,
                 hasWebsite: !!token.website,
@@ -1364,7 +1404,7 @@ app.get('/api/live-launches', async (req, res) => {
                     h1: token.priceChange1h || token.price_change_1h || token.priceChange?.['1h'] || 0
                 },
                 graduated: true,
-                marketCap: token.market_cap || token.marketCap || 0,
+                marketCap: dexData?.marketCap || token.market_cap || token.marketCap || 0,
                 graduatedAt: graduatedAt, // Include timestamp
                 // RugCheck data
                 rugCheckScore: rugCheck?.score || 0,
