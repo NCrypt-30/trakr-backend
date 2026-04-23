@@ -974,6 +974,18 @@ function isBagsToken(address) {
     return address && address.toUpperCase().endsWith('BAGS');
 }
 
+// Check if a token address is a Printr token (ends in brrr)
+function isPrintrToken(address) {
+    return address && address.toLowerCase().endsWith('brrr');
+}
+
+// Determine which DBC launchpad a token came from
+function getDBCTokenSource(address) {
+    if (isBagsToken(address)) return 'Bags';
+    if (isPrintrToken(address)) return 'Printr';
+    return null;
+}
+
 // Fetch token metadata from DexScreener (free)
 async function fetchBagsTokenMetadata(tokenMint) {
     try {
@@ -1061,16 +1073,17 @@ async function fetchBagsLaunches() {
             return [];
         }
 
-        // Extract unique token mints from transactions
-        const potentialTokens = new Set();
+        // Extract unique token mints from transactions (Map: mint -> source)
+        const potentialTokens = new Map();
 
         for (const tx of transactions) {
             // Look for token mints in the transaction
             // Check tokenTransfers
             if (tx.tokenTransfers) {
                 for (const transfer of tx.tokenTransfers) {
-                    if (transfer.mint && isBagsToken(transfer.mint)) {
-                        potentialTokens.add(transfer.mint);
+                    if (transfer.mint) {
+                        const source = getDBCTokenSource(transfer.mint);
+                        if (source) potentialTokens.set(transfer.mint, source);
                     }
                 }
             }
@@ -1078,27 +1091,27 @@ async function fetchBagsLaunches() {
             // Check account data
             if (tx.accountData) {
                 for (const account of tx.accountData) {
-                    if (account.account && isBagsToken(account.account)) {
-                        potentialTokens.add(account.account);
+                    if (account.account) {
+                        const source = getDBCTokenSource(account.account);
+                        if (source) potentialTokens.set(account.account, source);
                     }
                 }
             }
 
-            // Check instructions for any addresses ending in BAGS
+            // Check instructions for any addresses ending in BAGS or brrr
             if (tx.instructions) {
                 for (const ix of tx.instructions) {
                     if (ix.accounts) {
                         for (const acc of ix.accounts) {
-                            if (isBagsToken(acc)) {
-                                potentialTokens.add(acc);
-                            }
+                            const source = getDBCTokenSource(acc);
+                            if (source) potentialTokens.set(acc, source);
                         }
                     }
                 }
             }
         }
 
-        console.log(`🛍️ Found ${potentialTokens.size} potential Bags tokens`);
+        console.log(`🛍️ Found ${potentialTokens.size} potential DBC tokens (Bags + Printr)`);
 
         // Fetch metadata for each Bags token IN PARALLEL and filter by CREATION TIME
         const bagsLaunches = [];
@@ -1106,7 +1119,7 @@ async function fetchBagsLaunches() {
         const now = Date.now();
         
         // Fetch all metadata in parallel for speed
-        const metadataPromises = Array.from(potentialTokens).map(async (tokenMint) => {
+        const metadataPromises = Array.from(potentialTokens.keys()).map(async (tokenMint) => {
             const metadata = await fetchBagsTokenMetadata(tokenMint);
             return { tokenMint, metadata };
         });
@@ -1114,6 +1127,7 @@ async function fetchBagsLaunches() {
         const metadataResults = await Promise.all(metadataPromises);
         
         for (const { tokenMint, metadata } of metadataResults) {
+            const tokenSource = potentialTokens.get(tokenMint);
             if (metadata) {
                 // Check token age - filter out old tokens
                 const createdTime = metadata.createdAt ? new Date(metadata.createdAt).getTime() : 0;
@@ -1124,7 +1138,7 @@ async function fetchBagsLaunches() {
                     continue;
                 }
                 
-                console.log(`✅ Bags token: ${metadata.symbol} (${ageMinutes}m old)`);
+                console.log(`✅ ${tokenSource} token: ${metadata.symbol} (${ageMinutes}m old)`);
                 
                 bagsLaunches.push({
                     symbol: metadata.symbol,
@@ -1137,18 +1151,19 @@ async function fetchBagsLaunches() {
                         m5: metadata.priceChange5m,
                         h1: metadata.priceChange1h
                     },
-                    source: 'Bags',
+                    source: tokenSource, // 'Bags' or 'Printr'
                     dex: metadata.dexId || 'meteora',
                     createdAt: metadata.createdAt,
                     ageMinutes: ageMinutes,
                     dexscreenerUrl: `https://dexscreener.com/solana/${tokenMint}`,
-                    bagsUrl: `https://bags.fm/${tokenMint}`,
+                    bagsUrl: tokenSource === 'Bags' ? `https://bags.fm/${tokenMint}` : null,
+                    printrUrl: tokenSource === 'Printr' ? `https://printr.money/token/${tokenMint}` : null,
                     jupiterUrl: `https://jup.ag/?sell=So11111111111111111111111111111111111111112&buy=${tokenMint}`
                 });
             }
         }
 
-        console.log(`🛍️ Returning ${bagsLaunches.length} fresh Bags tokens (< ${maxAgeMinutes}m old)`);
+        console.log(`🛍️ Returning ${bagsLaunches.length} fresh DBC tokens (< ${maxAgeMinutes}m old)`);
         return bagsLaunches;
 
     } catch (error) {
@@ -1470,6 +1485,7 @@ app.get('/api/live-launches', async (req, res) => {
                     dexscreenerUrl: token.dexscreenerUrl,
                     jupiterUrl: token.jupiterUrl,
                     bagsUrl: token.bagsUrl,
+                    printrUrl: token.printrUrl,
                     priceChange: token.priceChange || { m5: 0, h1: 0 },
                     graduated: false, // Still on bonding curve
                     marketCap: token.marketCap || 0,
@@ -1484,8 +1500,8 @@ app.get('/api/live-launches', async (req, res) => {
                     isRugged: rugCheck?.rugged || false,
                     // No bundle detection for Bags (they're on bonding curve)
                     bundleDetection: null,
-                    // Source identifier
-                    source: 'Bags'
+                    // Source identifier - use actual source from token
+                    source: token.source || 'Bags'
                 });
             }
         } catch (bagsError) {
@@ -1503,8 +1519,9 @@ app.get('/api/live-launches', async (req, res) => {
             launches: allLaunches,
             count: allLaunches.length,
             pumpCount: formatted.length,
-            bagsCount: bagsFormatted.length,
-            message: 'Pump.fun graduations + Bags.fm DBC launches',
+            bagsCount: bagsFormatted.filter(t => t.source === 'Bags').length,
+            printrCount: bagsFormatted.filter(t => t.source === 'Printr').length,
+            message: 'Pump.fun graduations + Bags.fm + Printr DBC launches',
             scamFilterRate: `${tokens.length > 0 ? ((1 - formatted.length / tokens.length) * 100).toFixed(1) : '0'}%`
         });
         
@@ -1710,8 +1727,9 @@ app.get('/api/all-launches', async (req, res) => {
             launches: allLaunches,
             count: allLaunches.length,
             pumpCount: pumpFormatted.length,
-            bagsCount: bagsLaunches.length,
-            message: 'Combined Pump.fun graduations + Bags.fm DBC launches'
+            bagsCount: bagsLaunches.filter(t => t.source === 'Bags').length,
+            printrCount: bagsLaunches.filter(t => t.source === 'Printr').length,
+            message: 'Combined Pump.fun graduations + Bags.fm + Printr DBC launches'
         });
 
     } catch (error) {
