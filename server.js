@@ -27,307 +27,6 @@ const TWITTER_BASE_URL = 'https://api.twitter.com/2';
 
 
 // ==========================================
-// SCANNER FUNCTIONS
-// ==========================================
-
-// 3-Tier Search System - X API v2 compatible (spaces instead of AND)
-const SEARCH_TIERS = {
-    tier1: {
-        query: '(testnet OR deployed OR "smart contract deployed" OR "mainnet live" OR "devnet live" OR "no token" OR "pre-token") (DeFi OR rollup OR DEX OR DePIN OR RWA) -is:retweet',
-        frequency: 5,  // minutes
-        label: 'TIER 1',
-        ageLimit: 365  // days - builders often have older accounts
-    },
-    tier2: {
-        query: '(stealth OR testnet) ("launch" OR "live" OR deploy OR deployed) (DeFi OR rollup OR DePIN OR RWA) -is:retweet',
-        frequency: 30,  // minutes (changed from 15 to reduce cost)
-        label: 'TIER 2',
-        ageLimit: 180  // days
-    },
-    tier3: {
-        query: '("launching" OR "now live" OR "going live" OR announced OR airdrop OR presale OR "TGE coming") (DeFi OR DEX OR NFT OR DePIN OR RWA OR "AI agent") -is:retweet',
-        frequency: 30,  // minutes
-        label: 'TIER 3',
-        ageLimit: 90  // days
-    }
-};
-
-// Fetch project account details
-async function fetchProjectDetails(username) {
-    try {
-        const response = await fetch(
-            `${TWITTER_BASE_URL}/users/by/username/${username}?user.fields=created_at,public_metrics,description,verified`,
-            {
-                headers: {
-                    'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}`
-                }
-            }
-        );
-        
-        if (!response.ok) return null;
-        const data = await response.json();
-        return data.data;
-    } catch (error) {
-        console.error(`Error fetching @${username}:`, error.message);
-        return null;
-    }
-}
-
-// Extract project handle from tweet
-function extractProjectHandle(text) {
-    const mentions = text.match(/@\w+/g);
-    if (!mentions || mentions.length === 0) return null;
-    
-    // Return first mention (usually the project)
-    return mentions[0].replace('@', '');
-}
-
-// Scan X API for projects (tiered)
-async function scanProjects(tier = 'tier1') {
-    const tierConfig = SEARCH_TIERS[tier];
-    console.log(`🔍 Starting ${tierConfig.label} scan...`);
-    
-    // Track last tweet count per tier (for cooldown skip)
-    if (!global.lastTweetCount) {
-        global.lastTweetCount = {};
-    }
-    
-    // Fix #3: Cooldown skip for Tier 1 if last run returned 0 tweets
-    if (tier === 'tier1' && global.lastTweetCount[tier] === 0) {
-        console.log('⏭️ Skipping TIER 1 — last run empty (cooldown)');
-        global.lastTweetCount[tier] = undefined; // Reset so next run executes
-        return [];
-    }
-    
-    const query = tierConfig.query;
-    const allProjects = [];
-    
-    // Track projects found in this scan cycle (across all tiers)
-    if (!global.currentScanProjects) {
-        global.currentScanProjects = new Set();
-    }
-    
-    // Hard lookup caps per tier (prevents surprise bills)
-    const LOOKUP_CAPS = {
-        tier1: 5,
-        tier2: 10,
-        tier3: 10
-    };
-    
-    // Track old accounts to never fetch again (persistent across scans)
-    if (!global.oldAccounts) {
-        global.oldAccounts = new Set();
-    }
-    
-    // Track lookups performed this scan
-    let lookupsPerformed = 0;
-    
-    // In-memory cache for mentioned projects (reduces duplicate API calls)
-    const projectCache = new Map();
-    
-    // Cheap tweet filter (before extraction)
-    function looksLikeProjectTweet(text) {
-        // Must contain project-related keywords
-        if (!/testnet|deployed|launch|live|airdrop|presale|mainnet|building|shipping|stealth/i.test(text)) {
-            return false;
-        }
-        // Filter out influencer/opinion content
-        if (/thread|thoughts|opinion|market update|daily|gm |gn /i.test(text)) {
-            return false;
-        }
-        return true;
-    }
-    
-    // Cheap handle heuristic filter
-    function looksLikeProjectHandle(username) {
-        if (!username || username.length < 4) return false;
-        if (/\d{4,}$/.test(username)) return false; // spammy numbers
-        // Allow most, filter obvious junk
-        return true;
-    }
-    
-    try {
-        // Calculate time window based on tier frequency
-        // Add 60-second safety buffer to ensure start_time is safely in the past
-        const SAFETY_BUFFER_SECONDS = 60;
-        const now = new Date();
-        const windowMinutes = tierConfig.frequency;
-        const windowStart = new Date(
-            now.getTime() 
-            - windowMinutes * 60 * 1000 
-            - SAFETY_BUFFER_SECONDS * 1000
-        );
-        
-        const params = new URLSearchParams({
-            query: query,
-            'max_results': '10',  // Both tiers capped at 10 for cost control
-            'tweet.fields': 'created_at',
-            'user.fields': 'username,description,verified,created_at,public_metrics,url',
-            'expansions': 'author_id',
-            'start_time': windowStart.toISOString()
-        });
-        
-        const response = await fetch(
-            `${TWITTER_BASE_URL}/tweets/search/recent?${params}`,
-            {
-                headers: {
-                    'Authorization': `Bearer ${TWITTER_BEARER_TOKEN}`
-                }
-            }
-        );
-        
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error(`${tierConfig.label} query failed:`, response.status);
-            console.error(`${tierConfig.label} error body:`, errorText);
-            return [];
-        }
-        
-        const data = await response.json();
-        
-        // Track tweet count for cooldown skip logic
-        const tweetCount = data.data?.length || 0;
-        global.lastTweetCount[tier] = tweetCount;
-        
-        // DEBUG: Log query and results
-        console.log(`${tierConfig.label} query:`, query.substring(0, 100) + '...');
-        console.log(`${tierConfig.label} tweets returned:`, tweetCount);
-        
-        if (!data.data || data.data.length === 0) {
-            console.log(`${tierConfig.label}: No tweets found in last ${windowMinutes} minutes`);
-            return [];
-        }
-        
-        // Build user map
-        const users = {};
-        if (data.includes && data.includes.users) {
-            data.includes.users.forEach(user => {
-                users[user.id] = user;
-            });
-        }
-        
-        // Parse tweets
-        for (const tweet of data.data) {
-            // Skip retweets
-            if (tweet.text.startsWith('RT @')) {
-                continue;
-            }
-            
-            // CHEAP FILTER #1: Tweet content filter (FREE, eliminates 50-70% junk)
-            if (!looksLikeProjectTweet(tweet.text)) {
-                continue;
-            }
-            
-            const user = users[tweet.author_id] || {};
-            const projectHandle = user.username;
-            
-            if (!projectHandle) continue;
-            
-            // CROSS-TIER DEDUPLICATION: Skip if already found by higher tier this scan cycle
-            if (global.currentScanProjects.has(projectHandle)) {
-                console.log(`⏭️ ${tierConfig.label}: Skipping @${projectHandle} - already found by higher tier`);
-                continue;
-            }
-            
-            // CHEAP FILTER #2: Handle heuristics (FREE)
-            if (!looksLikeProjectHandle(projectHandle)) {
-                console.log(`⏭️ ${tierConfig.label}: Skipping @${projectHandle} - doesn't look like project handle`);
-                continue;
-            }
-            
-            // CHEAP FILTER #3: Skip known old accounts (FREE, no API call)
-            if (global.oldAccounts.has(projectHandle)) {
-                continue; // Silent skip - already know it's old
-            }
-            
-            // Use author's data (already in response, no extra API call)
-            const projectUser = user;
-            
-            // Tiered age filter - check the PROJECT's age
-            const accountCreated = new Date(projectUser.created_at);
-            const ageLimitDays = tierConfig.ageLimit || 90;
-            const cutoffDate = new Date(Date.now() - ageLimitDays * 24 * 60 * 60 * 1000);
-            
-            if (accountCreated < cutoffDate) {
-                // Add to permanent skip list
-                global.oldAccounts.add(projectHandle);
-                console.log(`⏭️ ${tierConfig.label}: Skipping @${projectHandle} - account too old (${accountCreated.toISOString().split('T')[0]})`);
-                continue;
-            }
-            
-            console.log(`✅ ${tierConfig.label}: Found @${projectHandle} (created ${accountCreated.toISOString().split('T')[0]})`);
-            
-            // Mark as found in this scan cycle
-            global.currentScanProjects.add(projectHandle);
-            
-            // Store PROJECT's data
-            allProjects.push({
-                tweet_id: tweet.id,
-                project_handle: projectHandle,
-                tweet_text: tweet.text,
-                tweet_author: user.username,
-                tweet_url: `https://twitter.com/${user.username}/status/${tweet.id}`,
-                project_url: `https://twitter.com/${projectHandle}`,
-                account_created: projectUser.created_at,  // PROJECT's data
-                followers: projectUser.public_metrics?.followers_count || 0,  // PROJECT's data
-                verified: projectUser.verified || false,  // PROJECT's data
-                bio: projectUser.description || '',  // PROJECT's data
-                found_by_query: tierConfig.label  // Store tier label (TIER 1, TIER 2, TIER 3)
-            });
-        }
-        
-    } catch (error) {
-        console.error(`${tierConfig.label} error:`, error.message);
-        return [];
-    }
-    
-    console.log(`📊 ${tierConfig.label}: Found ${allProjects.length} projects`);
-    console.log(`📦 ${tierConfig.label}: Cache hits saved ${projectCache.size} API calls`);
-    
-    // Deduplicate by tweet_id
-    const unique = [];
-    const seenIds = new Set();
-    for (const proj of allProjects) {
-        if (!seenIds.has(proj.tweet_id)) {
-            seenIds.add(proj.tweet_id);
-            unique.push(proj);
-        }
-    }
-    
-    console.log(`✅ ${tierConfig.label}: ${unique.length} unique projects after deduplication`);
-    
-    // Save to database (FIX #4: Don't overwrite fetched data!)
-    if (unique.length > 0) {
-        const { error } = await supabase
-            .from('projects')
-            .upsert(unique.map(p => ({
-                tweet_id: p.tweet_id,
-                project_handle: p.project_handle,
-                tweet_text: p.tweet_text,
-                tweet_author: p.tweet_author,
-                tweet_url: p.tweet_url,
-                project_url: p.project_url,
-                account_created: p.account_created,  // Keep real data
-                followers: p.followers,  // Keep real data
-                verified: p.verified,  // Keep real data
-                bio: p.bio,  // Keep real data
-                found_by_query: p.found_by_query,  // Tier label (TIER 1, TIER 2, TIER 3)
-                found_at: new Date().toISOString()
-            })), {
-                onConflict: 'tweet_id'
-            });
-        
-        if (error) {
-            console.error(`❌ ${tierConfig.label} database error:`, error);
-        } else {
-            console.log(`💾 ${tierConfig.label}: Saved ${unique.length} projects to database`);
-        }
-    }
-    
-    return unique;
-}
-
-// ==========================================
 // WHALE TRACKER FUNCTIONS
 // ==========================================
 
@@ -419,46 +118,7 @@ async function logWhaleSearch(walletAddress, username, resultsCount) {
 
 // ==========================================
 // API ENDPOINTS
-// ==========================================
-
-// Get latest projects
-app.get('/api/projects', async (req, res) => {
-    try {
-        const { data, error } = await supabase
-            .from('projects')
-            .select('*')
-            .order('found_at', { ascending: false })
-            .limit(200); // Get more to ensure we have 100 unique after dedup
-        
-        if (error) throw error;
-        
-        // Deduplicate by project_handle (keep most recent)
-        const uniqueProjects = [];
-        const seenHandles = new Set();
-        
-        for (const project of data) {
-            if (!seenHandles.has(project.project_handle)) {
-                seenHandles.add(project.project_handle);
-                uniqueProjects.push(project);
-                
-                if (uniqueProjects.length >= 100) break; // Stop at 100 unique
-            }
-        }
-        
-        console.log(`📤 Returning ${uniqueProjects.length} unique projects (from ${data.length} total tweets)`);
-        
-        res.json({
-            success: true,
-            count: uniqueProjects.length,
-            projects: uniqueProjects
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
+// ===========================================
 
 // ==========================================
 // RUGCHECK API FUNCTION
@@ -1953,28 +1613,6 @@ app.get('/api/token-price/:contract', async (req, res) => {
         });
     }
 });
-
-// Trigger manual scan (rate limited)
-app.get('/api/scan', async (req, res) => {
-    try {
-        // Run Tier 1 and 2 only (Tier 3 disabled due to high cost/low quality)
-        const results = [];
-        results.push(...await scanProjects('tier1'));
-        results.push(...await scanProjects('tier2'));
-        
-        res.json({
-            success: true,
-            message: `Scanned Tier 1 & 2, found ${results.length} new projects`,
-            projects: results
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
 // Whale tracker search
 app.post('/api/whale/search', async (req, res) => {
     try {
@@ -2028,13 +1666,9 @@ app.post('/api/whale/search', async (req, res) => {
     }
 });
 
-// Get stats
+
 app.get('/api/stats', async (req, res) => {
     try {
-        const { data: projects } = await supabase
-            .from('projects')
-            .select('*', { count: 'exact' });
-        
         const { data: searches } = await supabase
             .from('whale_searches')
             .select('*', { count: 'exact' })
@@ -2043,7 +1677,6 @@ app.get('/api/stats', async (req, res) => {
         res.json({
             success: true,
             stats: {
-                totalProjects: projects?.length || 0,
                 whaleSearchesToday: searches?.length || 0,
                 lastUpdate: new Date().toISOString()
             }
@@ -2055,7 +1688,6 @@ app.get('/api/stats', async (req, res) => {
         });
     }
 });
-
 // Health check
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -2539,161 +2171,9 @@ function verifyAdmin(req, res, next) {
     next();
 }
 
-// Get project count
-app.get('/api/admin/projects/count', verifyAdmin, async (req, res) => {
-    try {
-        const { count, error } = await supabase
-            .from('projects')
-            .select('*', { count: 'exact', head: true });
-        
-        if (error) throw error;
-        
-        res.json({ 
-            success: true, 
-            count: count,
-            message: `Currently ${count} projects in database`
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
-});
-
-// Delete all projects
-app.delete('/api/admin/projects/clear-all', verifyAdmin, async (req, res) => {
-    try {
-        const { data, error } = await supabase
-            .from('projects')
-            .delete()
-            .not('tweet_id', 'is', null);
-        
-        if (error) throw error;
-        
-        const deletedCount = data?.length || 0;
-        console.log(`🗑️ ADMIN: Deleted ${deletedCount} projects`);
-        res.json({ 
-            success: true, 
-            deleted: deletedCount,
-            message: `Successfully deleted ${deletedCount} projects`,
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        console.error('Error deleting projects:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
-});
-
-// Delete old projects (older than X days)
-app.delete('/api/admin/projects/clear-old', verifyAdmin, async (req, res) => {
-    try {
-        const days = parseInt(req.query.days) || 7;
-        const cutoffDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-        
-        const { data, error } = await supabase
-            .from('projects')
-            .delete()
-            .lt('found_at', cutoffDate);
-        
-        if (error) throw error;
-        
-        const deletedCount = data?.length || 0;
-        console.log(`🗑️ ADMIN: Deleted ${deletedCount} projects older than ${days} days`);
-        res.json({ 
-            success: true, 
-            deleted: deletedCount,
-            message: `Deleted ${deletedCount} projects older than ${days} days`
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
-});
-
-// Delete by filters (e.g., low followers)
-app.delete('/api/admin/projects/filter', verifyAdmin, async (req, res) => {
-    try {
-        const minFollowers = parseInt(req.query.minFollowers) || 100;
-        
-        const { data, error } = await supabase
-            .from('projects')
-            .delete()
-            .lt('followers', minFollowers);
-        
-        if (error) throw error;
-        
-        const deletedCount = data?.length || 0;
-        console.log(`🗑️ ADMIN: Deleted ${deletedCount} low-quality projects`);
-        res.json({ 
-            success: true, 
-            deleted: deletedCount,
-            message: `Deleted ${deletedCount} projects with < ${minFollowers} followers`
-        });
-    } catch (error) {
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
-});
-
 // ==========================================
 // CRON JOBS
 // ==========================================
-
-// CRON JOBS - Tiered Scanning
-// ==========================================
-
-// Reset cross-tier deduplication every hour to prevent memory bloat
-cron.schedule('0 * * * *', () => {
-    if (global.currentScanProjects) {
-        const size = global.currentScanProjects.size;
-        global.currentScanProjects.clear();
-        console.log(`🔄 Reset cross-tier deduplication (was tracking ${size} projects)`);
-    }
-});
-
-// TIER 1: Every 5 minutes (high-signal)
-cron.schedule('*/5 * * * *', async () => {
-    if (!scanningEnabled) return;
-    
-    console.log('⏰ TIER 1 scan triggered (every 5 min)');
-    try {
-        await scanProjects('tier1');
-    } catch (error) {
-        console.error('Tier 1 scan error:', error);
-    }
-});
-
-// TIER 2: Every 30 minutes (builder signals) - reduced from 15 min for cost savings
-cron.schedule('*/30 * * * *', async () => {
-    if (!scanningEnabled) return;
-    
-    console.log('⏰ TIER 2 scan triggered (every 30 min)');
-    try {
-        await scanProjects('tier2');
-    } catch (error) {
-        console.error('Tier 2 scan error:', error);
-    }
-});
-
-// TIER 3: DISABLED (too expensive, low quality results)
-// Was costing ~$19/day for mostly spam/bots
-// cron.schedule('*/30 * * * *', async () => {
-//     if (!scanningEnabled) return;
-//     console.log('⏰ TIER 3 scan triggered (every 30 min)');
-//     try {
-//         await scanProjects('tier3');
-//     } catch (error) {
-//         console.error('Tier 3 scan error:', error);
-//     }
-// });
 
 // Live X Tracker - Check every 15 minutes
 cron.schedule('*/15 * * * *', async () => {
@@ -2704,7 +2184,6 @@ cron.schedule('*/15 * * * *', async () => {
         console.error('Live X Tracker error:', error);
     }
 });
-
 // ==========================================
 // JUPITER API PROXY (for Chrome Extension)
 // ==========================================
@@ -3900,8 +3379,6 @@ app.get('/api/analytics/summary', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`🚀 Trakr Backend running on port ${PORT}`);
     console.log(`📡 Endpoints:`);
-    console.log(`   GET  /api/projects`);
-    console.log(`   GET  /api/scan`);
     console.log(`   POST /api/whale/search`);
     console.log(`   POST /api/whale/live/track`);
     console.log(`   POST /api/whale/live/untrack`);
@@ -3910,14 +3387,10 @@ app.listen(PORT, () => {
     console.log(`   POST /api/whale/live/mark-read`);
     console.log(`   POST /api/whale/live/mark-all-read`);
     console.log(`   GET  /api/stats`);
-    console.log(`   GET  /api/live-launches (Pump.fun graduations + Bags.fm)`);
+    console.log(`   GET  /api/live-launches (Pump.fun graduations + Bags.fm + Printr)`);
     console.log(`   GET  /api/refresh/:contract (Refresh token data)`);
-    console.log(`   GET  /api/bags-launches (Bags.fm DBC launches)`);
-    console.log(`   GET  /api/all-launches (Combined Pump + Bags)`);
-    console.log(`   GET  /api/admin/projects/count`);
-    console.log(`   DELETE /api/admin/projects/clear-all`);
-    console.log(`   DELETE /api/admin/projects/clear-old`);
-    console.log(`   DELETE /api/admin/projects/filter`);
+    console.log(`   GET  /api/bags-launches (Bags.fm + Printr DBC launches)`);
+    console.log(`   GET  /api/all-launches (Combined Pump + Bags + Printr)`);
     console.log(`   GET  /jupiter/quote (Jupiter proxy)`);
     console.log(`   POST /jupiter/swap (Jupiter proxy)`);
     console.log(`   POST /api/analytics/connect (Log wallet connection)`);
