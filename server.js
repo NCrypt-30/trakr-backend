@@ -1919,7 +1919,7 @@ app.post('/api/whale/live/track', async (req, res) => {
         if (countError) throw countError;
         
         // Free tier limit: 2 accounts
-        const FREE_LIMIT = 2;
+        const FREE_LIMIT = 10;
         if (currentTracking.length >= FREE_LIMIT) {
             return res.json({
                 success: false,
