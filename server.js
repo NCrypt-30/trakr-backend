@@ -2175,8 +2175,8 @@ function verifyAdmin(req, res, next) {
 // CRON JOBS
 // ==========================================
 
-// Live X Tracker - Check every 15 minutes
-cron.schedule('*/15 * * * *', async () => {
+// Live X Tracker - Check every hour
+cron.schedule('0 * * * *', async () => {
     console.log('⏰ Live X Tracker check triggered');
     try {
         await checkLiveWhales();
