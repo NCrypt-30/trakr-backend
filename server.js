@@ -2056,7 +2056,7 @@ app.post('/api/whale/live/notifications', async (req, res) => {
             .from('whale_live_notifications')
             .select(`
                 *,
-                whale_user_notifications!left(read, dismissed, read_at)
+                whale_user_notifications!left(user_wallet, read, dismissed, read_at)
             `)
             .in('whale_username', whaleUsernames)
             .order('detected_at', { ascending: false })
@@ -2064,15 +2064,21 @@ app.post('/api/whale/live/notifications', async (req, res) => {
         
         if (notifError) throw notifError;
         
-        // Count unread
-        const unreadCount = notifications.filter(n => {
-            const userNotif = n.whale_user_notifications.find(un => un.read === false);
-            return !n.whale_user_notifications.length || userNotif;
+        // Filter out dismissed notifications for this user
+        const filteredNotifications = notifications.filter(n => {
+            const userNotif = n.whale_user_notifications?.find(un => un.user_wallet === userWallet);
+            return !userNotif?.dismissed;
+        });
+        
+        // Count unread (not read and not dismissed)
+        const unreadCount = filteredNotifications.filter(n => {
+            const userNotif = n.whale_user_notifications?.find(un => un.user_wallet === userWallet);
+            return !userNotif || !userNotif.read;
         }).length;
         
         res.json({
             success: true,
-            data: notifications,
+            data: filteredNotifications,
             unreadCount: unreadCount
         });
     } catch (error) {
@@ -2149,6 +2155,59 @@ app.post('/api/whale/live/mark-all-read', async (req, res) => {
         res.json({ success: true, marked: notifications.length });
     } catch (error) {
         console.error('Mark all read error:', error);
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// Remove individual notification (mark as dismissed)
+app.post('/api/whale/live/remove-notification', async (req, res) => {
+    try {
+        const { userWallet, notificationId } = req.body;
+        
+        if (!userWallet || !notificationId) {
+            return res.json({ success: false, error: 'Missing userWallet or notificationId' });
+        }
+        
+        // Mark notification as dismissed for this user
+        const { error } = await supabase
+            .from('whale_user_notifications')
+            .upsert({
+                user_wallet: userWallet,
+                notification_id: notificationId,
+                read: true,
+                dismissed: true,
+                read_at: new Date().toISOString()
+            }, { onConflict: 'user_wallet,notification_id' });
+        
+        if (error) throw error;
+        
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Remove notification error:', error);
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// Update whale label/tag
+app.post('/api/whale/live/update-label', async (req, res) => {
+    try {
+        const { userWallet, whaleUsername, label } = req.body;
+        
+        if (!userWallet || !whaleUsername) {
+            return res.json({ success: false, error: 'Missing userWallet or whaleUsername' });
+        }
+        
+        const { error } = await supabase
+            .from('whale_live_tracking')
+            .update({ label: label || null })
+            .eq('user_wallet', userWallet)
+            .eq('whale_username', whaleUsername);
+        
+        if (error) throw error;
+        
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Update label error:', error);
         res.json({ success: false, error: error.message });
     }
 });
@@ -3386,6 +3445,8 @@ app.listen(PORT, () => {
     console.log(`   POST /api/whale/live/notifications`);
     console.log(`   POST /api/whale/live/mark-read`);
     console.log(`   POST /api/whale/live/mark-all-read`);
+    console.log(`   POST /api/whale/live/remove-notification`);
+    console.log(`   POST /api/whale/live/update-label`);
     console.log(`   GET  /api/stats`);
     console.log(`   GET  /api/live-launches (Pump.fun graduations + Bags.fm + Printr)`);
     console.log(`   GET  /api/refresh/:contract (Refresh token data)`);
