@@ -1818,7 +1818,7 @@ async function checkLiveWhales() {
                 console.log(`🔍 Checking @${whaleUsername}...`);
                 
                 // Fetch current following list
-                const currentFollowing = await fetchUserFollowing(whaleUsername, 50);
+                const currentFollowing = await fetchUserFollowing(whaleUsername, 10);
                 const currentUsernames = currentFollowing.map(u => u.username);
                 
                 // Get previous snapshot
@@ -2234,8 +2234,8 @@ function verifyAdmin(req, res, next) {
 // CRON JOBS
 // ==========================================
 
-// Live X Tracker - Check every hour
-cron.schedule('0 * * * *', async () => {
+// Live X Tracker - Check every 12 hours
+cron.schedule('0 */12 * * *', async () => {
     console.log('⏰ Live X Tracker check triggered');
     try {
         await checkLiveWhales();
