@@ -1801,17 +1801,18 @@ async function checkLiveWhales() {
     console.log('🔴 Checking live tracked whales...');
     
     try {
-        // Get all unique whales being tracked
+        // Get all unique whales being tracked (not paused)
         const { data: trackedWhales, error } = await supabase
             .from('whale_live_tracking')
-            .select('whale_username')
+            .select('whale_username, paused')
             .eq('active', true);
         
         if (error) throw error;
         
-        // Get unique whale usernames
-        const uniqueWhales = [...new Set(trackedWhales.map(w => w.whale_username))];
-        console.log(`📊 Tracking ${uniqueWhales.length} unique whales`);
+        // Filter out paused and get unique whale usernames
+        const activeWhales = trackedWhales.filter(w => !w.paused);
+        const uniqueWhales = [...new Set(activeWhales.map(w => w.whale_username))];
+        console.log(`📊 Tracking ${uniqueWhales.length} unique whales (${trackedWhales.length - activeWhales.length} paused)`);
         
         for (const whaleUsername of uniqueWhales) {
             try {
@@ -2208,6 +2209,42 @@ app.post('/api/whale/live/update-label', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('Update label error:', error);
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// Toggle pause for individual whale
+app.post('/api/whale/live/toggle-pause', async (req, res) => {
+    try {
+        const { userWallet, whaleUsername } = req.body;
+        
+        if (!userWallet || !whaleUsername) {
+            return res.json({ success: false, error: 'Missing userWallet or whaleUsername' });
+        }
+        
+        // Get current pause state
+        const { data: current, error: fetchError } = await supabase
+            .from('whale_live_tracking')
+            .select('paused')
+            .eq('user_wallet', userWallet)
+            .eq('whale_username', whaleUsername)
+            .single();
+        
+        if (fetchError) throw fetchError;
+        
+        const newPausedState = !(current?.paused || false);
+        
+        const { error } = await supabase
+            .from('whale_live_tracking')
+            .update({ paused: newPausedState })
+            .eq('user_wallet', userWallet)
+            .eq('whale_username', whaleUsername);
+        
+        if (error) throw error;
+        
+        res.json({ success: true, paused: newPausedState });
+    } catch (error) {
+        console.error('Toggle pause error:', error);
         res.json({ success: false, error: error.message });
     }
 });
@@ -3447,6 +3484,7 @@ app.listen(PORT, () => {
     console.log(`   POST /api/whale/live/mark-all-read`);
     console.log(`   POST /api/whale/live/remove-notification`);
     console.log(`   POST /api/whale/live/update-label`);
+    console.log(`   POST /api/whale/live/toggle-pause`);
     console.log(`   GET  /api/stats`);
     console.log(`   GET  /api/live-launches (Pump.fun graduations + Bags.fm + Printr)`);
     console.log(`   GET  /api/refresh/:contract (Refresh token data)`);
