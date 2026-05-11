@@ -2031,7 +2031,7 @@ app.post('/api/whale/live/list', async (req, res) => {
 // Get notifications for user
 app.post('/api/whale/live/notifications', async (req, res) => {
     try {
-        const { userWallet, limit = 50 } = req.body;
+        const { userWallet, limit = 200 } = req.body;
         
         if (!userWallet) {
             return res.json({ success: false, error: 'Missing userWallet' });
@@ -2249,6 +2249,30 @@ app.post('/api/whale/live/toggle-pause', async (req, res) => {
     }
 });
 
+// Pause or resume ALL whales for a user
+app.post('/api/whale/live/pause-all', async (req, res) => {
+    try {
+        const { userWallet, paused } = req.body;
+        
+        if (!userWallet || paused === undefined) {
+            return res.json({ success: false, error: 'Missing userWallet or paused state' });
+        }
+        
+        const { data, error } = await supabase
+            .from('whale_live_tracking')
+            .update({ paused: paused })
+            .eq('user_wallet', userWallet)
+            .eq('active', true);
+        
+        if (error) throw error;
+        
+        res.json({ success: true, paused: paused });
+    } catch (error) {
+        console.error('Pause all error:', error);
+        res.json({ success: false, error: error.message });
+    }
+});
+
 // ============================================
 // ADMIN ENDPOINTS - Database Management
 // ============================================
@@ -2271,8 +2295,8 @@ function verifyAdmin(req, res, next) {
 // CRON JOBS
 // ==========================================
 
-// Live X Tracker - Check every 12 hours
-cron.schedule('0 */12 * * *', async () => {
+// Live X Tracker - Check once per day at midnight
+cron.schedule('0 0 * * *', async () => {
     console.log('⏰ Live X Tracker check triggered');
     try {
         await checkLiveWhales();
@@ -3485,6 +3509,7 @@ app.listen(PORT, () => {
     console.log(`   POST /api/whale/live/remove-notification`);
     console.log(`   POST /api/whale/live/update-label`);
     console.log(`   POST /api/whale/live/toggle-pause`);
+    console.log(`   POST /api/whale/live/pause-all`);
     console.log(`   GET  /api/stats`);
     console.log(`   GET  /api/live-launches (Pump.fun graduations + Bags.fm + Printr)`);
     console.log(`   GET  /api/refresh/:contract (Refresh token data)`);
