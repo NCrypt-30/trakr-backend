@@ -639,10 +639,16 @@ function isPrintrToken(address) {
     return address && address.toLowerCase().endsWith('brrr');
 }
 
+// Check if a token address is an Easy token (ends in EASY)
+function isEasyToken(address) {
+    return address && address.toUpperCase().endsWith('EASY');
+}
+
 // Determine which DBC launchpad a token came from
 function getDBCTokenSource(address) {
     if (isBagsToken(address)) return 'Bags';
     if (isPrintrToken(address)) return 'Printr';
+    if (isEasyToken(address)) return 'Easy';
     return null;
 }
 
@@ -811,13 +817,14 @@ async function fetchBagsLaunches() {
                         m5: metadata.priceChange5m,
                         h1: metadata.priceChange1h
                     },
-                    source: tokenSource, // 'Bags' or 'Printr'
+                    source: tokenSource, // 'Bags', 'Printr', or 'Easy'
                     dex: metadata.dexId || 'meteora',
                     createdAt: metadata.createdAt,
                     ageMinutes: ageMinutes,
                     dexscreenerUrl: `https://dexscreener.com/solana/${tokenMint}`,
                     bagsUrl: tokenSource === 'Bags' ? `https://bags.fm/${tokenMint}` : null,
                     printrUrl: tokenSource === 'Printr' ? `https://printr.money/token/${tokenMint}` : null,
+                    easyUrl: tokenSource === 'Easy' ? `https://kickstart.easya.io/token/${tokenMint}` : null,
                     jupiterUrl: `https://jup.ag/?sell=So11111111111111111111111111111111111111112&buy=${tokenMint}`
                 });
             }
@@ -1146,6 +1153,7 @@ app.get('/api/live-launches', async (req, res) => {
                     jupiterUrl: token.jupiterUrl,
                     bagsUrl: token.bagsUrl,
                     printrUrl: token.printrUrl,
+                    easyUrl: token.easyUrl,
                     priceChange: token.priceChange || { m5: 0, h1: 0 },
                     graduated: false, // Still on bonding curve
                     marketCap: token.marketCap || 0,
@@ -1181,7 +1189,8 @@ app.get('/api/live-launches', async (req, res) => {
             pumpCount: formatted.length,
             bagsCount: bagsFormatted.filter(t => t.source === 'Bags').length,
             printrCount: bagsFormatted.filter(t => t.source === 'Printr').length,
-            message: 'Pump.fun graduations + Bags.fm + Printr DBC launches',
+            easyCount: bagsFormatted.filter(t => t.source === 'Easy').length,
+            message: 'Pump.fun graduations + Bags.fm + Printr + Easy DBC launches',
             scamFilterRate: `${tokens.length > 0 ? ((1 - formatted.length / tokens.length) * 100).toFixed(1) : '0'}%`
         });
         
@@ -1389,7 +1398,8 @@ app.get('/api/all-launches', async (req, res) => {
             pumpCount: pumpFormatted.length,
             bagsCount: bagsLaunches.filter(t => t.source === 'Bags').length,
             printrCount: bagsLaunches.filter(t => t.source === 'Printr').length,
-            message: 'Combined Pump.fun graduations + Bags.fm + Printr DBC launches'
+            easyCount: bagsLaunches.filter(t => t.source === 'Easy').length,
+            message: 'Combined Pump.fun graduations + Bags.fm + Printr + Easy DBC launches'
         });
 
     } catch (error) {
@@ -3511,9 +3521,9 @@ app.listen(PORT, () => {
     console.log(`   POST /api/whale/live/toggle-pause`);
     console.log(`   POST /api/whale/live/pause-all`);
     console.log(`   GET  /api/stats`);
-    console.log(`   GET  /api/live-launches (Pump.fun graduations + Bags.fm + Printr)`);
+    console.log(`   GET  /api/live-launches (Pump.fun graduations + Bags.fm + Printr + Easy)`);
     console.log(`   GET  /api/refresh/:contract (Refresh token data)`);
-    console.log(`   GET  /api/bags-launches (Bags.fm + Printr DBC launches)`);
+    console.log(`   GET  /api/bags-launches (Bags.fm + Printr + Easy DBC launches)`);
     console.log(`   GET  /api/all-launches (Combined Pump + Bags + Printr)`);
     console.log(`   GET  /jupiter/quote (Jupiter proxy)`);
     console.log(`   POST /jupiter/swap (Jupiter proxy)`);
